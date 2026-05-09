@@ -164,11 +164,20 @@ This is final support target matrix, not means currently supported or implemente
       - [ ] `$atanh`
 
 - [ ] Supported operators
-  - [ ] `{}` `{{}}` Concatenation, replication
-  - [ ] unary `+` unary `-` Unary operators
-  - [ ] `+` `-` `*` `/` `**` Arithmetic
+  - [ ] `{}` Concatenation
+  - [ ] `{{}}` Replication
+  - [ ] unary `+` Unary positive
+  - [ ] unary `-` Unary negative
+  - [ ] `+` Arithmetic add
+  - [ ] `-` Arithmetic minus
+  - [ ] `*` Arithmetic multiply
+  - [ ] `/` Arithmetic divide
+  - [ ] `**` Arithmetic power
   - [ ] `%` Modulus
-  - [ ] `>` `>=` `<` `<=` Relational
+  - [ ] `>` Relational larger than
+  - [ ] `>=` Relational larger or equal than
+  - [ ] `<` Relational less than
+  - [ ] `<=` Relational less or equal than
   - [ ] `!` Logical negation
   - [ ] `&&` Logical and
   - [ ] `||` Logical or
