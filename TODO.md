@@ -65,6 +65,12 @@ Operator precedence / associativity fixes (IEEE 1364-2005 Table 22):
 - [x] `**` is left-associative — `3 ** 3 ** 3 == 19683`
 - [x] Unary `+`/`-` binds tighter than `**` — `-2 ** 2 == 4`
 
+Output base propagation (vcal display convention, not in LRM):
+
+- [x] Unary preserves operand base — `-4'b1 == 4'b1111`
+- [x] Binary takes leftmost operand's base — `4'b0111 + 4'b1001 == 4'b0000`, `8'h0a + 8'b1 == 8'h0b`
+- [x] Power follows the same rule (lhs base wins) — `4'h2 ** 2 == 4'h4`
+
 REPL UX:
 
 - [x] Trailing space after `In[n]:` and `Out[n]:` prompts
