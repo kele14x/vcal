@@ -166,14 +166,14 @@ This is final support target matrix, not means currently supported or implemente
 - [ ] Supported operators
   - [ ] `{}` Concatenation
   - [ ] `{{}}` Replication
-  - [ ] unary `+` Unary positive
-  - [ ] unary `-` Unary negative
-  - [ ] `+` Arithmetic add
-  - [ ] `-` Arithmetic minus
-  - [ ] `*` Arithmetic multiply
-  - [ ] `/` Arithmetic divide
-  - [ ] `**` Arithmetic power
-  - [ ] `%` Modulus
+  - [x] unary `+` Unary positive
+  - [x] unary `-` Unary negative
+  - [x] `+` Arithmetic add
+  - [x] `-` Arithmetic minus
+  - [x] `*` Arithmetic multiply
+  - [x] `/` Arithmetic divide
+  - [x] `**` Arithmetic power
+  - [x] `%` Modulus
   - [ ] `>` Relational larger than
   - [ ] `>=` Relational larger or equal than
   - [ ] `<` Relational less than
@@ -343,7 +343,7 @@ This is final support target matrix, not means currently supported or implemente
 ## Main Gap
 
 - [ ] Ways of multi-line editor is not clear yet
-- [ ] The propagate of 4-value logic through operators are not very clear
+- [ ] The full expression width/sign rules across all Verilog operators are not fully implemented yet
 
 ## Detailed Implementation
 
@@ -363,17 +363,70 @@ A simple_identifier shall start with an alpha or underscore (`_`) character, sha
 
 The dollar sign (`$`) in a *system_function_identifier* or *system_task_identifier* shall not be followed by white space.
 
+### Constants
+
+#### Integer Constants
+
+Integer constants are mainly specific in LRM section "3.5.1 Integer constants". It mainly be divided into two types:
+
+- Simple decimal number
+- Based constant, which be composed by up to three tokens: a optional size constant, an apostrophe character (`'`) followed by a base format character, and the digits representing the value of the number.
+
+Imports notes (which follows LRM but specified here as notes):
+
+- Unsized number (simple decimal number or a number without size) shall be at least 32 bits, but may be longer than 32 if the value needs more bits
+- If the value digits occupy fewer bits than the literal width (or fewer than 32 bits for an unsized literal), the value is left-extended. Ordinary unsigned digits are zero-extended, `x` digits are extended with `x`, and `z`/`?` digits are extended with `z`. This literal-digit padding rule is not sign extension.
+- There could be spaces between the 3 tokens (size, base, value) of integer constants. For example `8 'd 5` is the same as `8'd5`. However there should be no spaces between the `'` and the base (`b`, `o`, `d`, `h`, `sb`, `so`, `sd`, `sh`). Also there should be not spaces between `s` and the base.
+
 ### Operator precedence
 
 Operator precedence follows IEEE 1364-2005 exactly.
+
+Notes:
+
+- All operators shall associate left to right with the exception of the conditional operator, which shall associate right to left.
+  - The `**` operator is still left to right association, for example `3 ** 3 ** 3 = (3 ** 3) ** 3 = 19683`. Which is different from Python (`3 ** 3 ** 3 = 7625597484987`).
+- There is short-circuiting during expression evaluation.
 
 ### Width rules
 
 Width rules follows IEEE 1364-2005 exactly.
 
+Notes:
+
+- Mainly on LRM section 5.4.
+- Generally there are two types o expression bit lengths rules:
+  - Self-determined expression: where the bit length of the expression is solely determined by the expression itself.
+    - For example the `<` operator returns 1-bit unsigned result in all case. So the `a < b` expression is bit-width self-determined.
+  - Context-determined expression: where the bit length of the expression is determined itself and the fact that it is part of another expression.
+    - For example, the `=` statement, the bit size of the right-hand expression of an assignment depends on itself and the size of the left-hand side (LHS).
+
 ### Signedness rules
 
 Signedness rules follows IEEE 1364-2005 exactly.
+
+Notes:
+
+- Mainly on LRM section 5.5.
+- Unlike the bit-width, signedness depends only on the operands.
+- (Simple) decimal numbers are signed.
+- Some operators are self-determined
+  - For example, `<` result is always unsigned (also always 1-bit)
+- Some operators are not self-determined
+
+### Base rules
+
+The integer implementation should holds at least 4-fields for the features specified in LRM.
+
+- Width
+- Signed
+- Bits (value)
+
+However we need additional field for proper display in console:
+
+- Base
+
+The (default) base rule should be designed.
 
 ### Packed vs unpacked array
 
