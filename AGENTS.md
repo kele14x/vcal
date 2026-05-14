@@ -4,8 +4,8 @@
 
 - This repo is now a single Rust binary crate named `vcal`.
 - Phase 1 is complete.
-- Phase 2 is the next active implementation target.
-- `TODO.md` still records the completed Phase 1 checklist; use the Phase 2 notes in `README.md` for the next implementation steps until `TODO.md` is updated.
+- Phase 2 is complete: arithmetic evaluator (IEEE 1364-2005 section 5.1.5), prompt spacing, and `rustyline`-backed in-memory arrow-key history. See `TODO.md` for the per-task checklist.
+- The next phase is not yet scoped. Confirm scope with the user before introducing anything from `TODO.md` "Things to implement later" (variables, declarations, real numbers, non-arithmetic operators, strings, vectors, additional system tasks).
 
 ## Commands
 
@@ -20,13 +20,14 @@
 
 ## Guidance
 
-- Keep Phase 2 limited to single-line REPL input, integer literals, parentheses, and integer arithmetic operators from IEEE 1364-2005 section 5.1.5: unary `+`, unary `-`, `+`, `-`, `*`, `/`, `%`, `**`.
-- Do not add variables, declarations, strings, real numbers, concatenation, or non-arithmetic operators as part of Phase 2.
-- Implement arithmetic expressions with a parsed AST, not ad hoc string splitting.
+- Do not infer support from the top-level support matrix in `README.md`; many checked items are long-term targets and are intentionally out of scope for the current phase. Confirm with the user before expanding scope.
+- Implement expressions with a parsed AST, not ad hoc string splitting.
 - Keep expression width/sign handling as a separate analysis step from numeric evaluation.
 - Prefer a two-pass design for expressions:
   - bottom-up self-determined width/sign inference for each AST node
   - top-down context-determined evaluation so parent width can widen child arithmetic
-- For arithmetic operators, if any operand contains `x` or `z`, the result should become all `x` bits at the effective result width.
-- Preserve the canonical output contract from `README.md`: print values as Verilog literals via `Out[n]:`; print an empty `Out[n]:` line for system tasks with no return value.
-- Do not infer support from the top-level support matrix; many checked items are long-term targets and are intentionally out of scope for the current phase.
+- For arithmetic operators, if any operand contains `x` or `z`, the result becomes all `x` bits at the effective result width.
+- Result base follows the vcal leftmost-wins rule (see README "Base rules"): unary preserves the operand's base; binary takes the LHS base. Decimal is the default for unsized literals.
+- Operator precedence and associativity follow IEEE 1364-2005 Table 22 — notably, unary binds tighter than `**`, and `**` is left-associative.
+- Preserve the canonical output contract: prompts are `In[n]: ` and `Out[n]: ` (trailing space); print `Out[n]: ` with an empty value for system tasks like `$finish`/`$stop`.
+- Interactive entry point is `vcal::run_interactive` (rustyline, TTY only); piped/test input uses the generic `vcal::run_repl(BufRead, Write)`. `src/main.rs` dispatches via `IsTerminal`. Keep both paths working.

@@ -270,6 +270,10 @@ struct Parser {
 struct ExprMeta {
     width: usize,
     signed: bool,
+    // Inferred display base — leftmost operand wins for binary ops.
+    // Used when constructing arithmetic results; ignored when ExprMeta is
+    // passed downward as context (literals keep their own base).
+    base: Base,
 }
 
 enum ParsedLine {
@@ -394,7 +398,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut chars = input.char_indices().peekable();
 
-    while let Some((start, ch)) = chars.next() {
+    while let Some((_, ch)) = chars.next() {
         if ch.is_whitespace() {
             continue;
         }
@@ -420,9 +424,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 )?));
             }
             _ => {
-                tokens.push(Token::IntegerLiteral(read_integer_literal(
-                    input, start, ch, &mut chars,
-                )?));
+                tokens.push(Token::IntegerLiteral(read_integer_literal(ch, &mut chars)?));
             }
         }
     }
@@ -431,8 +433,6 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
 }
 
 fn read_integer_literal<I>(
-    input: &str,
-    start: usize,
     first_ch: char,
     chars: &mut std::iter::Peekable<I>,
 ) -> Result<String, String>
@@ -495,10 +495,6 @@ where
         if !saw_digit {
             return Err("missing digits in integer literal".to_string());
         }
-    }
-
-    if input[start..].is_empty() {
-        return Err("empty integer literal".to_string());
     }
 
     Ok(literal)
@@ -708,6 +704,7 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
         Expr::Literal(value) => Ok(ExprMeta {
             width: value.width,
             signed: value.signed,
+            base: value.base,
         }),
         Expr::Grouped(expr) => infer_expr_meta(expr),
         Expr::Unary { op, expr } => match op {
@@ -716,22 +713,27 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
         Expr::Binary { op, lhs, rhs } => {
             let lhs_meta = infer_expr_meta(lhs)?;
             let rhs_meta = infer_expr_meta(rhs)?;
-
-            match op {
-                BinaryOp::Add
-                | BinaryOp::Subtract
-                | BinaryOp::Multiply
-                | BinaryOp::Divide
-                | BinaryOp::Modulus => Ok(ExprMeta {
-                    width: usize::max(lhs_meta.width, rhs_meta.width),
-                    signed: lhs_meta.signed && rhs_meta.signed,
-                }),
-                BinaryOp::Power => Ok(ExprMeta {
-                    width: lhs_meta.width,
-                    signed: lhs_meta.signed,
-                }),
-            }
+            Ok(combine_binary_meta(*op, lhs_meta, rhs_meta))
         }
+    }
+}
+
+fn combine_binary_meta(op: BinaryOp, lhs_meta: ExprMeta, rhs_meta: ExprMeta) -> ExprMeta {
+    match op {
+        BinaryOp::Add
+        | BinaryOp::Subtract
+        | BinaryOp::Multiply
+        | BinaryOp::Divide
+        | BinaryOp::Modulus => ExprMeta {
+            width: usize::max(lhs_meta.width, rhs_meta.width),
+            signed: lhs_meta.signed && rhs_meta.signed,
+            base: lhs_meta.base,
+        },
+        BinaryOp::Power => ExprMeta {
+            width: lhs_meta.width,
+            signed: lhs_meta.signed,
+            base: lhs_meta.base,
+        },
     }
 }
 
@@ -744,6 +746,7 @@ fn evaluate_unary_expr(
     let effective_meta = ExprMeta {
         width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
         signed: meta.signed,
+        base: meta.base,
     };
     let operand = evaluate_expr_in_context(expr, Some(effective_meta))?;
 
@@ -755,7 +758,7 @@ fn evaluate_unary_expr(
         return Ok(IntegerValue::all_x(
             effective_meta.width,
             meta.signed,
-            Base::Decimal,
+            meta.base,
         ));
     }
 
@@ -769,7 +772,7 @@ fn evaluate_unary_expr(
         result,
         effective_meta.width,
         meta.signed,
-        Base::Decimal,
+        meta.base,
     ))
 }
 
@@ -779,14 +782,13 @@ fn evaluate_binary_expr(
     rhs: &Expr,
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
-    let meta = infer_expr_meta(&Expr::Binary {
-        op,
-        lhs: Box::new(lhs.clone()),
-        rhs: Box::new(rhs.clone()),
-    })?;
+    let lhs_meta = infer_expr_meta(lhs)?;
+    let rhs_meta = infer_expr_meta(rhs)?;
+    let meta = combine_binary_meta(op, lhs_meta, rhs_meta);
     let effective_meta = ExprMeta {
         width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
         signed: meta.signed,
+        base: meta.base,
     };
 
     match op {
@@ -802,7 +804,7 @@ fn evaluate_binary_expr(
                 return Ok(IntegerValue::all_x(
                     effective_meta.width,
                     meta.signed,
-                    Base::Decimal,
+                    meta.base,
                 ));
             }
 
@@ -817,7 +819,7 @@ fn evaluate_binary_expr(
                         return Ok(IntegerValue::all_x(
                             effective_meta.width,
                             meta.signed,
-                            Base::Decimal,
+                            meta.base,
                         ));
                     }
                     lhs_int / rhs_int
@@ -827,7 +829,7 @@ fn evaluate_binary_expr(
                         return Ok(IntegerValue::all_x(
                             effective_meta.width,
                             meta.signed,
-                            Base::Decimal,
+                            meta.base,
                         ));
                     }
                     lhs_int % rhs_int
@@ -839,15 +841,14 @@ fn evaluate_binary_expr(
                 result,
                 effective_meta.width,
                 meta.signed,
-                Base::Decimal,
+                meta.base,
             ))
         }
         BinaryOp::Power => {
-            let lhs_meta = infer_expr_meta(lhs)?;
-            let rhs_meta = infer_expr_meta(rhs)?;
             let lhs_context = ExprMeta {
                 width: effective_meta.width,
                 signed: lhs_meta.signed,
+                base: lhs_meta.base,
             };
             let lhs_value = evaluate_expr_in_context(lhs, Some(lhs_context))?;
             let rhs_value = evaluate_expr_in_context(rhs, Some(rhs_meta))?;
@@ -856,7 +857,7 @@ fn evaluate_binary_expr(
                 return Ok(IntegerValue::all_x(
                     effective_meta.width,
                     lhs_meta.signed,
-                    Base::Decimal,
+                    lhs_meta.base,
                 ));
             }
 
@@ -868,7 +869,7 @@ fn evaluate_binary_expr(
                     return Ok(IntegerValue::all_x(
                         effective_meta.width,
                         lhs_meta.signed,
-                        Base::Decimal,
+                        lhs_meta.base,
                     ));
                 }
             };
@@ -877,7 +878,7 @@ fn evaluate_binary_expr(
                 result,
                 effective_meta.width,
                 lhs_meta.signed,
-                Base::Decimal,
+                lhs_meta.base,
             ))
         }
     }
@@ -1567,8 +1568,10 @@ mod tests {
         let addition = evaluate_input("4'bx + 1").expect("x addition should evaluate");
         let unary = evaluate_input("-4'bz").expect("z unary minus should evaluate");
 
-        assert_eq!(addition.output, "32'dx");
-        assert_eq!(unary.output, "4'dx");
+        // Result base inherits from leftmost operand (binary), so the all-x result
+        // is rendered in binary, one digit per bit.
+        assert_eq!(addition.output, "32'bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+        assert_eq!(unary.output, "4'bxxxx");
     }
 
     #[test]
@@ -1600,7 +1603,7 @@ mod tests {
         let modulus_by_zero =
             evaluate_input("8'd3 % 8'd0").expect("modulus by zero should evaluate to x");
 
-        assert_eq!(unknown.output, "32'dx");
+        assert_eq!(unknown.output, "32'bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
         assert_eq!(divide_by_zero.output, "8'dx");
         assert_eq!(modulus_by_zero.output, "8'dx");
     }
@@ -1631,7 +1634,7 @@ mod tests {
         let unknown = evaluate_input("4'bx ** 2").expect("unknown power should evaluate");
         let undefined = evaluate_input("0 ** -1").expect("undefined integer power should yield x");
 
-        assert_eq!(unknown.output, "4'dx");
+        assert_eq!(unknown.output, "4'bxxxx");
         assert_eq!(undefined.output, "32'sdx");
     }
 
@@ -1706,5 +1709,37 @@ mod tests {
 
         let output = String::from_utf8(output).expect("output should be valid UTF-8");
         assert_eq!(output, "In[0]: Out[0]: 32'sd42\nIn[1]: Out[1]: \n");
+    }
+
+    #[test]
+    fn binary_arithmetic_preserves_shared_operand_base() {
+        let binary_add = evaluate_input("4'b0111 + 4'b1001").expect("binary add should evaluate");
+        let hex_add = evaluate_input("8'h0a + 8'h05").expect("hex add should evaluate");
+        let hex_mul = evaluate_input("8'h0a * 8'h02").expect("hex multiply should evaluate");
+        let hex_power = evaluate_input("4'h2 ** 2").expect("hex power should evaluate");
+
+        assert_eq!(binary_add.output, "4'b0000");
+        assert_eq!(hex_add.output, "8'h0f");
+        assert_eq!(hex_mul.output, "8'h14");
+        assert_eq!(hex_power.output, "4'h4");
+    }
+
+    #[test]
+    fn binary_arithmetic_takes_leftmost_base_when_operands_differ() {
+        let hex_then_binary = evaluate_input("8'h0a + 8'b1").expect("hex+binary should evaluate");
+        let binary_then_hex =
+            evaluate_input("8'b00001010 + 8'h05").expect("binary+hex should evaluate");
+
+        assert_eq!(hex_then_binary.output, "8'h0b");
+        assert_eq!(binary_then_hex.output, "8'b00001111");
+    }
+
+    #[test]
+    fn unary_minus_preserves_operand_base() {
+        let binary = evaluate_input("-4'b1").expect("binary unary minus should evaluate");
+        let hex = evaluate_input("-8'h01").expect("hex unary minus should evaluate");
+
+        assert_eq!(binary.output, "4'b1111");
+        assert_eq!(hex.output, "8'hff");
     }
 }

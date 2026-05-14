@@ -426,7 +426,13 @@ However we need additional field for proper display in console:
 
 - Base
 
-The (default) base rule should be designed.
+The base of an arithmetic result is inferred from its operands so the output keeps the form the user typed when possible. The LRM does not specify this — it is a vcal display convention.
+
+- A literal carries the base it was declared with. Unsized decimal literals (e.g. `42`) are decimal.
+- A unary operator (`+`, `-`) preserves the operand's base. So `-4'b1` is `4'b1111`.
+- A binary operator (`+`, `-`, `*`, `/`, `%`, `**`) takes the **leftmost** operand's base. So `4'b0111 + 4'b1001` is `4'b0000`, `8'h0a + 8'b1` is `8'h0b`, and `8'b00001010 + 8'h05` is `8'b00001111`.
+- The leftmost-wins rule mirrors the left-to-right evaluation order of the supported operators. There is no automatic base "promotion" between bases.
+- All-`x` results inherit the same base. For wide non-decimal results this can be verbose (e.g. `4'bx + 1` prints as `32'bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`); this is intentional, matching how literals like `4'bx` already render as `4'bxxxx`.
 
 ### Packed vs unpacked array
 
