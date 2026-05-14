@@ -1,6 +1,6 @@
 # TODO
 
-We are currently on Phase 2.
+We are currently on Phase 2. The arithmetic evaluator and REPL UX polish (prompt spacing, in-memory arrow-key history) are complete; Phase 3 scope is TBD.
 
 ## Implementation Plan
 
@@ -60,6 +60,17 @@ Implementation checklist:
 - [x] Implement signed/unsigned extension rules for the arithmetic subset
 - [x] Add unit tests for precedence, width truncation, context widening, signedness, unknown propagation, and zero-division/undefined power cases
 
+Operator precedence / associativity fixes (IEEE 1364-2005 Table 22):
+
+- [x] `**` is left-associative — `3 ** 3 ** 3 == 19683`
+- [x] Unary `+`/`-` binds tighter than `**` — `-2 ** 2 == 4`
+
+REPL UX:
+
+- [x] Trailing space after `In[n]:` and `Out[n]:` prompts
+- [x] Up/down arrow history in interactive mode (in-memory, per session) via `rustyline`
+- [x] TTY detection in `main.rs` so piped input keeps using the plain `BufRead` path (preserves test/script use)
+
 Implementation notes:
 
 - Arithmetic expressions are implemented with a parsed AST, not ad hoc string splitting.
@@ -81,6 +92,9 @@ Things to implement later:
 - Strings
 - Vectors
 - Other system tasks and functions
+- REPL UX
+  - Persistent history across sessions (e.g., `~/.vcal_history`)
+  - Multi-line input editing
 
 ## Improvements
 
