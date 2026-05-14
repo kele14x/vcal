@@ -49,11 +49,12 @@ pub struct IntegerValue {
 
 impl IntegerValue {
     pub fn canonical(&self) -> String {
-        if self.base == Base::Decimal && self.signed {
-            if let Some((negative, digits)) = self.render_signed_decimal_digits() {
-                let prefix = if negative { "-" } else { "" };
-                return format!("{prefix}{}'sd{digits}", self.width);
-            }
+        if self.base == Base::Decimal
+            && self.signed
+            && let Some((negative, digits)) = self.render_signed_decimal_digits()
+        {
+            let prefix = if negative { "-" } else { "" };
+            return format!("{prefix}{}'sd{digits}", self.width);
         }
 
         let signed = if self.signed { "s" } else { "" };
@@ -87,7 +88,7 @@ impl IntegerValue {
             .iter()
             .any(|bit| matches!(bit, LogicBit::X | LogicBit::Z))
         {
-            return if self.bits.iter().any(|bit| *bit == LogicBit::X) {
+            return if self.bits.contains(&LogicBit::X) {
                 "x".to_string()
             } else {
                 "z".to_string()
@@ -109,7 +110,7 @@ impl IntegerValue {
         if self.has_unknown_bits() {
             return Some((
                 false,
-                if self.bits.iter().any(|bit| *bit == LogicBit::X) {
+                if self.bits.contains(&LogicBit::X) {
                     "x".to_string()
                 } else {
                     "z".to_string()
@@ -383,10 +384,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             }
             _ => {
                 tokens.push(Token::IntegerLiteral(read_integer_literal(
-                    input,
-                    start,
-                    ch,
-                    &mut chars,
+                    input, start, ch, &mut chars,
                 )?));
             }
         }
@@ -558,7 +556,7 @@ impl Parser {
     }
 
     fn parse_multiplicative(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_unary()?;
+        let mut expression = self.parse_power()?;
 
         loop {
             let op = match self.peek() {
@@ -569,7 +567,7 @@ impl Parser {
             };
             self.index += 1;
 
-            let rhs = self.parse_unary()?;
+            let rhs = self.parse_power()?;
             expression = Expr::Binary {
                 op,
                 lhs: Box::new(expression),
@@ -580,8 +578,10 @@ impl Parser {
         Ok(expression)
     }
 
+    // Unary binds tighter than `**` (LRM 1364-2005 Table 22), so both sides of
+    // `**` go through `parse_unary`. The while loop accumulates left-to-right.
     fn parse_power(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_primary()?;
+        let mut expression = self.parse_unary()?;
 
         while matches!(self.peek(), Some(Token::Power)) {
             self.index += 1;
@@ -611,7 +611,7 @@ impl Parser {
                 expr: Box::new(expr),
             })
         } else {
-            self.parse_power()
+            self.parse_primary()
         }
     }
 
@@ -626,12 +626,10 @@ impl Parser {
                 }
             }
             Some(Token::RParen) => Err("unexpected closing parenthesis".to_string()),
-            Some(Token::Plus)
-            | Some(Token::Minus)
-            | Some(Token::Star)
-            | Some(Token::Slash)
-            | Some(Token::Percent)
-            | Some(Token::Power) => Err("expected expression operand".to_string()),
+            Some(Token::Plus) | Some(Token::Minus) | Some(Token::Star) | Some(Token::Slash)
+            | Some(Token::Percent) | Some(Token::Power) => {
+                Err("expected expression operand".to_string())
+            }
             None => Err("unexpected end of expression".to_string()),
         }
     }
@@ -755,7 +753,11 @@ fn evaluate_binary_expr(
     };
 
     match op {
-        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Modulus => {
+        BinaryOp::Add
+        | BinaryOp::Subtract
+        | BinaryOp::Multiply
+        | BinaryOp::Divide
+        | BinaryOp::Modulus => {
             let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta))?;
             let rhs_value = evaluate_expr_in_context(rhs, Some(effective_meta))?;
 
@@ -905,7 +907,11 @@ fn evaluate_power(base: BigInt, exponent: BigInt) -> Result<BigInt, String> {
 
         if base == BigInt::from(-1) {
             let is_odd = (&(-exponent.clone()) & BigInt::one()) == BigInt::one();
-            return Ok(if is_odd { BigInt::from(-1) } else { BigInt::one() });
+            return Ok(if is_odd {
+                BigInt::from(-1)
+            } else {
+                BigInt::one()
+            });
         }
 
         return Ok(BigInt::zero());
@@ -1022,9 +1028,7 @@ fn parse_based_integer(input: &str, apostrophe_index: usize) -> Result<IntegerVa
 
     match base {
         Base::Decimal => parse_based_decimal(width, signed, &digits),
-        Base::Binary | Base::Octal | Base::Hex => {
-            parse_based_radix(width, signed, base, &digits)
-        }
+        Base::Binary | Base::Octal | Base::Hex => parse_based_radix(width, signed, base, &digits),
     }
 }
 
@@ -1195,11 +1199,11 @@ fn is_z_digit(ch: char) -> bool {
 }
 
 fn render_group_digit(bits: &[LogicBit], base: Base) -> char {
-    if bits.iter().any(|bit| *bit == LogicBit::X) {
+    if bits.contains(&LogicBit::X) {
         return 'x';
     }
 
-    if bits.iter().any(|bit| *bit == LogicBit::Z) {
+    if bits.contains(&LogicBit::Z) {
         return 'z';
     }
 
@@ -1213,7 +1217,11 @@ fn render_group_digit(bits: &[LogicBit], base: Base) -> char {
 
     match base {
         Base::Binary => {
-            if value == 0 { '0' } else { '1' }
+            if value == 0 {
+                '0'
+            } else {
+                '1'
+            }
         }
         Base::Octal => char::from(b'0' + value),
         Base::Hex => {
@@ -1311,7 +1319,8 @@ mod tests {
         let simple_decimal = evaluate_input("1").expect("simple decimal should parse");
         let simple_negative = evaluate_input("-1").expect("simple negative should evaluate");
         let signed_positive = evaluate_input("4'sd1").expect("signed decimal should parse");
-        let signed_negative = evaluate_input("-4'sd1").expect("signed decimal negation should evaluate");
+        let signed_negative =
+            evaluate_input("-4'sd1").expect("signed decimal negation should evaluate");
         let signed_hex = evaluate_input("4'shF").expect("signed hex should parse");
 
         assert_eq!(simple_decimal.output, "32'sd1");
@@ -1325,7 +1334,8 @@ mod tests {
     fn accepts_spaces_inside_based_integer_literals_in_expressions() {
         let literal = evaluate_input("8 'd 6").expect("spaced based literal should parse");
         let unary = evaluate_input("- 8 'd 6").expect("spaced unary minus literal should parse");
-        let expr = evaluate_input("8 'd 6 + 1").expect("spaced based literal expression should parse");
+        let expr =
+            evaluate_input("8 'd 6 + 1").expect("spaced based literal expression should parse");
 
         assert_eq!(literal.output, "8'd6");
         assert_eq!(unary.output, "8'd250");
@@ -1334,9 +1344,10 @@ mod tests {
 
     #[test]
     fn rejects_spaces_inside_base_token() {
-        let missing_base = evaluate_input("8 ' d 6").expect_err("space after apostrophe should be rejected");
-        let split_signed =
-            evaluate_input("8 ' s d 6").expect_err("spaces inside signed base token should be rejected");
+        let missing_base =
+            evaluate_input("8 ' d 6").expect_err("space after apostrophe should be rejected");
+        let split_signed = evaluate_input("8 ' s d 6")
+            .expect_err("spaces inside signed base token should be rejected");
         let split_signed_base =
             evaluate_input("8 's d 6").expect_err("space between s and base should be rejected");
 
@@ -1348,7 +1359,8 @@ mod tests {
     #[test]
     fn accepts_apostrophe_led_based_literals_with_spaced_digits() {
         let hex = evaluate_input("'h 837FF").expect("apostrophe-led hex literal should parse");
-        let signed_hex = evaluate_input("'sh f").expect("apostrophe-led signed hex literal should parse");
+        let signed_hex =
+            evaluate_input("'sh f").expect("apostrophe-led signed hex literal should parse");
 
         assert_eq!(hex.output, "32'h000837ff");
         assert_eq!(signed_hex.output, "32'sh0000000f");
@@ -1403,7 +1415,9 @@ mod tests {
             expression,
             Expr::Binary {
                 op: BinaryOp::Add,
-                lhs: Box::new(Expr::Literal(parse_integer("1").expect("literal should parse"))),
+                lhs: Box::new(Expr::Literal(
+                    parse_integer("1").expect("literal should parse")
+                )),
                 rhs: Box::new(Expr::Binary {
                     op: BinaryOp::Multiply,
                     lhs: Box::new(Expr::Literal(
@@ -1423,19 +1437,58 @@ mod tests {
 
         assert_eq!(
             expression,
-            Expr::Unary {
-                op: UnaryOp::Minus,
-                expr: Box::new(Expr::Binary {
+            Expr::Binary {
+                op: BinaryOp::Power,
+                lhs: Box::new(Expr::Unary {
+                    op: UnaryOp::Minus,
+                    expr: Box::new(Expr::Literal(
+                        parse_integer("2").expect("literal should parse")
+                    )),
+                }),
+                rhs: Box::new(Expr::Literal(
+                    parse_integer("3").expect("literal should parse")
+                )),
+            }
+        );
+    }
+
+    #[test]
+    fn unary_minus_binds_tighter_than_power() {
+        let even_exp = evaluate_input("-2 ** 2").expect("even exponent should evaluate");
+        let odd_exp = evaluate_input("-2 ** 3").expect("odd exponent should evaluate");
+
+        assert_eq!(even_exp.output, "32'sd4");
+        assert_eq!(odd_exp.output, "-32'sd8");
+    }
+
+    #[test]
+    fn parses_power_operator_left_associatively() {
+        let expression = parse_expression("3 ** 3 ** 3").expect("expression should parse");
+
+        assert_eq!(
+            expression,
+            Expr::Binary {
+                op: BinaryOp::Power,
+                lhs: Box::new(Expr::Binary {
                     op: BinaryOp::Power,
                     lhs: Box::new(Expr::Literal(
-                        parse_integer("2").expect("literal should parse")
+                        parse_integer("3").expect("literal should parse")
                     )),
                     rhs: Box::new(Expr::Literal(
                         parse_integer("3").expect("literal should parse")
                     )),
                 }),
+                rhs: Box::new(Expr::Literal(
+                    parse_integer("3").expect("literal should parse")
+                )),
             }
         );
+    }
+
+    #[test]
+    fn evaluates_chained_power_left_to_right() {
+        let evaluation = evaluate_input("3 ** 3 ** 3").expect("chained power should evaluate");
+        assert_eq!(evaluation.output, "32'sd19683");
     }
 
     #[test]
@@ -1529,7 +1582,8 @@ mod tests {
     #[test]
     fn applies_lhs_width_rule_to_power_operator() {
         let self_determined = evaluate_input("4'd3 ** 4'd3").expect("power should evaluate");
-        let context_widened = evaluate_input("4'd3 ** 4'd3 + 0").expect("power should widen in context");
+        let context_widened =
+            evaluate_input("4'd3 ** 4'd3 + 0").expect("power should widen in context");
 
         assert_eq!(self_determined.output, "4'd11");
         assert_eq!(context_widened.output, "32'd27");
@@ -1577,15 +1631,18 @@ mod tests {
 
     #[test]
     fn widens_signed_subexpressions_before_truncation() {
-        let evaluation = evaluate_input("(-4'sd1 + -4'sd1) + 0").expect("signed expression should evaluate");
+        let evaluation =
+            evaluate_input("(-4'sd1 + -4'sd1) + 0").expect("signed expression should evaluate");
         assert_eq!(evaluation.output, "-32'sd2");
     }
 
     #[test]
     fn evaluates_negative_base_power_cases_from_lrm_examples() {
         let odd = evaluate_input("(-4'sd1) ** 3").expect("odd negative-base power should evaluate");
-        let even = evaluate_input("(-4'sd1) ** 2").expect("even negative-base power should evaluate");
-        let reciprocal = evaluate_input("(-4'sd1) ** -3").expect("negative exponent should evaluate");
+        let even =
+            evaluate_input("(-4'sd1) ** 2").expect("even negative-base power should evaluate");
+        let reciprocal =
+            evaluate_input("(-4'sd1) ** -3").expect("negative exponent should evaluate");
 
         assert_eq!(odd.output, "-4'sd1");
         assert_eq!(even.output, "4'sd1");
