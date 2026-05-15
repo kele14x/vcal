@@ -176,11 +176,17 @@ impl IntegerValue {
     }
 
     fn context_extension_bit(&self, context_signed: bool) -> LogicBit {
+        // LRM 5.5.4: the "fill with x/z when sign bit is x/z" rule applies
+        // only when resizing into a SIGNED wider width. Unsigned extension is
+        // always zero-fill regardless of the source MSB. iverilog confirmed.
+        if !context_signed {
+            return LogicBit::Zero;
+        }
         match self.bits.last().copied().unwrap_or(LogicBit::Zero) {
             LogicBit::X => LogicBit::X,
             LogicBit::Z => LogicBit::Z,
-            LogicBit::One if context_signed => LogicBit::One,
-            _ => LogicBit::Zero,
+            LogicBit::One => LogicBit::One,
+            LogicBit::Zero => LogicBit::Zero,
         }
     }
 
@@ -250,6 +256,10 @@ enum BinaryOp {
     GreaterThan,
     LessThanOrEqual,
     GreaterThanOrEqual,
+    Equal,
+    NotEqual,
+    CaseEqual,
+    CaseNotEqual,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,6 +277,10 @@ enum Token {
     Greater,
     LessEqual,
     GreaterEqual,
+    EqualEqual,
+    NotEqual,
+    CaseEqual,
+    CaseNotEqual,
 }
 
 struct Parser {
@@ -442,6 +456,30 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::Greater);
                 }
             }
+            '=' => {
+                if !matches!(chars.peek(), Some((_, '='))) {
+                    return Err("expected `==` or `===`".to_string());
+                }
+                chars.next();
+                if matches!(chars.peek(), Some((_, '='))) {
+                    chars.next();
+                    tokens.push(Token::CaseEqual);
+                } else {
+                    tokens.push(Token::EqualEqual);
+                }
+            }
+            '!' => {
+                if !matches!(chars.peek(), Some((_, '='))) {
+                    return Err("expected `!=` or `!==`".to_string());
+                }
+                chars.next();
+                if matches!(chars.peek(), Some((_, '='))) {
+                    chars.next();
+                    tokens.push(Token::CaseNotEqual);
+                } else {
+                    tokens.push(Token::NotEqual);
+                }
+            }
             '\'' => {
                 tokens.push(Token::IntegerLiteral(read_based_literal_after_apostrophe(
                     &mut chars,
@@ -582,12 +620,39 @@ where
 }
 
 fn is_expression_delimiter(ch: char) -> bool {
-    matches!(ch, '(' | ')' | '+' | '-' | '*' | '/' | '%' | '<' | '>')
+    matches!(
+        ch,
+        '(' | ')' | '+' | '-' | '*' | '/' | '%' | '<' | '>' | '=' | '!'
+    )
 }
 
 impl Parser {
     fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_relational()
+        self.parse_equality()
+    }
+
+    fn parse_equality(&mut self) -> Result<Expr, String> {
+        let mut expression = self.parse_relational()?;
+
+        loop {
+            let op = match self.peek() {
+                Some(Token::EqualEqual) => BinaryOp::Equal,
+                Some(Token::NotEqual) => BinaryOp::NotEqual,
+                Some(Token::CaseEqual) => BinaryOp::CaseEqual,
+                Some(Token::CaseNotEqual) => BinaryOp::CaseNotEqual,
+                _ => break,
+            };
+            self.index += 1;
+
+            let rhs = self.parse_relational()?;
+            expression = Expr::Binary {
+                op,
+                lhs: Box::new(expression),
+                rhs: Box::new(rhs),
+            };
+        }
+
+        Ok(expression)
     }
 
     fn parse_relational(&mut self) -> Result<Expr, String> {
@@ -709,9 +774,9 @@ impl Parser {
             Some(Token::RParen) => Err("unexpected closing parenthesis".to_string()),
             Some(Token::Plus) | Some(Token::Minus) | Some(Token::Star) | Some(Token::Slash)
             | Some(Token::Percent) | Some(Token::Power) | Some(Token::Less)
-            | Some(Token::Greater) | Some(Token::LessEqual) | Some(Token::GreaterEqual) => {
-                Err("expected expression operand".to_string())
-            }
+            | Some(Token::Greater) | Some(Token::LessEqual) | Some(Token::GreaterEqual)
+            | Some(Token::EqualEqual) | Some(Token::NotEqual) | Some(Token::CaseEqual)
+            | Some(Token::CaseNotEqual) => Err("expected expression operand".to_string()),
             None => Err("unexpected end of expression".to_string()),
         }
     }
@@ -786,7 +851,11 @@ fn combine_binary_meta(op: BinaryOp, lhs_meta: ExprMeta, rhs_meta: ExprMeta) -> 
         BinaryOp::LessThan
         | BinaryOp::GreaterThan
         | BinaryOp::LessThanOrEqual
-        | BinaryOp::GreaterThanOrEqual => ExprMeta {
+        | BinaryOp::GreaterThanOrEqual
+        | BinaryOp::Equal
+        | BinaryOp::NotEqual
+        | BinaryOp::CaseEqual
+        | BinaryOp::CaseNotEqual => ExprMeta {
             width: 1,
             signed: false,
             base: Base::Binary,
@@ -800,9 +869,14 @@ fn evaluate_unary_expr(
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
     let meta = infer_expr_meta(expr)?;
+    // LRM 5.5.2: unary +/- is context-determined — propagated size AND
+    // signedness must reach the inner primary. Falling back to the operand's
+    // own signedness here would sign-extend a signed leaf even when the
+    // surrounding comparison/arithmetic unified to unsigned, mis-encoding
+    // the value before negation.
     let effective_meta = ExprMeta {
         width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
-        signed: meta.signed,
+        signed: context.map_or(meta.signed, |ctx| ctx.signed),
         base: meta.base,
     };
     let operand = evaluate_expr_in_context(expr, Some(effective_meta))?;
@@ -814,12 +888,12 @@ fn evaluate_unary_expr(
     if operand.has_unknown_bits() {
         return Ok(IntegerValue::all_x(
             effective_meta.width,
-            meta.signed,
+            effective_meta.signed,
             meta.base,
         ));
     }
 
-    let value = operand.as_bigint(meta.signed);
+    let value = operand.as_bigint(effective_meta.signed);
     let result = match op {
         UnaryOp::Minus => -value,
         UnaryOp::Plus => unreachable!("handled before arithmetic evaluation"),
@@ -828,7 +902,7 @@ fn evaluate_unary_expr(
     Ok(IntegerValue::from_bigint(
         result,
         effective_meta.width,
-        meta.signed,
+        effective_meta.signed,
         meta.base,
     ))
 }
@@ -850,6 +924,13 @@ fn evaluate_binary_expr(
             | BinaryOp::GreaterThanOrEqual
     ) {
         return evaluate_relational_expr(op, lhs, rhs, lhs_meta, rhs_meta, context);
+    }
+
+    if matches!(
+        op,
+        BinaryOp::Equal | BinaryOp::NotEqual | BinaryOp::CaseEqual | BinaryOp::CaseNotEqual
+    ) {
+        return evaluate_equality_expr(op, lhs, rhs, lhs_meta, rhs_meta, context);
     }
 
     let meta = combine_binary_meta(op, lhs_meta, rhs_meta);
@@ -955,6 +1036,48 @@ fn evaluate_binary_expr(
         | BinaryOp::GreaterThanOrEqual => {
             unreachable!("relational ops dispatched to evaluate_relational_expr")
         }
+        BinaryOp::Equal | BinaryOp::NotEqual | BinaryOp::CaseEqual | BinaryOp::CaseNotEqual => {
+            unreachable!("equality ops dispatched to evaluate_equality_expr")
+        }
+    }
+}
+
+// LRM 5.5.2: relational/equality operands form a shared context — size =
+// max(L(i), L(j)), signed iff both signed. The propagated type drives extension
+// at the leaf primary (sign-extend only when propagated type is signed), so the
+// unified `comparison_signed` is what each operand sees.
+fn unify_comparison_operands(
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_meta: ExprMeta,
+    rhs_meta: ExprMeta,
+) -> Result<(IntegerValue, IntegerValue, bool), String> {
+    let operand_width = usize::max(lhs_meta.width, rhs_meta.width);
+    let comparison_signed = lhs_meta.signed && rhs_meta.signed;
+
+    let lhs_context = ExprMeta {
+        width: operand_width,
+        signed: comparison_signed,
+        base: lhs_meta.base,
+    };
+    let rhs_context = ExprMeta {
+        width: operand_width,
+        signed: comparison_signed,
+        base: rhs_meta.base,
+    };
+
+    let lhs_value = evaluate_expr_in_context(lhs, Some(lhs_context))?;
+    let rhs_value = evaluate_expr_in_context(rhs, Some(rhs_context))?;
+
+    Ok((lhs_value, rhs_value, comparison_signed))
+}
+
+fn comparison_result_value(bit: LogicBit) -> IntegerValue {
+    IntegerValue {
+        width: 1,
+        signed: false,
+        base: Base::Binary,
+        bits: vec![bit],
     }
 }
 
@@ -966,25 +1089,8 @@ fn evaluate_relational_expr(
     rhs_meta: ExprMeta,
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
-    let operand_width = usize::max(lhs_meta.width, rhs_meta.width);
-    let comparison_signed = lhs_meta.signed && rhs_meta.signed;
-
-    // Each operand widens using its OWN signedness — sign-extension preserves
-    // the signed value at the wider width before comparison-time
-    // reinterpretation as unsigned (LRM 5.5.1).
-    let lhs_context = ExprMeta {
-        width: operand_width,
-        signed: lhs_meta.signed,
-        base: lhs_meta.base,
-    };
-    let rhs_context = ExprMeta {
-        width: operand_width,
-        signed: rhs_meta.signed,
-        base: rhs_meta.base,
-    };
-
-    let lhs_value = evaluate_expr_in_context(lhs, Some(lhs_context))?;
-    let rhs_value = evaluate_expr_in_context(rhs, Some(rhs_context))?;
+    let (lhs_value, rhs_value, comparison_signed) =
+        unify_comparison_operands(lhs, rhs, lhs_meta, rhs_meta)?;
 
     if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
         return Ok(widen_relational_result(
@@ -1009,14 +1115,72 @@ fn evaluate_relational_expr(
     } else {
         LogicBit::Zero
     };
-    let result = IntegerValue {
-        width: 1,
-        signed: false,
-        base: Base::Binary,
-        bits: vec![bit],
+    Ok(widen_relational_result(comparison_result_value(bit), context))
+}
+
+fn evaluate_equality_expr(
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_meta: ExprMeta,
+    rhs_meta: ExprMeta,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    // Bit-level comparison; the unified signedness only matters for operand
+    // extension (already done inside `unify_comparison_operands`), not for the
+    // comparison itself.
+    let (lhs_value, rhs_value, _comparison_signed) =
+        unify_comparison_operands(lhs, rhs, lhs_meta, rhs_meta)?;
+
+    let bit = match op {
+        // LRM 5.1.8: ==/!= are 1-bit x only when the relation is *ambiguous*.
+        // A single definite bit mismatch (0 vs 1) makes the operands unequal
+        // regardless of any x/z elsewhere; only when no bit definitively
+        // mismatches AND at least one bit involves x or z is the result x.
+        BinaryOp::Equal | BinaryOp::NotEqual => {
+            let mut definite_mismatch = false;
+            let mut has_unknown = false;
+            for (lb, rb) in lhs_value.bits.iter().zip(rhs_value.bits.iter()) {
+                match (lb, rb) {
+                    (LogicBit::Zero, LogicBit::One) | (LogicBit::One, LogicBit::Zero) => {
+                        definite_mismatch = true;
+                    }
+                    (LogicBit::X | LogicBit::Z, _) | (_, LogicBit::X | LogicBit::Z) => {
+                        has_unknown = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !definite_mismatch && has_unknown {
+                return Ok(widen_relational_result(
+                    IntegerValue::all_x(1, false, Base::Binary),
+                    context,
+                ));
+            }
+            let equal = !definite_mismatch;
+            let result = if matches!(op, BinaryOp::Equal) {
+                equal
+            } else {
+                !equal
+            };
+            if result { LogicBit::One } else { LogicBit::Zero }
+        }
+        // LRM 5.1.8: ===/!== compare bit-for-bit including x and z; the result
+        // is always a known 0 or 1, never x. Operands are already the same
+        // length after unification.
+        BinaryOp::CaseEqual | BinaryOp::CaseNotEqual => {
+            let equal = lhs_value.bits == rhs_value.bits;
+            let result = if matches!(op, BinaryOp::CaseEqual) {
+                equal
+            } else {
+                !equal
+            };
+            if result { LogicBit::One } else { LogicBit::Zero }
+        }
+        _ => unreachable!("non-equality op in evaluate_equality_expr"),
     };
 
-    Ok(widen_relational_result(result, context))
+    Ok(widen_relational_result(comparison_result_value(bit), context))
 }
 
 fn widen_relational_result(result: IntegerValue, context: Option<ExprMeta>) -> IntegerValue {
@@ -1060,6 +1224,22 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                 return Ok(value.as_bigint(false));
             }
 
+            if matches!(
+                op,
+                BinaryOp::Equal
+                    | BinaryOp::NotEqual
+                    | BinaryOp::CaseEqual
+                    | BinaryOp::CaseNotEqual
+            ) {
+                let lhs_meta = infer_expr_meta(lhs)?;
+                let rhs_meta = infer_expr_meta(rhs)?;
+                let value = evaluate_equality_expr(*op, lhs, rhs, lhs_meta, rhs_meta, None)?;
+                if value.has_unknown_bits() {
+                    return Err("expression contains unknown bits".to_string());
+                }
+                return Ok(value.as_bigint(false));
+            }
+
             let lhs_value = evaluate_expr_as_math_bigint(lhs)?;
             let rhs_value = evaluate_expr_as_math_bigint(rhs)?;
 
@@ -1085,7 +1265,11 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                 BinaryOp::LessThan
                 | BinaryOp::GreaterThan
                 | BinaryOp::LessThanOrEqual
-                | BinaryOp::GreaterThanOrEqual => unreachable!("handled above"),
+                | BinaryOp::GreaterThanOrEqual
+                | BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::CaseEqual
+                | BinaryOp::CaseNotEqual => unreachable!("handled above"),
             }
         }
     }
@@ -1992,9 +2176,10 @@ mod tests {
     fn mixed_signedness_uses_unsigned_comparison() {
         // -4'sd1 has bits 1111 → reinterpreted as unsigned 15; 15 > 0
         let neg_one_gt_zero = evaluate_input("-4'sd1 > 4'd0").expect("neg vs unsigned");
-        // -4'sd1 sign-extends to 11111111 (= 255 unsigned); 255 > 0
+        // -4'sd1 propagates 8-bit unsigned context to the inner 4'sd1, which
+        // zero-extends to 0000_0001; negation at 8-bit unsigned yields 255.
         let neg_one_gt_zero_widened = evaluate_input("-4'sd1 > 8'd0").expect("widened");
-        // 4'sd2 sign-extends to 00000010 (= 2 unsigned); 2 > 5 is false
+        // 4'sd2 zero-extends (unsigned context) to 0000_0010 = 2; 2 > 5 false.
         let two_not_gt_five = evaluate_input("4'sd2 > 8'd5").expect("not gt");
 
         assert_eq!(neg_one_gt_zero.output, "1'b1");
@@ -2003,17 +2188,54 @@ mod tests {
     }
 
     #[test]
-    fn mixed_signedness_extends_before_reinterpreting_as_unsigned() {
-        // LRM ordering trap: width extension uses each operand's OWN signedness
-        // FIRST, then both bit patterns are reinterpreted as unsigned for the
-        // comparison. Reversed ordering (reinterpret first, then zero-extend)
-        // would give a different answer here.
+    fn mixed_signedness_zero_extends_signed_primary_per_lrm_5_5_2() {
+        // LRM §5.1.7 + §5.5.2: when one operand is unsigned the propagated
+        // type is unsigned, so the narrower signed primary is ZERO-extended,
+        // not sign-extended-then-reinterpreted. The buggy "extend with own
+        // signedness, then reinterpret as unsigned" model would flip these
+        // answers. Verified against iverilog.
         //
-        // -4'sd1 sign-extends to 8 bits as `11111111` (= unsigned 255).
-        // 255 > 16 → TRUE. Reversed-order would zero-extend `1111` to
-        // `00001111` = 15, and 15 > 16 → FALSE (LRM-incorrect).
-        let gt = evaluate_input("-4'sd1 > 8'd16").expect("ordering > case");
-        let lt = evaluate_input("-4'sd1 < 8'd16").expect("ordering < case");
+        //   4'sb1111 < 8'd255  →  zero-ext 1111 → 0000_1111 = 15;  15 < 255 → 1
+        //   4'sb1000 > 8'd7    →  zero-ext 1000 → 0000_1000 = 8;    8 >  7  → 1
+        //   4'sb1000 < 8'd9    →  zero-ext 1000 → 0000_1000 = 8;    8 <  9  → 1
+        //   4'sb1111 < 8'd16   →  zero-ext 1111 → 0000_1111 = 15;  15 < 16  → 1
+        let lt_big = evaluate_input("4'sb1111 < 8'd255").expect("lt_big");
+        let gt_small = evaluate_input("4'sb1000 > 8'd7").expect("gt_small");
+        let lt_small = evaluate_input("4'sb1000 < 8'd9").expect("lt_small");
+        let lt_sixteen = evaluate_input("4'sb1111 < 8'd16").expect("lt_sixteen");
+
+        assert_eq!(lt_big.output, "1'b1");
+        assert_eq!(gt_small.output, "1'b1");
+        assert_eq!(lt_small.output, "1'b1");
+        assert_eq!(lt_sixteen.output, "1'b1");
+    }
+
+    #[test]
+    fn unary_minus_propagates_unsigned_context_through_to_primary() {
+        // LRM §5.5.2: propagation passes through context-determined unary `-`
+        // down to the leaf primary. For `-4'sb1000 < 8'd9` the inner 4'sb1000
+        // zero-extends to 0000_1000 = 8 (unsigned context); negation at 8-bit
+        // unsigned wraps to 256-8 = 248; 248 < 9 → 0.
+        //
+        // The "evaluate -4'sb1000 self-determined first then sign-extend"
+        // model would give 8 < 9 → 1, which iverilog disagrees with.
+        let lt = evaluate_input("-4'sb1000 < 8'd9").expect("unary lt");
+        let gt = evaluate_input("-4'sb1000 > 8'd9").expect("unary gt");
+        let lt_close = evaluate_input("-4'sb1000 < 8'd249").expect("248 < 249");
+
+        assert_eq!(lt.output, "1'b0");
+        assert_eq!(gt.output, "1'b1");
+        assert_eq!(lt_close.output, "1'b1");
+    }
+
+    #[test]
+    fn mixed_signedness_relational_compatible_with_iverilog_neg_one_widened() {
+        // Both models agree here (the buggy "sign-extend then reinterpret"
+        // path happens to coincide with the LRM-correct "propagate down,
+        // negate at wider width" path because 4'sd1 has MSB=0). Kept as a
+        // regression guard against future propagation changes.
+        let gt = evaluate_input("-4'sd1 > 8'd16").expect("> case");
+        let lt = evaluate_input("-4'sd1 < 8'd16").expect("< case");
 
         assert_eq!(gt.output, "1'b1");
         assert_eq!(lt.output, "1'b0");
@@ -2050,5 +2272,211 @@ mod tests {
         // Both operands hex but the 1-bit relational result is binary.
         let hex_compare = evaluate_input("8'h0a < 8'h0f").expect("hex compare");
         assert_eq!(hex_compare.output, "1'b1");
+    }
+
+    // ---------- Equality operators (==, !=, ===, !==) ----------
+    //
+    // All expected values in this section were verified against iverilog
+    // (Icarus Verilog) and match the LRM 1364-2005 §5.1.8 + §5.5.2 rules:
+    //   * Operand unification follows the same shared-context model as
+    //     relational ops (max width; signed iff both signed; extension at the
+    //     leaf primary uses the propagated signedness).
+    //   * `==`/`!=` return 1'bx only when the relation is *ambiguous* — a
+    //     definite bit mismatch (0 vs 1) makes operands unequal regardless
+    //     of x/z elsewhere.
+    //   * `===`/`!==` compare bit-for-bit including x and z; result is always
+    //     a known 0 or 1, never x.
+
+    #[test]
+    fn evaluates_basic_equality_operators() {
+        let eq_true = evaluate_input("4'd3 == 4'd3").expect("eq true");
+        let eq_false = evaluate_input("4'd3 == 4'd5").expect("eq false");
+        let ne_true = evaluate_input("4'd3 != 4'd5").expect("ne true");
+        let ne_false = evaluate_input("4'd3 != 4'd3").expect("ne false");
+        let case_eq = evaluate_input("4'd3 === 4'd3").expect("case eq");
+        let case_ne = evaluate_input("4'd3 !== 4'd5").expect("case ne");
+
+        assert_eq!(eq_true.output, "1'b1");
+        assert_eq!(eq_false.output, "1'b0");
+        assert_eq!(ne_true.output, "1'b1");
+        assert_eq!(ne_false.output, "1'b0");
+        assert_eq!(case_eq.output, "1'b1");
+        assert_eq!(case_ne.output, "1'b1");
+    }
+
+    #[test]
+    fn equality_zero_extends_signed_primary_in_mixed_context() {
+        // 4'sb1111 zero-extends (unsigned context) to 0000_1111 = 15;
+        // RHS 8'hFF = 255; not equal → == 0, != 1.
+        let eq = evaluate_input("4'sb1111 == 8'hFF").expect("eq");
+        let ne = evaluate_input("4'sb1111 != 8'hFF").expect("ne");
+        // 4'sb1000 zero-extends to 0000_1000 = 8; RHS 8'hF8 = 248 → not equal
+        let eq8 = evaluate_input("4'sb1000 == 8'hF8").expect("eq8");
+        // Positive signed primary: 4'sb0001 zero-extends to 1; equals 8'd1.
+        let eq_pos = evaluate_input("4'sb0001 == 8'd1").expect("eq_pos");
+
+        assert_eq!(eq.output, "1'b0");
+        assert_eq!(ne.output, "1'b1");
+        assert_eq!(eq8.output, "1'b0");
+        assert_eq!(eq_pos.output, "1'b1");
+    }
+
+    #[test]
+    fn equality_unary_minus_changes_extension_outcome_with_same_bits() {
+        // Three cases that look almost identical but expose the LRM §5.5.2
+        // propagation rule clearly. The bit pattern `1111` shows up in all
+        // three, but the surrounding context decides whether it ends up as
+        // 15 or as 255 in an 8-bit comparison. Iverilog-confirmed.
+        //
+        //   -4'sh1 == 4'shF : both 4-bit signed, no extension; bits
+        //                     `1111` == `1111`             → 1
+        //   -4'sh1 == 8'hFF : mixed → 8-bit unsigned context. Propagation
+        //                     passes through unary `-` to the primary
+        //                     `4'sh1` = `0001`; zero-extends to
+        //                     `0000_0001` = 1; negate at 8-bit unsigned
+        //                     → `1111_1111` = 255. 255 == 255 → 1
+        //   4'shF  == 8'hFF : same mixed context, but no unary `-`, so
+        //                     the primary `4'shF` = `1111` zero-extends
+        //                     directly to `0000_1111` = 15. 15 ≠ 255 → 0
+        let neg_same_width = evaluate_input("-4'sh1 == 4'shF").expect("neg same width");
+        let neg_widened = evaluate_input("-4'sh1 == 8'hFF").expect("neg widened");
+        let no_neg_widened = evaluate_input("4'shF == 8'hFF").expect("no neg widened");
+
+        assert_eq!(neg_same_width.output, "1'b1");
+        assert_eq!(neg_widened.output, "1'b1");
+        assert_eq!(no_neg_widened.output, "1'b0");
+    }
+
+    #[test]
+    fn equality_unary_minus_propagates_unsigned_context_to_primary() {
+        // -4'sb1000 in 8-bit unsigned context: inner 4'sb1000 zero-extends to
+        // 0000_1000 = 8; negate at 8-bit unsigned → 256-8 = 248. 248 == 248 → 1.
+        let eq = evaluate_input("-4'sb1000 == 8'd248").expect("neg eq");
+        // Same mechanism: -4'sd1 in 8-bit unsigned context becomes 255.
+        let neg_one = evaluate_input("-4'sd1 == 8'hFF").expect("neg one eq");
+
+        assert_eq!(eq.output, "1'b1");
+        assert_eq!(neg_one.output, "1'b1");
+    }
+
+    #[test]
+    fn equality_both_signed_uses_sign_extension() {
+        // Both signed → context signed → narrower side sign-extends.
+        // -4'sd1 sign-extends to 8-bit -1 = 1111_1111; -8'sd1 same bits → equal.
+        let neg_neg = evaluate_input("-4'sd1 == -8'sd1").expect("neg neg");
+        // === on identical signed bit patterns → 1.
+        let case_neg = evaluate_input("4'sb1111 === 4'sb1111").expect("case neg");
+
+        assert_eq!(neg_neg.output, "1'b1");
+        assert_eq!(case_neg.output, "1'b1");
+    }
+
+    #[test]
+    fn logical_equality_returns_x_only_when_ambiguous() {
+        // All-x: nothing definite to mismatch on → ambiguous → x.
+        let all_x = evaluate_input("4'bx == 4'd1").expect("all x");
+        // RHS all-z: same reasoning → x.
+        let all_z = evaluate_input("4'd0 == 4'bz").expect("all z");
+        // Identical bit pattern with one x: also ambiguous → x.
+        let same_x = evaluate_input("4'b01x0 == 4'b01x0").expect("same with x");
+        // Definite mismatch elsewhere (bit[2]: 1 vs 0) makes operands
+        // unequal regardless of the x bit → != is 1, not x. iverilog confirmed.
+        let definite_mismatch_eq = evaluate_input("4'b01x0 == 4'd1").expect("definite mismatch ==");
+        let definite_mismatch_ne = evaluate_input("4'b01x0 != 4'd1").expect("definite mismatch !=");
+        // No definite mismatch, only an x at bit[0] → ambiguous → x.
+        let ambiguous_eq = evaluate_input("4'b101x == 4'b1010").expect("ambiguous ==");
+        let ambiguous_ne = evaluate_input("4'b101x != 4'b1010").expect("ambiguous !=");
+
+        assert_eq!(all_x.output, "1'bx");
+        assert_eq!(all_z.output, "1'bx");
+        assert_eq!(same_x.output, "1'bx");
+        assert_eq!(definite_mismatch_eq.output, "1'b0");
+        assert_eq!(definite_mismatch_ne.output, "1'b1");
+        assert_eq!(ambiguous_eq.output, "1'bx");
+        assert_eq!(ambiguous_ne.output, "1'bx");
+    }
+
+    #[test]
+    fn case_equality_matches_x_and_z_literally() {
+        // === requires bit-for-bit identity including x and z; result never x.
+        let xxxx_eq = evaluate_input("4'bxxxx === 4'bxxxx").expect("xxxx eq");
+        let mixed_eq = evaluate_input("4'bx101 === 4'bx101").expect("mixed eq");
+        let mixed_ne_diff = evaluate_input("4'bx101 !== 4'bx100").expect("mixed ne diff");
+        let xxxx_vs_zero = evaluate_input("4'bxxxx === 4'd0").expect("xxxx vs zero");
+        let x_vs_one = evaluate_input("4'bx101 === 4'b1101").expect("x vs one");
+        let zzzz_eq = evaluate_input("4'bzzzz === 4'bzzzz").expect("zzzz eq");
+        let xz_pattern = evaluate_input("4'bxzxz === 4'bxzxz").expect("xz pattern");
+        let same_ne = evaluate_input("4'bxxxx !== 4'bxxxx").expect("same !==");
+
+        assert_eq!(xxxx_eq.output, "1'b1");
+        assert_eq!(mixed_eq.output, "1'b1");
+        assert_eq!(mixed_ne_diff.output, "1'b1");
+        assert_eq!(xxxx_vs_zero.output, "1'b0");
+        assert_eq!(x_vs_one.output, "1'b0");
+        assert_eq!(zzzz_eq.output, "1'b1");
+        assert_eq!(xz_pattern.output, "1'b1");
+        assert_eq!(same_ne.output, "1'b0");
+    }
+
+    #[test]
+    fn case_equality_extends_unsigned_with_zero_not_x() {
+        // LRM 5.5.4: x/z fill on extension applies only to SIGNED resize.
+        // For mixed signedness (unsigned context) the narrower side
+        // zero-extends regardless of MSB, so 4'bx101 becomes 0000_x101.
+        let zero_filled = evaluate_input("4'bx101 === 8'b0000x101").expect("zero filled");
+        let not_x_filled = evaluate_input("4'bx101 === 8'bxxxxx101").expect("not x filled");
+        // Same for z.
+        let z_zero_filled = evaluate_input("4'bz101 === 8'b0000z101").expect("z zero filled");
+        let z_not_z_filled = evaluate_input("4'bz101 === 8'bzzzzz101").expect("z not z filled");
+
+        assert_eq!(zero_filled.output, "1'b1");
+        assert_eq!(not_x_filled.output, "1'b0");
+        assert_eq!(z_zero_filled.output, "1'b1");
+        assert_eq!(z_not_z_filled.output, "1'b0");
+    }
+
+    #[test]
+    fn case_equality_signed_extends_msb_with_x_or_z() {
+        // LRM 5.5.4: when BOTH operands are signed (context signed), an x or
+        // z MSB does propagate into the upper bits.
+        let signed_x_fill =
+            evaluate_input("4'sbx000 === 8'sbxxxxx000").expect("signed x fills");
+        let signed_zero_fill_wrong =
+            evaluate_input("4'sbx000 === 8'sb0000x000").expect("signed zero would be wrong");
+
+        assert_eq!(signed_x_fill.output, "1'b1");
+        assert_eq!(signed_zero_fill_wrong.output, "1'b0");
+    }
+
+    #[test]
+    fn equality_lower_precedence_than_relational() {
+        // LRM 5.1.8: equality is lower precedence than relational. So
+        // `4'd1 < 4'd2 == 4'd1` parses as `(4'd1 < 4'd2) == 4'd1`, which is
+        // 1'b1 == 4'd1 → 1 == 1 → 1. The other grouping would yield 0.
+        let result = evaluate_input("4'd1 < 4'd2 == 4'd1").expect("precedence");
+        assert_eq!(result.output, "1'b1");
+    }
+
+    #[test]
+    fn equality_is_left_associative() {
+        // 4'd1 == 4'd1 == 4'd1 → (1 == 1) == 4'd1 → 1'b1 == 4'd1 → 1 == 1 → 1
+        let result = evaluate_input("4'd1 == 4'd1 == 4'd1").expect("assoc");
+        let expr = parse_expression("4'd1 == 4'd1 == 4'd1").expect("parse assoc");
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::Equal,
+                lhs,
+                ..
+            } => assert!(matches!(*lhs, Expr::Binary { op: BinaryOp::Equal, .. })),
+            other => panic!("expected top-level ==, got {other:?}"),
+        }
+        assert_eq!(result.output, "1'b1");
+    }
+
+    #[test]
+    fn equality_result_widens_to_outer_arithmetic_context() {
+        // (4'd3 == 4'd3) → 1'b1; outer + widens result to 4 bits.
+        let result = evaluate_input("(4'd3 == 4'd3) + 4'd0").expect("widened");
+        assert_eq!(result.output, "4'b0001");
     }
 }

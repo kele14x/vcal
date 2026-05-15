@@ -174,17 +174,17 @@ This is final support target matrix, not means currently supported or implemente
   - [x] `/` Arithmetic divide
   - [x] `**` Arithmetic power
   - [x] `%` Modulus
-  - [ ] `>` Relational larger than
-  - [ ] `>=` Relational larger or equal than
-  - [ ] `<` Relational less than
-  - [ ] `<=` Relational less or equal than
+  - [x] `>` Relational larger than
+  - [x] `>=` Relational larger or equal than
+  - [x] `<` Relational less than
+  - [x] `<=` Relational less or equal than
   - [ ] `!` Logical negation
   - [ ] `&&` Logical and
   - [ ] `||` Logical or
-  - [ ] `==` Logical equality
-  - [ ] `!=` Logical inequality
-  - [ ] `===` Case equality
-  - [ ] `!==` Case inequality
+  - [x] `==` Logical equality
+  - [x] `!=` Logical inequality
+  - [x] `===` Case equality
+  - [x] `!==` Case inequality
   - [ ] `~` Bitwise negation
   - [ ] `&` Bitwise and
   - [ ] `|` Bitwise inclusive or
@@ -450,7 +450,42 @@ They handle `x` and `z` value in a very clear way: the `unary +` will return the
 
 #### Relational operators
 
-There are 4 relational operators: `<`, `>`, `<=` and `>=`. The result is always 1-bit unsigned number: `0`/`1`/`x`. Like arithmetic operators, if nay operand's any bit value is `x` or `z`, then result is `1'bx`.
+There are 4 relational operators: `<`, `>`, `<=` and `>=`. The result is always a 1-bit unsigned number: `0`/`1`/`x`. If either operand contains any `x` or `z` bit, the result is `1'bx`.
+
+Operand unification follows LRM 1364-2005 §5.5.2 and is shared with the equality operators. The relational expression first decides a single propagated context for both operands:
+
+- **Width** = `max(L(lhs), L(rhs))`.
+- **Signedness** = signed iff *both* operands are signed; otherwise unsigned.
+
+That propagated context is pushed down through any context-determined sub-expressions (e.g. unary `-`, binary `+`/`*`/...) until it reaches a leaf primary. Extension at the primary is decided by the **propagated** signedness, not by the primary's own signedness:
+
+- Propagated context is **unsigned** → narrower side is **zero-extended**, regardless of whether that side was originally signed.
+- Propagated context is **signed** → narrower side is **sign-extended**.
+
+Once both operands are at the same width under the unified type, the comparison is performed as integers in that type. The 1-bit result is independent of the rest of the surrounding expression (LRM §5.5.2 last paragraph).
+
+Practical consequences (verified against iverilog as the golden reference):
+
+- `4'sb1111 < 8'd255` → `1'b1`. The signed `4'sb1111` zero-extends to `8'b00001111` (= 15) under the unsigned context — *not* `8'b11111111`.
+- `-4'sb1000 < 8'd9` → `1'b0`. Propagation passes through unary `-` to the primary `4'sb1000`, which zero-extends to `0000_1000` = 8; negation at 8-bit unsigned wraps to `1111_1000` = 248; 248 < 9 is false.
+
+#### Equality operators
+
+There are 4 equality operators: logical `==` and `!=`, and case `===` and `!==`. The result is always a 1-bit unsigned number. Equality is one precedence level *lower* than relational (LRM §5.1.8).
+
+Operand unification is identical to the relational operators (see above). After unification:
+
+- **`==` / `!=`** (logical equality) follow LRM §5.1.8. The result is `1'bx` only when the relation is *ambiguous*. Concretely:
+  - If any bit position has a *definite* mismatch (one side is `0`, the other side is `1`), the operands are definitely unequal regardless of any `x`/`z` elsewhere — `==` returns `0`, `!=` returns `1`.
+  - Otherwise, if any bit position involves `x` or `z`, the result is `1'bx`.
+  - Otherwise, all bits match and the operands are equal.
+- **`===` / `!==`** (case equality) compare the two operands bit-for-bit, treating `x` as matching only `x` and `z` as matching only `z`. The result is always a known `0` or `1`, never `x`.
+
+Width-extension on `===` / `!==` follows LRM §5.5.4: the special "fill with `x`/`z` when the sign bit is `x`/`z`" rule applies *only* when the propagated context is signed (i.e. both operands are signed). Under an unsigned propagated context the narrower side is always zero-extended, even if its MSB is `x` or `z`. Examples (iverilog-confirmed):
+
+- `4'sbx000 === 8'sbxxxxx000` → `1'b1` (both signed → x-fill).
+- `4'sbx000 === 8'b0000x000` → `1'b1` (mixed → unsigned context → zero-fill).
+- `4'sbx000 === 8'bxxxxx000` → `1'b0` (mixed; the upper `xxxx` of RHS does not match the zero-filled upper bits of LHS).
 
 ### Packed vs unpacked array
 

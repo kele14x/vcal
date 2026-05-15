@@ -2,10 +2,11 @@
 
 ## Current State
 
-- Phases 1, 2, and 3 complete. No active phase; next-phase scope is TBD.
+- Phases 1–4 complete. No active phase; next-phase scope is TBD.
 - Phase 1 — REPL shell, integer literals (all LRM forms), `$finish`/`$stop`. Done.
 - Phase 2 — arithmetic ops (`+ - * / % **`, unary), two-pass width handling, leftmost-base propagation, rustyline history. Done.
-- Phase 3 — relational ops (`<`, `>`, `<=`, `>=`) with LRM-correct sign-extend-then-reinterpret semantics, 1-bit binary result, x/z propagation. Done.
+- Phase 3 — relational ops (`<`, `>`, `<=`, `>=`) with LRM 5.5.2 propagated-context unification (zero-extend at the leaf primary when context is unsigned, sign-extend when signed), 1-bit unsigned result, x/z propagation. Done.
+- Phase 4 — equality ops (`==`, `!=`, `===`, `!==`) sharing the relational unification path; per-bit ambiguity for `==`/`!=` (a definite mismatch defeats x), bit-for-bit including x/z for `===`/`!==`; corrected `context_extension_bit` to zero-fill under unsigned propagated context. Done.
 
 ## Current Scope
 
@@ -13,16 +14,17 @@
 - Integer literals and parentheses
 - Integer arithmetic operators (`+`, `-`, `*`, `/`, `%`, `**`, plus unary `+` / `-`)
 - Relational operators (`<`, `>`, `<=`, `>=`) — 1-bit unsigned binary result
+- Equality operators (`==`, `!=`, `===`, `!==`) — 1-bit unsigned binary result
 - No variables, declarations, strings, real numbers, concatenation
-- No equality (`==`/`!=`/`===`/`!==`), no logical (`&&`/`||`/`!`), no bitwise, no shifts
+- No logical (`&&`/`||`/`!`), no bitwise, no shifts
 
 ## Active Phase
 
-No active phase. Next-phase scope is TBD — confirm with the user before starting new work. Likely candidates are equality (`==`/`!=`/`===`/`!==`), logical (`&&`/`||`/`!`), bitwise, or shift operators; see README's "Supported Matrix" for the full target.
+No active phase. Next-phase scope is TBD — confirm with the user before starting new work. Likely candidates are logical (`&&`/`||`/`!`), bitwise (`& | ^ ~`), or shift operators (`<< >> <<< >>>`); see README's "Supported Matrix" for the full target.
 
 ## Backlog
 
-See README's "Supported Matrix" for the final target. Phase scoping for everything beyond Phase 3 is TBD — confirm with the user before starting work outside the active phase.
+See README's "Supported Matrix" for the final target. Phase scoping for everything beyond Phase 4 is TBD — confirm with the user before starting work outside the active phase.
 
 ## Commands
 
