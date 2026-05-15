@@ -246,6 +246,10 @@ enum BinaryOp {
     Divide,
     Modulus,
     Power,
+    LessThan,
+    GreaterThan,
+    LessThanOrEqual,
+    GreaterThanOrEqual,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -259,6 +263,10 @@ enum Token {
     Slash,
     Percent,
     Power,
+    Less,
+    Greater,
+    LessEqual,
+    GreaterEqual,
 }
 
 struct Parser {
@@ -418,6 +426,22 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::Star);
                 }
             }
+            '<' => {
+                if matches!(chars.peek(), Some((_, '='))) {
+                    chars.next();
+                    tokens.push(Token::LessEqual);
+                } else {
+                    tokens.push(Token::Less);
+                }
+            }
+            '>' => {
+                if matches!(chars.peek(), Some((_, '='))) {
+                    chars.next();
+                    tokens.push(Token::GreaterEqual);
+                } else {
+                    tokens.push(Token::Greater);
+                }
+            }
             '\'' => {
                 tokens.push(Token::IntegerLiteral(read_based_literal_after_apostrophe(
                     &mut chars,
@@ -558,12 +582,36 @@ where
 }
 
 fn is_expression_delimiter(ch: char) -> bool {
-    matches!(ch, '(' | ')' | '+' | '-' | '*' | '/' | '%')
+    matches!(ch, '(' | ')' | '+' | '-' | '*' | '/' | '%' | '<' | '>')
 }
 
 impl Parser {
     fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_additive()
+        self.parse_relational()
+    }
+
+    fn parse_relational(&mut self) -> Result<Expr, String> {
+        let mut expression = self.parse_additive()?;
+
+        loop {
+            let op = match self.peek() {
+                Some(Token::Less) => BinaryOp::LessThan,
+                Some(Token::Greater) => BinaryOp::GreaterThan,
+                Some(Token::LessEqual) => BinaryOp::LessThanOrEqual,
+                Some(Token::GreaterEqual) => BinaryOp::GreaterThanOrEqual,
+                _ => break,
+            };
+            self.index += 1;
+
+            let rhs = self.parse_additive()?;
+            expression = Expr::Binary {
+                op,
+                lhs: Box::new(expression),
+                rhs: Box::new(rhs),
+            };
+        }
+
+        Ok(expression)
     }
 
     fn parse_additive(&mut self) -> Result<Expr, String> {
@@ -660,7 +708,8 @@ impl Parser {
             }
             Some(Token::RParen) => Err("unexpected closing parenthesis".to_string()),
             Some(Token::Plus) | Some(Token::Minus) | Some(Token::Star) | Some(Token::Slash)
-            | Some(Token::Percent) | Some(Token::Power) => {
+            | Some(Token::Percent) | Some(Token::Power) | Some(Token::Less)
+            | Some(Token::Greater) | Some(Token::LessEqual) | Some(Token::GreaterEqual) => {
                 Err("expected expression operand".to_string())
             }
             None => Err("unexpected end of expression".to_string()),
@@ -734,6 +783,14 @@ fn combine_binary_meta(op: BinaryOp, lhs_meta: ExprMeta, rhs_meta: ExprMeta) -> 
             signed: lhs_meta.signed,
             base: lhs_meta.base,
         },
+        BinaryOp::LessThan
+        | BinaryOp::GreaterThan
+        | BinaryOp::LessThanOrEqual
+        | BinaryOp::GreaterThanOrEqual => ExprMeta {
+            width: 1,
+            signed: false,
+            base: Base::Binary,
+        },
     }
 }
 
@@ -784,6 +841,17 @@ fn evaluate_binary_expr(
 ) -> Result<IntegerValue, String> {
     let lhs_meta = infer_expr_meta(lhs)?;
     let rhs_meta = infer_expr_meta(rhs)?;
+
+    if matches!(
+        op,
+        BinaryOp::LessThan
+            | BinaryOp::GreaterThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThanOrEqual
+    ) {
+        return evaluate_relational_expr(op, lhs, rhs, lhs_meta, rhs_meta, context);
+    }
+
     let meta = combine_binary_meta(op, lhs_meta, rhs_meta);
     let effective_meta = ExprMeta {
         width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
@@ -881,6 +949,80 @@ fn evaluate_binary_expr(
                 lhs_meta.base,
             ))
         }
+        BinaryOp::LessThan
+        | BinaryOp::GreaterThan
+        | BinaryOp::LessThanOrEqual
+        | BinaryOp::GreaterThanOrEqual => {
+            unreachable!("relational ops dispatched to evaluate_relational_expr")
+        }
+    }
+}
+
+fn evaluate_relational_expr(
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_meta: ExprMeta,
+    rhs_meta: ExprMeta,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let operand_width = usize::max(lhs_meta.width, rhs_meta.width);
+    let comparison_signed = lhs_meta.signed && rhs_meta.signed;
+
+    // Each operand widens using its OWN signedness — sign-extension preserves
+    // the signed value at the wider width before comparison-time
+    // reinterpretation as unsigned (LRM 5.5.1).
+    let lhs_context = ExprMeta {
+        width: operand_width,
+        signed: lhs_meta.signed,
+        base: lhs_meta.base,
+    };
+    let rhs_context = ExprMeta {
+        width: operand_width,
+        signed: rhs_meta.signed,
+        base: rhs_meta.base,
+    };
+
+    let lhs_value = evaluate_expr_in_context(lhs, Some(lhs_context))?;
+    let rhs_value = evaluate_expr_in_context(rhs, Some(rhs_context))?;
+
+    if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
+        return Ok(widen_relational_result(
+            IntegerValue::all_x(1, false, Base::Binary),
+            context,
+        ));
+    }
+
+    let lhs_int = lhs_value.as_bigint(comparison_signed);
+    let rhs_int = rhs_value.as_bigint(comparison_signed);
+
+    let comparison_result = match op {
+        BinaryOp::LessThan => lhs_int < rhs_int,
+        BinaryOp::GreaterThan => lhs_int > rhs_int,
+        BinaryOp::LessThanOrEqual => lhs_int <= rhs_int,
+        BinaryOp::GreaterThanOrEqual => lhs_int >= rhs_int,
+        _ => unreachable!("non-relational op in evaluate_relational_expr"),
+    };
+
+    let bit = if comparison_result {
+        LogicBit::One
+    } else {
+        LogicBit::Zero
+    };
+    let result = IntegerValue {
+        width: 1,
+        signed: false,
+        base: Base::Binary,
+        bits: vec![bit],
+    };
+
+    Ok(widen_relational_result(result, context))
+}
+
+fn widen_relational_result(result: IntegerValue, context: Option<ExprMeta>) -> IntegerValue {
+    match context {
+        Some(ctx) if ctx.width > 1 => result.resized_to_context(ctx.width, false),
+        _ => result,
     }
 }
 
@@ -902,6 +1044,22 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
             })
         }
         Expr::Binary { op, lhs, rhs } => {
+            if matches!(
+                op,
+                BinaryOp::LessThan
+                    | BinaryOp::GreaterThan
+                    | BinaryOp::LessThanOrEqual
+                    | BinaryOp::GreaterThanOrEqual
+            ) {
+                let lhs_meta = infer_expr_meta(lhs)?;
+                let rhs_meta = infer_expr_meta(rhs)?;
+                let value = evaluate_relational_expr(*op, lhs, rhs, lhs_meta, rhs_meta, None)?;
+                if value.has_unknown_bits() {
+                    return Err("expression contains unknown bits".to_string());
+                }
+                return Ok(value.as_bigint(false));
+            }
+
             let lhs_value = evaluate_expr_as_math_bigint(lhs)?;
             let rhs_value = evaluate_expr_as_math_bigint(rhs)?;
 
@@ -924,6 +1082,10 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                     }
                 }
                 BinaryOp::Power => evaluate_power(lhs_value, rhs_value),
+                BinaryOp::LessThan
+                | BinaryOp::GreaterThan
+                | BinaryOp::LessThanOrEqual
+                | BinaryOp::GreaterThanOrEqual => unreachable!("handled above"),
             }
         }
     }
@@ -1741,5 +1903,152 @@ mod tests {
 
         assert_eq!(binary.output, "4'b1111");
         assert_eq!(hex.output, "8'hff");
+    }
+
+    #[test]
+    fn tokenizes_le_and_ge_as_single_tokens() {
+        let le = tokenize("4 <= 5").expect("<= should tokenize");
+        let ge = tokenize("4 >= 5").expect(">= should tokenize");
+        let lt = tokenize("4 < 5").expect("< should tokenize");
+        let gt = tokenize("4 > 5").expect("> should tokenize");
+
+        assert_eq!(le.len(), 3);
+        assert_eq!(le[1], Token::LessEqual);
+        assert_eq!(ge.len(), 3);
+        assert_eq!(ge[1], Token::GreaterEqual);
+        assert_eq!(lt[1], Token::Less);
+        assert_eq!(gt[1], Token::Greater);
+    }
+
+    #[test]
+    fn relational_binds_looser_than_additive() {
+        // 1 + 2 < 4 parses as (1 + 2) < 4 → 3 < 4 → true
+        let expr = parse_expression("1 + 2 < 4").expect("parse");
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::LessThan,
+                lhs,
+                ..
+            } => assert!(matches!(*lhs, Expr::Binary { op: BinaryOp::Add, .. })),
+            other => panic!("expected top-level <, got {other:?}"),
+        }
+
+        let result = evaluate_input("1 + 2 < 4").expect("precedence");
+        assert_eq!(result.output, "1'b1");
+    }
+
+    #[test]
+    fn relational_is_left_associative() {
+        // 4 < 5 < 1 parses as (4 < 5) < 1 → 1 < 1 → false
+        let expr = parse_expression("4 < 5 < 1").expect("parse");
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::LessThan,
+                lhs,
+                ..
+            } => assert!(matches!(
+                *lhs,
+                Expr::Binary {
+                    op: BinaryOp::LessThan,
+                    ..
+                }
+            )),
+            other => panic!("expected top-level <, got {other:?}"),
+        }
+
+        let result = evaluate_input("4 < 5 < 1").expect("assoc");
+        assert_eq!(result.output, "1'b0");
+    }
+
+    #[test]
+    fn evaluates_basic_unsigned_relational_operators() {
+        let lt = evaluate_input("4'd3 < 4'd5").expect("lt");
+        let gt = evaluate_input("4'd5 > 4'd3").expect("gt");
+        let le_eq = evaluate_input("4'd3 <= 4'd3").expect("le eq");
+        let ge_eq = evaluate_input("4'd3 >= 4'd3").expect("ge eq");
+        let le_false = evaluate_input("4'd4 <= 4'd3").expect("le false");
+        let ge_false = evaluate_input("4'd2 >= 4'd3").expect("ge false");
+
+        assert_eq!(lt.output, "1'b1");
+        assert_eq!(gt.output, "1'b1");
+        assert_eq!(le_eq.output, "1'b1");
+        assert_eq!(ge_eq.output, "1'b1");
+        assert_eq!(le_false.output, "1'b0");
+        assert_eq!(ge_false.output, "1'b0");
+    }
+
+    #[test]
+    fn signed_relational_uses_real_world_signed_comparison() {
+        let three_lt_five = evaluate_input("4'sd3 < 4'sd5").expect("signed lt");
+        let neg_lt = evaluate_input("-4'sd1 < 4'sd2").expect("signed neg lt");
+        let neg_gt_neg = evaluate_input("-4'sd1 > -4'sd2").expect("signed neg/neg");
+
+        assert_eq!(three_lt_five.output, "1'b1");
+        assert_eq!(neg_lt.output, "1'b1");
+        assert_eq!(neg_gt_neg.output, "1'b1");
+    }
+
+    #[test]
+    fn mixed_signedness_uses_unsigned_comparison() {
+        // -4'sd1 has bits 1111 → reinterpreted as unsigned 15; 15 > 0
+        let neg_one_gt_zero = evaluate_input("-4'sd1 > 4'd0").expect("neg vs unsigned");
+        // -4'sd1 sign-extends to 11111111 (= 255 unsigned); 255 > 0
+        let neg_one_gt_zero_widened = evaluate_input("-4'sd1 > 8'd0").expect("widened");
+        // 4'sd2 sign-extends to 00000010 (= 2 unsigned); 2 > 5 is false
+        let two_not_gt_five = evaluate_input("4'sd2 > 8'd5").expect("not gt");
+
+        assert_eq!(neg_one_gt_zero.output, "1'b1");
+        assert_eq!(neg_one_gt_zero_widened.output, "1'b1");
+        assert_eq!(two_not_gt_five.output, "1'b0");
+    }
+
+    #[test]
+    fn mixed_signedness_extends_before_reinterpreting_as_unsigned() {
+        // LRM ordering trap: width extension uses each operand's OWN signedness
+        // FIRST, then both bit patterns are reinterpreted as unsigned for the
+        // comparison. Reversed ordering (reinterpret first, then zero-extend)
+        // would give a different answer here.
+        //
+        // -4'sd1 sign-extends to 8 bits as `11111111` (= unsigned 255).
+        // 255 > 16 → TRUE. Reversed-order would zero-extend `1111` to
+        // `00001111` = 15, and 15 > 16 → FALSE (LRM-incorrect).
+        let gt = evaluate_input("-4'sd1 > 8'd16").expect("ordering > case");
+        let lt = evaluate_input("-4'sd1 < 8'd16").expect("ordering < case");
+
+        assert_eq!(gt.output, "1'b1");
+        assert_eq!(lt.output, "1'b0");
+    }
+
+    #[test]
+    fn unsigned_relational_zero_extends_smaller_operand() {
+        // 4'd1 zero-extends to 8 bits = 8'd1; 16 > 1 → true
+        let result = evaluate_input("8'd16 > 4'd1").expect("widen unsigned");
+        assert_eq!(result.output, "1'b1");
+    }
+
+    #[test]
+    fn relational_propagates_unknown_bits_as_one_bit_x() {
+        let with_x_lhs = evaluate_input("4'bx < 4'd1").expect("x lhs");
+        let with_z_rhs = evaluate_input("4'd0 < 4'bz").expect("z rhs");
+        let with_partial_x = evaluate_input("4'b01x0 > 4'd1").expect("partial x");
+
+        assert_eq!(with_x_lhs.output, "1'bx");
+        assert_eq!(with_z_rhs.output, "1'bx");
+        assert_eq!(with_partial_x.output, "1'bx");
+    }
+
+    #[test]
+    fn relational_result_widens_to_outer_arithmetic_context() {
+        // (4'd3 < 4'd5) → 1'b1; outer + widens result to 4 bits.
+        // Leftmost-base wins: relational's Binary; outer + is unsigned (mixed).
+        let result = evaluate_input("(4'd3 < 4'd5) + 4'd0").expect("widened");
+        assert_eq!(result.output, "4'b0001");
+    }
+
+    #[test]
+    fn relational_result_renders_in_binary_regardless_of_operand_base() {
+        // Both operands hex but the 1-bit relational result is binary.
+        let hex_compare = evaluate_input("8'h0a < 8'h0f").expect("hex compare");
+        assert_eq!(hex_compare.output, "1'b1");
     }
 }
