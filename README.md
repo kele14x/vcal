@@ -178,9 +178,9 @@ This is final support target matrix, not means currently supported or implemente
   - [x] `>=` Relational larger or equal than
   - [x] `<` Relational less than
   - [x] `<=` Relational less or equal than
-  - [ ] `!` Logical negation
-  - [ ] `&&` Logical and
-  - [ ] `||` Logical or
+  - [x] `!` Logical negation
+  - [x] `&&` Logical and
+  - [x] `||` Logical or
   - [x] `==` Logical equality
   - [x] `!=` Logical inequality
   - [x] `===` Case equality
@@ -486,6 +486,10 @@ Width-extension on `===` / `!==` follows LRM §5.5.4: the special "fill with `x`
 - `4'sbx000 === 8'sbxxxxx000` → `1'b1` (both signed → x-fill).
 - `4'sbx000 === 8'b0000x000` → `1'b1` (mixed → unsigned context → zero-fill).
 - `4'sbx000 === 8'bxxxxx000` → `1'b0` (mixed; the upper `xxxx` of RHS does not match the zero-filled upper bits of LHS).
+
+#### Logical operators
+
+There are 3 logical operators: `&&`, `||` and `!`. `!` is unary operator so has higher precedence. The precedence of `&&` is greater than `||`. The result of logical operators is always 1-bit unsigned so they are very like relational and equality operators.
 
 ### Packed vs unpacked array
 
