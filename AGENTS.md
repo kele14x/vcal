@@ -2,51 +2,23 @@
 
 ## Current State
 
-- Phases 1 and 2 complete; Phase 3 (relational operators) is the active phase.
+- Phases 1, 2, and 3 complete. No active phase; next-phase scope is TBD.
 - Phase 1 — REPL shell, integer literals (all LRM forms), `$finish`/`$stop`. Done.
 - Phase 2 — arithmetic ops (`+ - * / % **`, unary), two-pass width handling, leftmost-base propagation, rustyline history. Done.
-- Phase 3 — relational operators (`<`, `>`, `<=`, `>=`). In progress; checklist below.
+- Phase 3 — relational ops (`<`, `>`, `<=`, `>=`) with LRM-correct sign-extend-then-reinterpret semantics, 1-bit binary result, x/z propagation. Done.
 
 ## Current Scope
 
 - Single-line REPL input only
 - Integer literals and parentheses
 - Integer arithmetic operators (`+`, `-`, `*`, `/`, `%`, `**`, plus unary `+` / `-`)
+- Relational operators (`<`, `>`, `<=`, `>=`) — 1-bit unsigned binary result
 - No variables, declarations, strings, real numbers, concatenation
-- No equality (`==`/`!=`/`===`/`!==`), no logical (`&&`/`||`/`!`), no bitwise, no shifts, no variables, no strings, no real numbers
+- No equality (`==`/`!=`/`===`/`!==`), no logical (`&&`/`||`/`!`), no bitwise, no shifts
 
-## Active Phase: Phase 3 target
+## Active Phase
 
-REPL UX:
-
-- (no REPL UX changes scoped for Phase 3)
-
-LRM features:
-
-- [ ] Relational operators from IEEE 1364-2005 section 5.1.7:
-  - [ ] `<`
-  - [ ] `>`
-  - [ ] `<=`
-  - [ ] `>=`
-- [ ] Tokenize multi-character `<=` and `>=` correctly
-- [ ] Support relational operator precedence and left-associativity per LRM Table 22 (below additive, above the future equality level)
-- [ ] Size both operands to the larger of their two widths, treating the comparison as unsigned if either operand is unsigned
-- [ ] Isolate relational operands from outer context width (a wider parent context cannot widen the operand evaluation, unlike arithmetic)
-- [ ] Produce a 1-bit unsigned result that zero-extends when used in a wider parent context
-- [ ] Propagate `x`/`z` through relational operators as a `1'bx` result
-- [ ] Implement signed vs unsigned comparison per LRM 5.1.7
-- [ ] Add unit tests for precedence, associativity, signed/unsigned mixing, x/z propagation, result widening, and `<=` parsing as relational
-
-Non-LRM features:
-
-- [ ] Render the 1-bit relational result always in binary (`1'b1` / `1'b0` / `1'bx`); the leftmost-wins base rule does not apply
-
-Implementation notes:
-
-- The result is intrinsically 1-bit unsigned; outer context can only zero-extend the result, never widen the comparison itself.
-- Operand widening is bounded by the larger of the two operand widths — internal arithmetic inside an operand may still widen up to that bound, but no further.
-- `<=` is relational only in Phase 3 — once variables and procedural blocks land, the parser will need to disambiguate against non-blocking assignment by context. This is a forward-compatibility concern, not a Phase 3 task.
-- The exponent of `**` remains self-determined; relational subexpressions used as `**` exponent are still self-determined per LRM.
+No active phase. Next-phase scope is TBD — confirm with the user before starting new work. Likely candidates are equality (`==`/`!=`/`===`/`!==`), logical (`&&`/`||`/`!`), bitwise, or shift operators; see README's "Supported Matrix" for the full target.
 
 ## Backlog
 
