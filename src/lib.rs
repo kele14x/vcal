@@ -242,6 +242,7 @@ enum Expr {
 enum UnaryOp {
     Plus,
     Minus,
+    LogicalNot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +261,8 @@ enum BinaryOp {
     NotEqual,
     CaseEqual,
     CaseNotEqual,
+    LogicalAnd,
+    LogicalOr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,6 +284,9 @@ enum Token {
     NotEqual,
     CaseEqual,
     CaseNotEqual,
+    Bang,
+    LogicalAnd,
+    LogicalOr,
 }
 
 struct Parser {
@@ -469,16 +475,31 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 }
             }
             '!' => {
-                if !matches!(chars.peek(), Some((_, '='))) {
-                    return Err("expected `!=` or `!==`".to_string());
-                }
-                chars.next();
                 if matches!(chars.peek(), Some((_, '='))) {
                     chars.next();
-                    tokens.push(Token::CaseNotEqual);
+                    if matches!(chars.peek(), Some((_, '='))) {
+                        chars.next();
+                        tokens.push(Token::CaseNotEqual);
+                    } else {
+                        tokens.push(Token::NotEqual);
+                    }
                 } else {
-                    tokens.push(Token::NotEqual);
+                    tokens.push(Token::Bang);
                 }
+            }
+            '&' => {
+                if !matches!(chars.peek(), Some((_, '&'))) {
+                    return Err("expected `&&`".to_string());
+                }
+                chars.next();
+                tokens.push(Token::LogicalAnd);
+            }
+            '|' => {
+                if !matches!(chars.peek(), Some((_, '|'))) {
+                    return Err("expected `||`".to_string());
+                }
+                chars.next();
+                tokens.push(Token::LogicalOr);
             }
             '\'' => {
                 tokens.push(Token::IntegerLiteral(read_based_literal_after_apostrophe(
@@ -622,13 +643,56 @@ where
 fn is_expression_delimiter(ch: char) -> bool {
     matches!(
         ch,
-        '(' | ')' | '+' | '-' | '*' | '/' | '%' | '<' | '>' | '=' | '!'
+        '(' | ')'
+            | '+'
+            | '-'
+            | '*'
+            | '/'
+            | '%'
+            | '<'
+            | '>'
+            | '='
+            | '!'
+            | '&'
+            | '|'
     )
 }
 
 impl Parser {
     fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_equality()
+        self.parse_logical_or()
+    }
+
+    fn parse_logical_or(&mut self) -> Result<Expr, String> {
+        let mut expression = self.parse_logical_and()?;
+
+        while matches!(self.peek(), Some(Token::LogicalOr)) {
+            self.index += 1;
+            let rhs = self.parse_logical_and()?;
+            expression = Expr::Binary {
+                op: BinaryOp::LogicalOr,
+                lhs: Box::new(expression),
+                rhs: Box::new(rhs),
+            };
+        }
+
+        Ok(expression)
+    }
+
+    fn parse_logical_and(&mut self) -> Result<Expr, String> {
+        let mut expression = self.parse_equality()?;
+
+        while matches!(self.peek(), Some(Token::LogicalAnd)) {
+            self.index += 1;
+            let rhs = self.parse_equality()?;
+            expression = Expr::Binary {
+                op: BinaryOp::LogicalAnd,
+                lhs: Box::new(expression),
+                rhs: Box::new(rhs),
+            };
+        }
+
+        Ok(expression)
     }
 
     fn parse_equality(&mut self) -> Result<Expr, String> {
@@ -746,6 +810,7 @@ impl Parser {
         let op = match self.peek() {
             Some(Token::Plus) => Some(UnaryOp::Plus),
             Some(Token::Minus) => Some(UnaryOp::Minus),
+            Some(Token::Bang) => Some(UnaryOp::LogicalNot),
             _ => None,
         };
 
@@ -776,7 +841,8 @@ impl Parser {
             | Some(Token::Percent) | Some(Token::Power) | Some(Token::Less)
             | Some(Token::Greater) | Some(Token::LessEqual) | Some(Token::GreaterEqual)
             | Some(Token::EqualEqual) | Some(Token::NotEqual) | Some(Token::CaseEqual)
-            | Some(Token::CaseNotEqual) => Err("expected expression operand".to_string()),
+            | Some(Token::CaseNotEqual) | Some(Token::Bang) | Some(Token::LogicalAnd)
+            | Some(Token::LogicalOr) => Err("expected expression operand".to_string()),
             None => Err("unexpected end of expression".to_string()),
         }
     }
@@ -823,6 +889,11 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
         Expr::Grouped(expr) => infer_expr_meta(expr),
         Expr::Unary { op, expr } => match op {
             UnaryOp::Plus | UnaryOp::Minus => infer_expr_meta(expr),
+            UnaryOp::LogicalNot => Ok(ExprMeta {
+                width: 1,
+                signed: false,
+                base: Base::Binary,
+            }),
         },
         Expr::Binary { op, lhs, rhs } => {
             let lhs_meta = infer_expr_meta(lhs)?;
@@ -855,7 +926,9 @@ fn combine_binary_meta(op: BinaryOp, lhs_meta: ExprMeta, rhs_meta: ExprMeta) -> 
         | BinaryOp::Equal
         | BinaryOp::NotEqual
         | BinaryOp::CaseEqual
-        | BinaryOp::CaseNotEqual => ExprMeta {
+        | BinaryOp::CaseNotEqual
+        | BinaryOp::LogicalAnd
+        | BinaryOp::LogicalOr => ExprMeta {
             width: 1,
             signed: false,
             base: Base::Binary,
@@ -868,6 +941,22 @@ fn evaluate_unary_expr(
     expr: &Expr,
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
+    if op == UnaryOp::LogicalNot {
+        // LRM 5.4: logical operands are self-determined — evaluate without
+        // pushing a context down, reduce to the operand's logical value, then
+        // apply the !-truth table from §5.1.9.
+        let operand = evaluate_expr_in_context(expr, None)?;
+        let bit = match logical_value(&operand) {
+            LogicBit::One => LogicBit::Zero,
+            LogicBit::Zero => LogicBit::One,
+            LogicBit::X | LogicBit::Z => LogicBit::X,
+        };
+        return Ok(widen_relational_result(
+            comparison_result_value(bit),
+            context,
+        ));
+    }
+
     let meta = infer_expr_meta(expr)?;
     // LRM 5.5.2: unary +/- is context-determined — propagated size AND
     // signedness must reach the inner primary. Falling back to the operand's
@@ -897,6 +986,7 @@ fn evaluate_unary_expr(
     let result = match op {
         UnaryOp::Minus => -value,
         UnaryOp::Plus => unreachable!("handled before arithmetic evaluation"),
+        UnaryOp::LogicalNot => unreachable!("handled by early-return path"),
     };
 
     Ok(IntegerValue::from_bigint(
@@ -931,6 +1021,10 @@ fn evaluate_binary_expr(
         BinaryOp::Equal | BinaryOp::NotEqual | BinaryOp::CaseEqual | BinaryOp::CaseNotEqual
     ) {
         return evaluate_equality_expr(op, lhs, rhs, lhs_meta, rhs_meta, context);
+    }
+
+    if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
+        return evaluate_logical_expr(op, lhs, rhs, context);
     }
 
     let meta = combine_binary_meta(op, lhs_meta, rhs_meta);
@@ -1039,6 +1133,9 @@ fn evaluate_binary_expr(
         BinaryOp::Equal | BinaryOp::NotEqual | BinaryOp::CaseEqual | BinaryOp::CaseNotEqual => {
             unreachable!("equality ops dispatched to evaluate_equality_expr")
         }
+        BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
+            unreachable!("logical ops dispatched to evaluate_logical_expr")
+        }
     }
 }
 
@@ -1079,6 +1176,50 @@ fn comparison_result_value(bit: LogicBit) -> IntegerValue {
         base: Base::Binary,
         bits: vec![bit],
     }
+}
+
+// LRM 5.1.9: an operand reduces to its logical value before the
+// !/&&/|| truth table applies. Any 1 bit makes the operand definitely
+// true; all-zero is definitely false; otherwise (any x/z, no 1) the
+// operand is ambiguous and reduces to x.
+fn logical_value(value: &IntegerValue) -> LogicBit {
+    if value.bits.iter().any(|bit| *bit == LogicBit::One) {
+        LogicBit::One
+    } else if value.bits.iter().all(|bit| *bit == LogicBit::Zero) {
+        LogicBit::Zero
+    } else {
+        LogicBit::X
+    }
+}
+
+fn evaluate_logical_expr(
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    // LRM 5.4: each operand is self-determined, so we evaluate them in
+    // isolation rather than unifying widths the way relational/equality do.
+    let lhs_logical = logical_value(&evaluate_expr_in_context(lhs, None)?);
+    let rhs_logical = logical_value(&evaluate_expr_in_context(rhs, None)?);
+
+    // LRM 5.1.9 Table 5-7. Iverilog-confirmed via doc/four_value_ops_output.txt:
+    // a definite false defeats x in &&, a definite true defeats x in ||.
+    let bit = match op {
+        BinaryOp::LogicalAnd => match (lhs_logical, rhs_logical) {
+            (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
+            (LogicBit::One, LogicBit::One) => LogicBit::One,
+            _ => LogicBit::X,
+        },
+        BinaryOp::LogicalOr => match (lhs_logical, rhs_logical) {
+            (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
+            (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
+            _ => LogicBit::X,
+        },
+        _ => unreachable!("non-logical op in evaluate_logical_expr"),
+    };
+
+    Ok(widen_relational_result(comparison_result_value(bit), context))
 }
 
 fn evaluate_relational_expr(
@@ -1201,10 +1342,18 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
         }
         Expr::Grouped(expr) => evaluate_expr_as_math_bigint(expr),
         Expr::Unary { op, expr } => {
+            if matches!(op, UnaryOp::LogicalNot) {
+                let value = evaluate_unary_expr(*op, expr, None)?;
+                if value.has_unknown_bits() {
+                    return Err("expression contains unknown bits".to_string());
+                }
+                return Ok(value.as_bigint(false));
+            }
             let value = evaluate_expr_as_math_bigint(expr)?;
             Ok(match op {
                 UnaryOp::Plus => value,
                 UnaryOp::Minus => -value,
+                UnaryOp::LogicalNot => unreachable!("handled above"),
             })
         }
         Expr::Binary { op, lhs, rhs } => {
@@ -1240,6 +1389,14 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                 return Ok(value.as_bigint(false));
             }
 
+            if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
+                let value = evaluate_logical_expr(*op, lhs, rhs, None)?;
+                if value.has_unknown_bits() {
+                    return Err("expression contains unknown bits".to_string());
+                }
+                return Ok(value.as_bigint(false));
+            }
+
             let lhs_value = evaluate_expr_as_math_bigint(lhs)?;
             let rhs_value = evaluate_expr_as_math_bigint(rhs)?;
 
@@ -1269,7 +1426,9 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                 | BinaryOp::Equal
                 | BinaryOp::NotEqual
                 | BinaryOp::CaseEqual
-                | BinaryOp::CaseNotEqual => unreachable!("handled above"),
+                | BinaryOp::CaseNotEqual
+                | BinaryOp::LogicalAnd
+                | BinaryOp::LogicalOr => unreachable!("handled above"),
             }
         }
     }
@@ -2478,5 +2637,246 @@ mod tests {
         // (4'd3 == 4'd3) → 1'b1; outer + widens result to 4 bits.
         let result = evaluate_input("(4'd3 == 4'd3) + 4'd0").expect("widened");
         assert_eq!(result.output, "4'b0001");
+    }
+
+    // ---------- Logical operators (!, &&, ||) ----------
+    //
+    // All expected values were checked against the iverilog-generated truth
+    // tables in `doc/four_value_ops_output.txt`, which encode LRM 1364-2005
+    // §5.1.9 Table 5-7. Operands of !, &&, || are self-determined (LRM §5.4
+    // Table 5-22) — each operand is reduced to a 1-bit logical value before
+    // the truth table applies, so width unification is irrelevant.
+
+    #[test]
+    fn tokenizes_logical_operators_as_single_tokens() {
+        let and = tokenize("4'd1 && 4'd0").expect("&& should tokenize");
+        let or = tokenize("4'd1 || 4'd0").expect("|| should tokenize");
+        let bang = tokenize("!4'd0").expect("! should tokenize");
+
+        assert_eq!(and[1], Token::LogicalAnd);
+        assert_eq!(or[1], Token::LogicalOr);
+        assert_eq!(bang[0], Token::Bang);
+    }
+
+    #[test]
+    fn rejects_bare_ampersand_or_pipe_in_logical_phase() {
+        // Bitwise & and | are out of scope for this phase; a single &/| should
+        // be rejected rather than silently misinterpreted.
+        let amp = evaluate_input("4'd1 & 4'd0").expect_err("bare & should be rejected");
+        let pipe = evaluate_input("4'd1 | 4'd0").expect_err("bare | should be rejected");
+
+        assert_eq!(amp, "expected `&&`");
+        assert_eq!(pipe, "expected `||`");
+    }
+
+    #[test]
+    fn evaluates_logical_not_truth_table() {
+        let not_zero = evaluate_input("!1'b0").expect("!0");
+        let not_one = evaluate_input("!1'b1").expect("!1");
+        let not_x = evaluate_input("!1'bx").expect("!x");
+        let not_z = evaluate_input("!1'bz").expect("!z");
+
+        assert_eq!(not_zero.output, "1'b1");
+        assert_eq!(not_one.output, "1'b0");
+        assert_eq!(not_x.output, "1'bx");
+        assert_eq!(not_z.output, "1'bx");
+    }
+
+    #[test]
+    fn logical_not_reduces_across_operand_width() {
+        // Any 1 bit makes the operand definitely true; all-zero is false; an x
+        // or z with no 1 bit is ambiguous → x. A 1 bit defeats x in the
+        // reduction, so 4'b01x0 → false, not x.
+        let not_five = evaluate_input("!4'd5").expect("!5");
+        let not_zero8 = evaluate_input("!8'd0").expect("!8'd0");
+        let not_x_only = evaluate_input("!4'b00x0").expect("!00x0");
+        let not_one_with_x = evaluate_input("!4'b01x0").expect("!01x0");
+
+        assert_eq!(not_five.output, "1'b0");
+        assert_eq!(not_zero8.output, "1'b1");
+        assert_eq!(not_x_only.output, "1'bx");
+        assert_eq!(not_one_with_x.output, "1'b0");
+    }
+
+    #[test]
+    fn evaluates_logical_and_truth_table() {
+        // Table 5-7 cases including the "0 dominates x" and "1 && 1 = 1" rows.
+        let true_and_true = evaluate_input("4'd1 && 4'd1").expect("1&&1");
+        let true_and_false = evaluate_input("4'd5 && 4'd0").expect("5&&0");
+        let false_and_true = evaluate_input("4'd0 && 4'd5").expect("0&&5");
+        let false_and_x = evaluate_input("4'd0 && 4'bx").expect("0&&x");
+        let x_and_false = evaluate_input("4'bx && 4'd0").expect("x&&0");
+        let x_and_true = evaluate_input("4'bx && 4'd1").expect("x&&1");
+        let x_and_x = evaluate_input("4'bx && 4'bx").expect("x&&x");
+
+        assert_eq!(true_and_true.output, "1'b1");
+        assert_eq!(true_and_false.output, "1'b0");
+        assert_eq!(false_and_true.output, "1'b0");
+        assert_eq!(false_and_x.output, "1'b0");
+        assert_eq!(x_and_false.output, "1'b0");
+        assert_eq!(x_and_true.output, "1'bx");
+        assert_eq!(x_and_x.output, "1'bx");
+    }
+
+    #[test]
+    fn evaluates_logical_or_truth_table() {
+        let true_or_false = evaluate_input("4'd1 || 4'd0").expect("1||0");
+        let false_or_false = evaluate_input("4'd0 || 4'd0").expect("0||0");
+        let false_or_true = evaluate_input("4'd0 || 4'd5").expect("0||5");
+        let true_or_x = evaluate_input("4'd1 || 4'bx").expect("1||x");
+        let x_or_true = evaluate_input("4'bx || 4'd1").expect("x||1");
+        let x_or_false = evaluate_input("4'bx || 4'd0").expect("x||0");
+        let x_or_x = evaluate_input("4'bx || 4'bx").expect("x||x");
+
+        assert_eq!(true_or_false.output, "1'b1");
+        assert_eq!(false_or_false.output, "1'b0");
+        assert_eq!(false_or_true.output, "1'b1");
+        assert_eq!(true_or_x.output, "1'b1");
+        assert_eq!(x_or_true.output, "1'b1");
+        assert_eq!(x_or_false.output, "1'bx");
+        assert_eq!(x_or_x.output, "1'bx");
+    }
+
+    #[test]
+    fn logical_result_renders_in_binary_regardless_of_operand_base() {
+        // Operands hex but the 1-bit logical result is binary, like
+        // relational/equality.
+        let hex_and = evaluate_input("8'h0a && 8'h0f").expect("hex &&");
+        let hex_or = evaluate_input("8'h00 || 8'h0f").expect("hex ||");
+        let hex_not = evaluate_input("!8'h0a").expect("hex !");
+
+        assert_eq!(hex_and.output, "1'b1");
+        assert_eq!(hex_or.output, "1'b1");
+        assert_eq!(hex_not.output, "1'b0");
+    }
+
+    #[test]
+    fn logical_not_binds_tighter_than_power() {
+        // LRM Table 5-4: unary operators (including !) are higher precedence
+        // than **. So `!4'd0 ** 4'd2` parses as `(!4'd0) ** 4'd2` → 1**2 → 1.
+        let expr = parse_expression("!4'd0 ** 4'd2").expect("parse");
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::Power,
+                lhs,
+                ..
+            } => assert!(matches!(
+                *lhs,
+                Expr::Unary {
+                    op: UnaryOp::LogicalNot,
+                    ..
+                }
+            )),
+            other => panic!("expected top-level **, got {other:?}"),
+        }
+        let result = evaluate_input("!4'd0 ** 4'd2").expect("eval");
+        assert_eq!(result.output, "1'b1");
+    }
+
+    #[test]
+    fn logical_and_lower_precedence_than_equality() {
+        // `4'd0 == 4'd0 && 4'd1` parses as `(4'd0 == 4'd0) && 4'd1`.
+        let expr = parse_expression("4'd0 == 4'd0 && 4'd1").expect("parse");
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::LogicalAnd,
+                lhs,
+                ..
+            } => assert!(matches!(*lhs, Expr::Binary { op: BinaryOp::Equal, .. })),
+            other => panic!("expected top-level &&, got {other:?}"),
+        }
+        let result = evaluate_input("4'd0 == 4'd0 && 4'd1").expect("eval");
+        assert_eq!(result.output, "1'b1");
+    }
+
+    #[test]
+    fn logical_or_lower_precedence_than_logical_and() {
+        // `4'd1 || 4'd0 && 4'd0` parses as `4'd1 || (4'd0 && 4'd0)` → 1.
+        let expr = parse_expression("4'd1 || 4'd0 && 4'd0").expect("parse");
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::LogicalOr,
+                rhs,
+                ..
+            } => assert!(matches!(
+                *rhs,
+                Expr::Binary {
+                    op: BinaryOp::LogicalAnd,
+                    ..
+                }
+            )),
+            other => panic!("expected top-level ||, got {other:?}"),
+        }
+        let result = evaluate_input("4'd1 || 4'd0 && 4'd0").expect("eval");
+        assert_eq!(result.output, "1'b1");
+    }
+
+    #[test]
+    fn logical_not_chains_recursively() {
+        // !! parses as `!(!x)` because `!` is right-associative through
+        // the recursive parse_unary; it also lets us test that the inner
+        // 1'b0 from `!4'd5` is correctly fed back into `!`.
+        let result = evaluate_input("!!4'd5").expect("!!5");
+        let zero = evaluate_input("!!4'd0").expect("!!0");
+
+        assert_eq!(result.output, "1'b1");
+        assert_eq!(zero.output, "1'b0");
+    }
+
+    #[test]
+    fn logical_and_is_left_associative() {
+        // a && b && c parses as (a && b) && c; same shape check as the
+        // existing equality_is_left_associative test.
+        let expr = parse_expression("4'd1 && 4'd1 && 4'd1").expect("parse");
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::LogicalAnd,
+                lhs,
+                ..
+            } => assert!(matches!(
+                *lhs,
+                Expr::Binary {
+                    op: BinaryOp::LogicalAnd,
+                    ..
+                }
+            )),
+            other => panic!("expected top-level &&, got {other:?}"),
+        }
+        let result = evaluate_input("4'd1 && 4'd1 && 4'd0").expect("eval");
+        assert_eq!(result.output, "1'b0");
+    }
+
+    #[test]
+    fn logical_or_is_left_associative() {
+        let expr = parse_expression("4'd0 || 4'd0 || 4'd1").expect("parse");
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::LogicalOr,
+                lhs,
+                ..
+            } => assert!(matches!(
+                *lhs,
+                Expr::Binary {
+                    op: BinaryOp::LogicalOr,
+                    ..
+                }
+            )),
+            other => panic!("expected top-level ||, got {other:?}"),
+        }
+        let result = evaluate_input("4'd0 || 4'd0 || 4'd1").expect("eval");
+        assert_eq!(result.output, "1'b1");
+    }
+
+    #[test]
+    fn logical_result_widens_to_outer_arithmetic_context() {
+        // (4'd1 && 4'd1) → 1'b1; outer + widens to 4 bits and inherits the
+        // leftmost operand's binary base (the && result's base).
+        let result = evaluate_input("(4'd1 && 4'd1) + 4'd0").expect("widened &&");
+        let or_widened = evaluate_input("(4'd0 || 4'd0) + 4'd0").expect("widened ||");
+        let not_widened = evaluate_input("(!4'd0) + 4'd0").expect("widened !");
+
+        assert_eq!(result.output, "4'b0001");
+        assert_eq!(or_widened.output, "4'b0000");
+        assert_eq!(not_widened.output, "4'b0001");
     }
 }
