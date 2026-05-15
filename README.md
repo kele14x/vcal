@@ -386,6 +386,7 @@ Notes:
 
 - All operators shall associate left to right with the exception of the conditional operator, which shall associate right to left.
   - The `**` operator is still left to right association, for example `3 ** 3 ** 3 = (3 ** 3) ** 3 = 19683`. Which is different from Python (`3 ** 3 ** 3 = 7625597484987`).
+- Unary `+`/`-` bind tighter than `**`, for example `-2 ** 2 == 4`.
 - There is short-circuiting during expression evaluation.
 
 ### Width rules
@@ -400,6 +401,11 @@ Notes:
     - For example the `<` operator returns 1-bit unsigned result in all case. So the `a < b` expression is bit-width self-determined.
   - Context-determined expression: where the bit length of the expression is determined itself and the fact that it is part of another expression.
     - For example, the `=` statement, the bit size of the right-hand expression of an assignment depends on itself and the size of the left-hand side (LHS).
+- vcal evaluates expressions in two passes to satisfy these rules:
+  - First pass: bottom-up self-determined width/sign inference for each AST node.
+  - Second pass: top-down context-determined evaluation so a parent expression can widen child arithmetic before truncation. Required for cases like `(a + b) + 0`, where the outer expression width widens the inner arithmetic before overflow is applied.
+- For arithmetic operators (`+`, `-`, `*`, `/`, `%`, `**`), if any operand contains `x` or `z`, the result becomes all-`x` bits at the effective result width.
+- The exponent operand of `**` is treated as self-determined.
 
 ### Signedness rules
 
@@ -433,6 +439,18 @@ The base of an arithmetic result is inferred from its operands so the output kee
 - A binary operator (`+`, `-`, `*`, `/`, `%`, `**`) takes the **leftmost** operand's base. So `4'b0111 + 4'b1001` is `4'b0000`, `8'h0a + 8'b1` is `8'h0b`, and `8'b00001010 + 8'h05` is `8'b00001111`.
 - The leftmost-wins rule mirrors the left-to-right evaluation order of the supported operators. There is no automatic base "promotion" between bases.
 - All-`x` results inherit the same base. For wide non-decimal results this can be verbose (e.g. `4'bx + 1` prints as `32'bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`); this is intentional, matching how literals like `4'bx` already render as `4'bxxxx`.
+
+### Operators
+
+#### Arithmetic operators
+
+There are 8 arithmetic operators in Verilog: 2 unary operators: `unary +` and `unary -`; 6 binary operators: `+`, `-`, `*`, `/`, `%` and `**`.
+
+They handle `x` and `z` value in a very clear way: the `unary +` will return the bit the same, including `x` and `z`. For other operators, if any operand's any bit value is `x` or `z`, then the entire result value shall be all `x`.
+
+#### Relational operators
+
+There are 4 relational operators: `<`, `>`, `<=` and `>=`. The result is always 1-bit unsigned number: `0`/`1`/`x`. Like arithmetic operators, if nay operand's any bit value is `x` or `z`, then result is `1'bx`.
 
 ### Packed vs unpacked array
 

@@ -1,16 +1,15 @@
 # Editor
-
 .vscode/
 
 # MacOS
-
 .DS_Store
 
 # Verilator
-
 obj_dir/
 *.out
 
 # Cargo
-
 /target
+
+# Misc
+doc/test.v
