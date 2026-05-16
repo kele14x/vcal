@@ -196,10 +196,10 @@ This is final support target matrix, not means currently supported or implemente
   - [x] `~|` Reduction nor
   - [x] `^` Reduction xor
   - [x] `~^` or `^~` Reduction xnor
-  - [ ] `<<` Logical left shift
-  - [ ] `>>` Logical right shift
-  - [ ] `<<<` Arithmetic left shift
-  - [ ] `>>>` Arithmetic right shift
+  - [x] `<<` Logical left shift
+  - [x] `>>` Logical right shift
+  - [x] `<<<` Arithmetic left shift
+  - [x] `>>>` Arithmetic right shift
   - [ ] `? :` Conditional
 
 - [ ] Supported syntax definition
@@ -522,6 +522,19 @@ There are 6 unary reduction operators — `&`, `~&`, `|`, `~|`, `^`, and `~^` (w
   - `|` (OR-reduction): a definite `1` anywhere forces `1`; otherwise any `x`/`z` forces `x`; else `0`.
   - `^` (XOR-reduction): any `x`/`z` bit forces `x`; otherwise odd-parity (`1` for an odd count of `1` bits, else `0`).
   - `~&`/`~|`/`~^`/`^~`: the bitwise NOT of the corresponding positive reduction.
+
+#### Shift operators
+
+There are 4 shift operators — `<<` (logical left), `<<<` (arithmetic left), `>>` (logical right), and `>>>` (arithmetic right). Per LRM §5.1.12 the LHS is context-determined like arithmetic, while the RHS is self-determined and "always treated as an unsigned number ... has no effect on the signedness of the result". Concretely:
+
+- Width = `max(L(lhs), L(context))`. The LHS widens to that result width before the shift runs, so an outer arithmetic context can rescue bits that a self-determined shift would have shifted out.
+- Signedness = LHS signedness combined with the propagated outer context (LRM §5.5.1: any unsigned operand in the surrounding expression makes the result unsigned). The RHS never contributes.
+- The RHS is read as an unsigned bit pattern regardless of its declared signedness, so a "negative" shift count (e.g. `-4'sd1`) becomes a very large unsigned value. The shift count is clamped to the result width — anything ≥ width yields the all-fill output, which keeps `BigUint`-sized counts safe and matches the saturated semantics implementations already give.
+- If the RHS contains any `x` or `z` bit, the entire result is all-`x` (LRM §5.1.12 last paragraph).
+- Vacated bits are filled with `0` for `<<`, `<<<`, and `>>`. For `>>>` the fill is the LHS's most-significant bit (after extension) when the propagated result type is signed, and `0` otherwise. So `4'sb1000 >>> 1` is `4'sb1100` self-determined, but `(4'sb1000 >>> 1) + 8'd0` is `8'b00000100` because the unsigned `8'd0` flips the propagated context to unsigned.
+- Result base inherits from the LHS (leftmost-wins), like the other binary operators.
+
+LHS bits that are not shifted out keep their value, including `x` and `z`, so `4'b01x0 << 1` is `4'b1x00`.
 
 ### Packed vs unpacked array
 

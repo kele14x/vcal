@@ -1,5 +1,5 @@
 use num_bigint::{BigInt, BigUint, Sign};
-use num_traits::{One, Zero};
+use num_traits::{One, ToPrimitive, Zero};
 use std::borrow::Cow;
 use std::io::{self, BufRead, Write};
 
@@ -274,6 +274,10 @@ enum BinaryOp {
     BitwiseOr,
     BitwiseXor,
     BitwiseXnor,
+    LogicalShiftLeft,
+    LogicalShiftRight,
+    ArithmeticShiftLeft,
+    ArithmeticShiftRight,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -305,6 +309,10 @@ enum Token {
     BitwiseXnor,
     BitwiseNand,
     BitwiseNor,
+    LogicalShiftLeft,
+    LogicalShiftRight,
+    ArithmeticShiftLeft,
+    ArithmeticShiftRight,
 }
 
 struct Parser {
@@ -465,7 +473,18 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 }
             }
             '<' => {
-                if matches!(chars.peek(), Some((_, '='))) {
+                // Greedy: `<<<` (arithmetic left shift) > `<<` (logical left
+                // shift) > `<=` > `<`. Longest-prefix wins, mirroring how the
+                // existing `==`/`===` and `~^`/`~&` paths disambiguate.
+                if matches!(chars.peek(), Some((_, '<'))) {
+                    chars.next();
+                    if matches!(chars.peek(), Some((_, '<'))) {
+                        chars.next();
+                        tokens.push(Token::ArithmeticShiftLeft);
+                    } else {
+                        tokens.push(Token::LogicalShiftLeft);
+                    }
+                } else if matches!(chars.peek(), Some((_, '='))) {
                     chars.next();
                     tokens.push(Token::LessEqual);
                 } else {
@@ -473,7 +492,15 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 }
             }
             '>' => {
-                if matches!(chars.peek(), Some((_, '='))) {
+                if matches!(chars.peek(), Some((_, '>'))) {
+                    chars.next();
+                    if matches!(chars.peek(), Some((_, '>'))) {
+                        chars.next();
+                        tokens.push(Token::ArithmeticShiftRight);
+                    } else {
+                        tokens.push(Token::LogicalShiftRight);
+                    }
+                } else if matches!(chars.peek(), Some((_, '='))) {
                     chars.next();
                     tokens.push(Token::GreaterEqual);
                 } else {
@@ -830,7 +857,7 @@ impl Parser {
     }
 
     fn parse_relational(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_additive()?;
+        let mut expression = self.parse_shift()?;
 
         loop {
             let op = match self.peek() {
@@ -838,6 +865,32 @@ impl Parser {
                 Some(Token::Greater) => BinaryOp::GreaterThan,
                 Some(Token::LessEqual) => BinaryOp::LessThanOrEqual,
                 Some(Token::GreaterEqual) => BinaryOp::GreaterThanOrEqual,
+                _ => break,
+            };
+            self.index += 1;
+
+            let rhs = self.parse_shift()?;
+            expression = Expr::Binary {
+                op,
+                lhs: Box::new(expression),
+                rhs: Box::new(rhs),
+            };
+        }
+
+        Ok(expression)
+    }
+
+    // LRM Table 5-4: shifts sit between additive and relational. Left
+    // associative; `<<<`/`>>>` share this level with `<<`/`>>` (LRM 5.1.12).
+    fn parse_shift(&mut self) -> Result<Expr, String> {
+        let mut expression = self.parse_additive()?;
+
+        loop {
+            let op = match self.peek() {
+                Some(Token::LogicalShiftLeft) => BinaryOp::LogicalShiftLeft,
+                Some(Token::LogicalShiftRight) => BinaryOp::LogicalShiftRight,
+                Some(Token::ArithmeticShiftLeft) => BinaryOp::ArithmeticShiftLeft,
+                Some(Token::ArithmeticShiftRight) => BinaryOp::ArithmeticShiftRight,
                 _ => break,
             };
             self.index += 1;
@@ -968,7 +1021,9 @@ impl Parser {
             | Some(Token::CaseNotEqual) | Some(Token::Bang) | Some(Token::LogicalAnd)
             | Some(Token::LogicalOr) | Some(Token::Tilde) | Some(Token::BitwiseAnd)
             | Some(Token::BitwiseOr) | Some(Token::BitwiseXor) | Some(Token::BitwiseXnor)
-            | Some(Token::BitwiseNand) | Some(Token::BitwiseNor) => {
+            | Some(Token::BitwiseNand) | Some(Token::BitwiseNor)
+            | Some(Token::LogicalShiftLeft) | Some(Token::LogicalShiftRight)
+            | Some(Token::ArithmeticShiftLeft) | Some(Token::ArithmeticShiftRight) => {
                 Err("expected expression operand".to_string())
             }
             None => Err("unexpected end of expression".to_string()),
@@ -1053,6 +1108,17 @@ fn combine_binary_meta(op: BinaryOp, lhs_meta: ExprMeta, rhs_meta: ExprMeta) -> 
             base: lhs_meta.base,
         },
         BinaryOp::Power => ExprMeta {
+            width: lhs_meta.width,
+            signed: lhs_meta.signed,
+            base: lhs_meta.base,
+        },
+        // LRM 5.1.12: result width and signedness derive from the LHS only;
+        // the RHS is self-determined and treated as unsigned, so it cannot
+        // widen the result or flip its signedness.
+        BinaryOp::LogicalShiftLeft
+        | BinaryOp::LogicalShiftRight
+        | BinaryOp::ArithmeticShiftLeft
+        | BinaryOp::ArithmeticShiftRight => ExprMeta {
             width: lhs_meta.width,
             signed: lhs_meta.signed,
             base: lhs_meta.base,
@@ -1196,6 +1262,16 @@ fn evaluate_binary_expr(
         return evaluate_logical_expr(op, lhs, rhs, context);
     }
 
+    if matches!(
+        op,
+        BinaryOp::LogicalShiftLeft
+            | BinaryOp::LogicalShiftRight
+            | BinaryOp::ArithmeticShiftLeft
+            | BinaryOp::ArithmeticShiftRight
+    ) {
+        return evaluate_shift_expr(op, lhs, rhs, lhs_meta, context);
+    }
+
     let meta = combine_binary_meta(op, lhs_meta, rhs_meta);
     let effective_meta = ExprMeta {
         width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
@@ -1333,7 +1409,116 @@ fn evaluate_binary_expr(
         BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
             unreachable!("logical ops dispatched to evaluate_logical_expr")
         }
+        BinaryOp::LogicalShiftLeft
+        | BinaryOp::LogicalShiftRight
+        | BinaryOp::ArithmeticShiftLeft
+        | BinaryOp::ArithmeticShiftRight => {
+            unreachable!("shift ops dispatched to evaluate_shift_expr")
+        }
     }
+}
+
+// LRM 5.1.12: the LHS is context-determined like arithmetic — its width
+// widens to max(L(lhs), L(context)) and the propagated signedness drives
+// extension at its leaf primary. The RHS is self-determined (LRM Table 5-22)
+// and "always treated as an unsigned number ... has no effect on the
+// signedness of the result", so we pass it `None` for the context and read
+// its bits as unsigned regardless of the operand's declared signedness.
+//
+// `>>>` (arithmetic right shift) fills vacated MSB positions with the LHS
+// sign bit only when the propagated context is signed. Under an unsigned
+// outer context the same operator zero-fills, matching iverilog. The other
+// three shift forms always zero-fill.
+fn evaluate_shift_expr(
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    lhs_meta: ExprMeta,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let meta = ExprMeta {
+        width: lhs_meta.width,
+        signed: lhs_meta.signed,
+        base: lhs_meta.base,
+    };
+    let effective_meta = ExprMeta {
+        width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
+        signed: context.map_or(meta.signed, |ctx| ctx.signed),
+        base: meta.base,
+    };
+
+    let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta))?;
+    // RHS is self-determined: do NOT push effective_meta; let it evaluate at
+    // its own width, then reinterpret its bits as unsigned for the count.
+    let rhs_value = evaluate_expr_in_context(rhs, None)?;
+
+    if rhs_value.has_unknown_bits() {
+        return Ok(IntegerValue::all_x(
+            effective_meta.width,
+            effective_meta.signed,
+            meta.base,
+        ));
+    }
+
+    let shift_count = bits_to_biguint(&rhs_value.bits);
+    // BigUint shift counts can dwarf usize; clamp to the result width since
+    // any larger count produces the same all-fill output.
+    let max_shift = BigUint::from(effective_meta.width);
+    let clamped_shift = if shift_count >= max_shift {
+        effective_meta.width
+    } else {
+        shift_count
+            .to_usize()
+            .expect("shift count smaller than width fits in usize")
+    };
+
+    let result_bits = match op {
+        BinaryOp::LogicalShiftLeft | BinaryOp::ArithmeticShiftLeft => {
+            shift_bits_left(&lhs_value.bits, clamped_shift)
+        }
+        BinaryOp::LogicalShiftRight => {
+            shift_bits_right(&lhs_value.bits, clamped_shift, LogicBit::Zero)
+        }
+        BinaryOp::ArithmeticShiftRight => {
+            let fill = if effective_meta.signed {
+                lhs_value.bits.last().copied().unwrap_or(LogicBit::Zero)
+            } else {
+                LogicBit::Zero
+            };
+            shift_bits_right(&lhs_value.bits, clamped_shift, fill)
+        }
+        _ => unreachable!("evaluate_shift_expr called with non-shift op"),
+    };
+
+    Ok(IntegerValue {
+        width: effective_meta.width,
+        signed: effective_meta.signed,
+        base: meta.base,
+        bits: result_bits,
+    })
+}
+
+fn shift_bits_left(bits: &[LogicBit], shift: usize) -> Vec<LogicBit> {
+    let width = bits.len();
+    (0..width)
+        .map(|i| {
+            if i < shift {
+                LogicBit::Zero
+            } else {
+                bits[i - shift]
+            }
+        })
+        .collect()
+}
+
+fn shift_bits_right(bits: &[LogicBit], shift: usize, fill: LogicBit) -> Vec<LogicBit> {
+    let width = bits.len();
+    (0..width)
+        .map(|i| match i.checked_add(shift) {
+            Some(src) if src < width => bits[src],
+            _ => fill,
+        })
+        .collect()
 }
 
 // LRM 5.5.2: relational/equality operands form a shared context — size =
@@ -1629,6 +1814,23 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                 return Ok(value.as_bigint(value.signed));
             }
 
+            if matches!(
+                op,
+                BinaryOp::LogicalShiftLeft
+                    | BinaryOp::LogicalShiftRight
+                    | BinaryOp::ArithmeticShiftLeft
+                    | BinaryOp::ArithmeticShiftRight
+            ) {
+                // Same reasoning as bitwise: shifts depend on the LHS width
+                // and signedness, so route through the standard pipeline
+                // rather than reaching into bigint shift operators directly.
+                let value = evaluate_binary_expr(*op, lhs, rhs, None)?;
+                if value.has_unknown_bits() {
+                    return Err("expression contains unknown bits".to_string());
+                }
+                return Ok(value.as_bigint(value.signed));
+            }
+
             let lhs_value = evaluate_expr_as_math_bigint(lhs)?;
             let rhs_value = evaluate_expr_as_math_bigint(rhs)?;
 
@@ -1664,7 +1866,11 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                 | BinaryOp::BitwiseAnd
                 | BinaryOp::BitwiseOr
                 | BinaryOp::BitwiseXor
-                | BinaryOp::BitwiseXnor => unreachable!("handled above"),
+                | BinaryOp::BitwiseXnor
+                | BinaryOp::LogicalShiftLeft
+                | BinaryOp::LogicalShiftRight
+                | BinaryOp::ArithmeticShiftLeft
+                | BinaryOp::ArithmeticShiftRight => unreachable!("handled above"),
             }
         }
     }
@@ -3781,6 +3987,339 @@ mod tests {
 
         assert_eq!(nested_reductions.output, "1'b1");
         assert_eq!(not_chains_into_reduction.output, "1'b1");
+    }
+
+    // ---------- Shift operators (<< >> <<< >>>) ----------
+    //
+    // LRM 1364-2005 §5.1.12: the LHS is context-determined; the RHS is
+    // self-determined and "always treated as an unsigned number ... has no
+    // effect on the signedness of the result". `<<` and `<<<` zero-fill
+    // vacated positions; `>>` always zero-fills; `>>>` fills with the LHS
+    // sign bit when the result type is signed and zero-fills otherwise. If
+    // the RHS contains x or z, the entire result is unknown.
+    //
+    // Single-bit truth tables in `doc/four_value_ops_output.txt` only cover
+    // 1-bit operands (where multi-bit shift dynamics collapse), so the
+    // interesting multi-bit cases here were cross-checked against iverilog.
+
+    #[test]
+    fn tokenizes_shift_operators_as_single_tokens() {
+        // Greedy lex: `<<<`/`>>>` win over `<<`/`>>`, which win over the
+        // single-character `<`/`>` (and over `<=`/`>=` which still need the
+        // `=`-specific path). A regression where `<<<` collapsed to two
+        // tokens would silently become `<<` followed by `<`.
+        let shl = tokenize("4'd1 << 1").expect("<< should tokenize");
+        let shr = tokenize("4'd1 >> 1").expect(">> should tokenize");
+        let ashl = tokenize("4'd1 <<< 1").expect("<<< should tokenize");
+        let ashr = tokenize("4'd1 >>> 1").expect(">>> should tokenize");
+
+        assert_eq!(shl[1], Token::LogicalShiftLeft);
+        assert_eq!(shr[1], Token::LogicalShiftRight);
+        assert_eq!(ashl[1], Token::ArithmeticShiftLeft);
+        assert_eq!(ashr[1], Token::ArithmeticShiftRight);
+    }
+
+    #[test]
+    fn shift_lex_does_not_swallow_relational_or_le_ge() {
+        // Adding `<<`/`<<<` paths must not regress `<=`, `>=`, or bare `<`/`>`.
+        let le = tokenize("4'd1 <= 4'd2").expect("<=");
+        let ge = tokenize("4'd1 >= 4'd2").expect(">=");
+        let lt = tokenize("4'd1 < 4'd2").expect("<");
+        let gt = tokenize("4'd1 > 4'd2").expect(">");
+
+        assert_eq!(le[1], Token::LessEqual);
+        assert_eq!(ge[1], Token::GreaterEqual);
+        assert_eq!(lt[1], Token::Less);
+        assert_eq!(gt[1], Token::Greater);
+    }
+
+    #[test]
+    fn evaluates_basic_logical_shift_left() {
+        let shifted = evaluate_input("4'b0001 << 1").expect("<< 1");
+        let by_two = evaluate_input("4'b0001 << 4'd2").expect("<< 2");
+        // Top bit shifts out at the 4-bit self-determined width.
+        let overflow = evaluate_input("4'b1000 << 1").expect("<< 1 overflow");
+        let by_zero = evaluate_input("4'b0101 << 0").expect("<< 0 noop");
+
+        assert_eq!(shifted.output, "4'b0010");
+        assert_eq!(by_two.output, "4'b0100");
+        assert_eq!(overflow.output, "4'b0000");
+        assert_eq!(by_zero.output, "4'b0101");
+    }
+
+    #[test]
+    fn evaluates_basic_logical_shift_right() {
+        let shifted = evaluate_input("4'b1000 >> 1").expect(">> 1");
+        let by_two = evaluate_input("4'b1100 >> 4'd2").expect(">> 2");
+        let by_zero = evaluate_input("4'b0101 >> 0").expect(">> 0 noop");
+        // Logical right shift always zero-fills, even when the LHS is signed.
+        let signed_zero_fill = evaluate_input("4'sb1000 >> 1").expect("signed >> 1");
+
+        assert_eq!(shifted.output, "4'b0100");
+        assert_eq!(by_two.output, "4'b0011");
+        assert_eq!(by_zero.output, "4'b0101");
+        assert_eq!(signed_zero_fill.output, "4'sb0100");
+    }
+
+    #[test]
+    fn arithmetic_left_shift_matches_logical_left_shift() {
+        // LRM 5.1.12: `<<<` is exactly `<<` — both zero-fill the LSBs.
+        let logical = evaluate_input("4'b0011 << 1").expect("<<");
+        let arithmetic = evaluate_input("4'b0011 <<< 1").expect("<<<");
+        let signed_logical = evaluate_input("4'sb1010 << 1").expect("signed <<");
+        let signed_arith = evaluate_input("4'sb1010 <<< 1").expect("signed <<<");
+
+        assert_eq!(logical.output, arithmetic.output);
+        assert_eq!(signed_logical.output, signed_arith.output);
+    }
+
+    #[test]
+    fn arithmetic_right_shift_sign_fills_when_signed() {
+        // Signed self-determined: vacated MSB takes the LHS sign bit.
+        //   4'sb1000 = -8;  >>> 1 → 4'sb1100 = -4
+        //   4'sb1110 = -2;  >>> 1 → 4'sb1111 = -1
+        //   4'sb1000 >>> 4'd3 → all four MSBs vacated, all filled with 1
+        let neg_eight = evaluate_input("4'sb1000 >>> 1").expect("signed >>> 1");
+        let neg_two = evaluate_input("4'sb1110 >>> 1").expect("signed >>> 1");
+        let saturated = evaluate_input("4'sb1000 >>> 4'd3").expect("signed >>> 3");
+
+        assert_eq!(neg_eight.output, "4'sb1100");
+        assert_eq!(neg_two.output, "4'sb1111");
+        assert_eq!(saturated.output, "4'sb1111");
+    }
+
+    #[test]
+    fn arithmetic_right_shift_zero_fills_when_unsigned() {
+        // Unsigned LHS (self-determined unsigned context) → `>>>` is just `>>`.
+        let unsigned = evaluate_input("4'b1000 >>> 1").expect("unsigned >>> 1");
+        let unsigned_full = evaluate_input("4'b1111 >>> 4'd3").expect("unsigned >>> 3");
+
+        assert_eq!(unsigned.output, "4'b0100");
+        assert_eq!(unsigned_full.output, "4'b0001");
+    }
+
+    #[test]
+    fn arithmetic_right_shift_propagates_x_or_z_when_msb_is_unknown() {
+        // The fill bit IS the LHS MSB (LRM 5.1.12). When the MSB is x, the
+        // vacated positions become x; when it is z, the same z value is used.
+        let x_fill = evaluate_input("4'sbx000 >>> 1").expect("x msb");
+        let z_fill = evaluate_input("4'sbz000 >>> 1").expect("z msb");
+
+        assert_eq!(x_fill.output, "4'sbxx00");
+        assert_eq!(z_fill.output, "4'sbzz00");
+    }
+
+    #[test]
+    fn shift_with_unknown_rhs_returns_all_x() {
+        // LRM 5.1.12: "If the right operand has an x or z value, then the
+        // result shall be unknown." This dominates the LHS bit pattern — even
+        // a fully-known LHS yields all-x.
+        let x_rhs_left = evaluate_input("4'd5 << 4'bx").expect("x rhs <<");
+        let z_rhs_right = evaluate_input("4'd5 >> 4'bz").expect("z rhs >>");
+        let x_rhs_arith = evaluate_input("4'sb1000 >>> 4'bx").expect("x rhs >>>");
+        // Even one x bit in the RHS poisons the entire result.
+        let partial_x = evaluate_input("4'd5 << 4'b00x0").expect("partial x rhs");
+        // Result inherits LHS base for rendering (decimal here → 4'dx).
+        assert_eq!(x_rhs_left.output, "4'dx");
+        assert_eq!(z_rhs_right.output, "4'dx");
+        assert_eq!(x_rhs_arith.output, "4'sbxxxx");
+        assert_eq!(partial_x.output, "4'dx");
+    }
+
+    #[test]
+    fn shift_preserves_lhs_bit_values_including_x_and_z() {
+        // The shift moves bits into new positions without altering them; only
+        // the vacated edge takes the fill value. So an x/z in the middle of
+        // the LHS just slides one position over.
+        let x_in_middle = evaluate_input("4'b01x0 << 1").expect("x in middle <<");
+        let z_in_middle = evaluate_input("4'b1z00 >> 1").expect("z in middle >>");
+        // Left shift by 1 of 4'sb1xx0: the MSB 1 shifts out (lost); xx slides
+        // left to bits 3,2; the original LSB 0 slides to bit 1; bit 0 is the
+        // zero-filled vacated LSB. → 4'sbxx00.
+        let signed_xx = evaluate_input("4'sb1xx0 << 1").expect("signed x's");
+
+        assert_eq!(x_in_middle.output, "4'b1x00");
+        assert_eq!(z_in_middle.output, "4'b01z0");
+        assert_eq!(signed_xx.output, "4'sbxx00");
+    }
+
+    #[test]
+    fn shift_clamps_oversized_count_to_lhs_width() {
+        // LRM 5.1.12 doesn't bound the RHS, so we treat any count >= width
+        // as an all-fill case. Useful both for huge constants and (next test)
+        // for negative RHS values that bit-encode as huge unsigned numbers.
+        let exactly_width = evaluate_input("4'd5 << 4'd4").expect("exactly width");
+        let beyond_width = evaluate_input("4'b0101 << 4'd5").expect("beyond width");
+        let beyond_width_right = evaluate_input("4'b1111 >> 4'd9").expect(">> beyond");
+        let signed_beyond = evaluate_input("4'sb1000 >>> 4'd9").expect(">>> beyond");
+
+        assert_eq!(exactly_width.output, "4'd0");
+        assert_eq!(beyond_width.output, "4'b0000");
+        assert_eq!(beyond_width_right.output, "4'b0000");
+        // signed >>> with beyond-width count saturates to the sign bit.
+        assert_eq!(signed_beyond.output, "4'sb1111");
+    }
+
+    #[test]
+    fn shift_treats_negative_rhs_as_large_unsigned() {
+        // LRM 5.1.12: the RHS is "always treated as an unsigned number".
+        // -1 has bits 1...1, which read unsigned is 2^N-1 — well past any
+        // reasonable LHS width — so the shift saturates to all-fill.
+        let neg_one_left = evaluate_input("4'd5 << -4'sd1").expect("<< -1");
+        let neg_one_signed_arith = evaluate_input("4'sb1000 >>> -4'sd1").expect(">>> -1");
+
+        assert_eq!(neg_one_left.output, "4'd0");
+        assert_eq!(neg_one_signed_arith.output, "4'sb1111");
+    }
+
+    #[test]
+    fn shift_widens_lhs_through_outer_arithmetic_context() {
+        // Self-determined the high bit of `4'd8 << 4'd1` shifts out → 4'd0.
+        // Inside a 32-bit context the LHS first widens to 32 bits before the
+        // shift, so the bit survives and the answer is 16, not 0. Same shape
+        // as the existing `applies_width_rules_to_multiplicative_expressions`
+        // test for arithmetic.
+        let truncated = evaluate_input("4'd8 << 4'd1").expect("truncated");
+        let widened = evaluate_input("(4'd8 << 4'd1) + 0").expect("widened");
+
+        assert_eq!(truncated.output, "4'd0");
+        assert_eq!(widened.output, "32'd16");
+    }
+
+    #[test]
+    fn arithmetic_right_shift_fill_follows_propagated_signedness() {
+        // Same shift, three different propagated contexts. `>>>` flips
+        // between sign-fill and zero-fill based on whether the result type
+        // ends up signed. iverilog-confirmed.
+        //
+        //   Self-determined signed: signed → sign-fill → -4 → 4'sb1100.
+        //   Mixed unsigned context (8'd0): unsigned → zero-fill, but the
+        //     LHS first zero-extends to 8 bits = 8 → 8 >>> 1 = 4 → 8'b0...100.
+        //   All-signed context (signed `0`): signed → sign-extend LHS to 32
+        //     bits = -8 → -8 >>> 1 = -4 → 32'sb1...1100.
+        let self_determined = evaluate_input("4'sb1000 >>> 1").expect("self");
+        let mixed_unsigned = evaluate_input("(4'sb1000 >>> 1) + 8'd0").expect("mixed");
+        let all_signed = evaluate_input("(4'sb1000 >>> 1) + 0").expect("all signed");
+
+        assert_eq!(self_determined.output, "4'sb1100");
+        // Result base inherits from the leftmost operand (Binary), and the
+        // shared 8-bit unsigned context makes the outer result unsigned.
+        assert_eq!(mixed_unsigned.output, "8'b00000100");
+        assert_eq!(
+            all_signed.output,
+            "32'sb11111111111111111111111111111100"
+        );
+    }
+
+    #[test]
+    fn shift_inherits_leftmost_base_like_arithmetic() {
+        // Result base is the LHS base, mirroring the existing leftmost-wins
+        // rule for arithmetic and bitwise binaries.
+        let hex = evaluate_input("8'h0a << 4'd1").expect("hex base");
+        let binary = evaluate_input("8'b00001010 << 4'd1").expect("binary base");
+        let decimal = evaluate_input("8'd10 << 4'd1").expect("decimal base");
+
+        assert_eq!(hex.output, "8'h14");
+        assert_eq!(binary.output, "8'b00010100");
+        assert_eq!(decimal.output, "8'd20");
+    }
+
+    #[test]
+    fn shift_rhs_is_self_determined_and_does_not_widen_lhs() {
+        // RHS at LRM Table 5-22 is self-determined, so a wide RHS must NOT
+        // pull the LHS up to its width. Without the self-determined rule the
+        // 4-bit `4'd8` would widen to 32 bits and `<< 1` would yield 16
+        // instead of the truncated 4'd0.
+        let wide_rhs = evaluate_input("4'd8 << 32'd1").expect("wide rhs");
+        assert_eq!(wide_rhs.output, "4'd0");
+    }
+
+    #[test]
+    fn shift_rhs_signedness_does_not_flip_result_signedness() {
+        // LRM 5.1.12: the RHS "has no effect on the signedness of the
+        // result". A signed RHS therefore keeps the LHS-driven signedness.
+        let signed_lhs_signed_rhs = evaluate_input("4'sd2 << 4'sd1").expect("ss");
+        let unsigned_lhs_signed_rhs = evaluate_input("4'd2 << 4'sd1").expect("us");
+
+        assert_eq!(signed_lhs_signed_rhs.output, "4'sd4");
+        assert_eq!(unsigned_lhs_signed_rhs.output, "4'd4");
+    }
+
+    #[test]
+    fn shift_precedence_below_additive_above_relational() {
+        // LRM Table 5-4: `+`/`-` > `<<`/`>>` > `<`/`>`.
+        //
+        //   `4'd1 + 4'd2 << 4'd1` parses as `(4'd1 + 4'd2) << 4'd1`
+        //                              = 3 << 1 = 6.
+        //   `4'd2 << 4'd1 < 4'd5` parses as `(4'd2 << 4'd1) < 4'd5`
+        //                              = 4 < 5 = 1.
+        let add_then_shift_expr = parse_expression("4'd1 + 4'd2 << 4'd1").expect("parse");
+        match add_then_shift_expr {
+            Expr::Binary {
+                op: BinaryOp::LogicalShiftLeft,
+                lhs,
+                ..
+            } => assert!(matches!(*lhs, Expr::Binary { op: BinaryOp::Add, .. })),
+            other => panic!("expected top-level <<, got {other:?}"),
+        }
+        let add_then_shift = evaluate_input("4'd1 + 4'd2 << 4'd1").expect("eval");
+        assert_eq!(add_then_shift.output, "4'd6");
+
+        let shift_then_relational_expr =
+            parse_expression("4'd2 << 4'd1 < 4'd5").expect("parse");
+        match shift_then_relational_expr {
+            Expr::Binary {
+                op: BinaryOp::LessThan,
+                lhs,
+                ..
+            } => assert!(matches!(
+                *lhs,
+                Expr::Binary {
+                    op: BinaryOp::LogicalShiftLeft,
+                    ..
+                }
+            )),
+            other => panic!("expected top-level <, got {other:?}"),
+        }
+        let shift_then_relational = evaluate_input("4'd2 << 4'd1 < 4'd5").expect("eval");
+        assert_eq!(shift_then_relational.output, "1'b1");
+    }
+
+    #[test]
+    fn shift_is_left_associative() {
+        // `a << b << c` parses as `(a << b) << c`. Same shape check used for
+        // the other binary levels.
+        let expr = parse_expression("4'd1 << 4'd1 << 4'd1").expect("parse");
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::LogicalShiftLeft,
+                lhs,
+                ..
+            } => assert!(matches!(
+                *lhs,
+                Expr::Binary {
+                    op: BinaryOp::LogicalShiftLeft,
+                    ..
+                }
+            )),
+            other => panic!("expected top-level <<, got {other:?}"),
+        }
+        // (1 << 1) << 1 = 2 << 1 = 4 at 4-bit width.
+        let result = evaluate_input("4'd1 << 4'd1 << 4'd1").expect("eval");
+        assert_eq!(result.output, "4'd4");
+    }
+
+    #[test]
+    fn shift_at_primary_position_is_rejected() {
+        // No shift operator is unary, so a leading shift token has no
+        // operand to the left. parse_primary's catchall must turn this into
+        // the standard "expected expression operand" error rather than
+        // silently consuming the operator as something else.
+        let lead_shl = evaluate_input("<< 4'd1").expect_err("leading <<");
+        let lead_shr = evaluate_input(">> 4'd1").expect_err("leading >>");
+
+        assert_eq!(lead_shl, "expected expression operand");
+        assert_eq!(lead_shr, "expected expression operand");
     }
 
     #[test]
