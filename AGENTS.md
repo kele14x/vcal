@@ -2,12 +2,14 @@
 
 ## Current State
 
-- Phases 1–5 complete. No active phase; next-phase scope is TBD.
+- Phases 1–6b complete. No active phase; next-phase scope is TBD — confirm with user before starting new work.
 - Phase 1 — REPL shell, integer literals (all LRM forms), `$finish`/`$stop`. Done.
 - Phase 2 — arithmetic ops (`+ - * / % **`, unary), two-pass width handling, leftmost-base propagation, rustyline history. Done.
 - Phase 3 — relational ops (`<`, `>`, `<=`, `>=`) with LRM 5.5.2 propagated-context unification (zero-extend at the leaf primary when context is unsigned, sign-extend when signed), 1-bit unsigned result, x/z propagation. Done.
 - Phase 4 — equality ops (`==`, `!=`, `===`, `!==`) sharing the relational unification path; per-bit ambiguity for `==`/`!=` (a definite mismatch defeats x), bit-for-bit including x/z for `===`/`!==`; corrected `context_extension_bit` to zero-fill under unsigned propagated context. Done.
-- Phase 5 — logical ops (`!`, `&&`, `||`) with self-determined operands reduced to a 1-bit logical value (any `1` → 1, all `0` → 0, any x/z without a `1` → x), LRM §5.1.9 truth tables, 1-bit unsigned binary result that widens through outer arithmetic context like relational/equality. Bare `&`/`|` rejected (bitwise out of scope). Done.
+- Phase 5 — logical ops (`!`, `&&`, `||`) with self-determined operands reduced to a 1-bit logical value (any `1` → 1, all `0` → 0, any x/z without a `1` → x), LRM §5.1.9 truth tables, 1-bit unsigned binary result that widens through outer arithmetic context like relational/equality. Done.
+- Phase 6a — per-bit bitwise ops (`~`, `&`, `|`, `^`, `~^`/`^~`). New parser band `&` > `^/~^/^~` > `|` between `==` and `&&`; LRM §5.1.10 truth tables zipped per position with no all-x short-circuit; context-determined width like arithmetic; bare `&`/`|` now lex as bitwise (the Phase 5 reject is replaced); `~^` and `^~` collapse to one token. Done.
+- Phase 6b — reduction unaries (`unary & ~& | ~| ^ ~^/^~`). New `~&`/`~|` tokens; binary `&`/`|`/`^`/`~^`/`^~` tokens are reused at unary position via parse-position disambiguation (no token rewrite). Single `reduce_bits` helper folds operand bits via the binary 4-state truth tables from 6a; identity element is `1` for AND-fold and `0` for OR/XOR; negated forms invert the fold. Self-determined 1-bit unsigned result that widens through outer arithmetic context like `!`/`&&`/`||`/relational/equality. `~&`/`~|` are unary-only (no binary parse level consumes them, so `a ~& b` correctly errors). Done.
 
 ## Current Scope
 
@@ -18,15 +20,17 @@
 - Equality operators (`==`, `!=`, `===`, `!==`) — 1-bit unsigned binary result
 - Logical operators (`!`, `&&`, `||`) — 1-bit unsigned binary result with x/z reduction
 - No variables, declarations, strings, real numbers, concatenation
-- No bitwise, no shifts
+- Bitwise (per-bit) operators (`~`, `&`, `|`, `^`, `~^`/`^~`)
+- Reduction unaries (`unary & ~& | ~| ^ ~^/^~`)
+- No shifts.
 
 ## Active Phase
 
-No active phase. Next-phase scope is TBD — confirm with the user before starting new work. Likely candidates are bitwise (`& | ^ ~`) or shift operators (`<< >> <<< >>>`); see README's "Supported Matrix" for the full target.
+No active phase. Confirm next-phase scope with the user before starting new work — shift operators (`<< >> <<< >>>`), the conditional operator (`?:`), concatenation/replication (`{} {{}}`), and variables/declarations are all in the long-term backlog.
 
 ## Backlog
 
-See README's "Supported Matrix" for the final target. Phase scoping for everything beyond Phase 4 is TBD — confirm with the user before starting work outside the active phase.
+See README's "Supported Matrix" for the final target. Phase scoping beyond bitwise (shifts, conditional, concatenation, variables, …) is TBD — confirm with the user before starting work outside the active phase.
 
 ## Commands
 
