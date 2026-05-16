@@ -185,17 +185,17 @@ This is final support target matrix, not means currently supported or implemente
   - [x] `!=` Logical inequality
   - [x] `===` Case equality
   - [x] `!==` Case inequality
-  - [ ] `~` Bitwise negation
-  - [ ] `&` Bitwise and
-  - [ ] `|` Bitwise inclusive or
-  - [ ] `^` Bitwise exclusive or
-  - [ ] `^~` or `~^` Bitwise equivalence
-  - [ ] `&` Reduction and
-  - [ ] `~&` Reduction nand
-  - [ ] `|` Reduction or
-  - [ ] `~|` Reduction nor
-  - [ ] `^` Reduction xor
-  - [ ] `~^` or `^~` Reduction xnor
+  - [x] `~` Bitwise negation
+  - [x] `&` Bitwise and
+  - [x] `|` Bitwise inclusive or
+  - [x] `^` Bitwise exclusive or
+  - [x] `^~` or `~^` Bitwise equivalence
+  - [x] `&` Reduction and
+  - [x] `~&` Reduction nand
+  - [x] `|` Reduction or
+  - [x] `~|` Reduction nor
+  - [x] `^` Reduction xor
+  - [x] `~^` or `^~` Reduction xnor
   - [ ] `<<` Logical left shift
   - [ ] `>>` Logical right shift
   - [ ] `<<<` Arithmetic left shift
@@ -387,6 +387,7 @@ Notes:
 - All operators shall associate left to right with the exception of the conditional operator, which shall associate right to left.
   - The `**` operator is still left to right association, for example `3 ** 3 ** 3 = (3 ** 3) ** 3 = 19683`. Which is different from Python (`3 ** 3 ** 3 = 7625597484987`).
 - Unary `+`/`-` bind tighter than `**`, for example `-2 ** 2 == 4`.
+- The binary bitwise band sits between equality and `&&` per LRM Table 5-4, with internal order `&` > `^` `~^` `^~` > `|` (tightest to loosest).
 - There is short-circuiting during expression evaluation.
 
 ### Width rules
@@ -490,6 +491,37 @@ Width-extension on `===` / `!==` follows LRM §5.5.4: the special "fill with `x`
 #### Logical operators
 
 There are 3 logical operators: `&&`, `||` and `!`. `!` is unary operator so has higher precedence. The precedence of `&&` is greater than `||`. The result of logical operators is always 1-bit unsigned so they are very like relational and equality operators.
+
+#### Bitwise operators
+
+There are 4 binary bitwise operators — `&`, `|`, `^`, and `~^` (with `^~` accepted as an equivalent spelling for the equivalence operator) — and 1 per-bit unary operator `~`. They operate position-by-position on the operand bits.
+
+- Width = `max(L(lhs), L(rhs))` for binaries; width = operand width for unary `~`. They are context-determined like arithmetic, so a wider parent context widens the per-bit operation before truncation.
+- Signedness = signed iff *both* operands are signed (binaries); unary `~` preserves operand signedness.
+- Base inheritance follows the existing rules: leftmost-wins for binaries, operand-preserving for unary `~`.
+- 4-state truth tables per LRM §5.1.10 (verified bit-for-bit against iverilog in `doc/four_value_ops_output.txt`):
+  - `~`: `0→1`, `1→0`, `x→x`, `z→x`.
+  - `&`: a definite `0` on either side forces `0`; otherwise any `x`/`z` forces `x`; else AND.
+  - `|`: a definite `1` on either side forces `1`; otherwise any `x`/`z` forces `x`; else OR.
+  - `^`, `~^`/`^~`: any `x`/`z` bit forces `x`; otherwise XOR / XNOR.
+
+LRM 1364-2005 has an internal inconsistency about operand extension: §5.1.10 says "the shorter operand is zero-filled in the most significant bit positions", but §5.5.2 says a narrower operand is sign-extended whenever the propagated type is signed (which, by §5.5.1, happens when *all* operands are signed). For `4'shF | 8'sh0` the two rules disagree — §5.1.10 would give `8'sh0F`, §5.5.2 gives `8'shFF`. vcal follows §5.5.2 (sign-extend when both signed, zero-extend otherwise), matching iverilog, VCS, Xcelium, and the IEEE 1800 (SystemVerilog) clarification that drops the §5.1.10 sentence entirely. This is the same extension rule already used by relational/equality/arithmetic in vcal, so all operators stay consistent.
+
+Note that `~^` and `^~` always denote the same operator, while `~&` and `~|` exist only as unary reduction forms (no binary form).
+
+#### Reduction operators
+
+There are 6 unary reduction operators — `&`, `~&`, `|`, `~|`, `^`, and `~^` (with `^~` as the equivalent spelling for `~^`). They fold the binary 4-state truth tables of `&`/`|`/`^` across all bits of a single operand to produce a 1-bit result.
+
+- The operand is self-determined (LRM Table 5-22); the 1-bit unsigned result widens through outer arithmetic context the same way as `!`, `&&`, `||`, relational, and equality results.
+- Result base is always Binary, independent of operand base.
+- `&`/`|`/`^`/`~^`/`^~` are also binary bitwise operators — they're disambiguated by parse position (unary when no left-hand operand is in scope).
+- `~&` and `~|` exist only as unary reduction operators; using them in a binary position is a syntax error.
+- Fold semantics per LRM §5.1.11, derived from the binary truth tables (verified against `doc/four_value_ops_output.txt`):
+  - `&` (AND-reduction): a definite `0` anywhere forces `0`; otherwise any `x`/`z` forces `x`; else `1`.
+  - `|` (OR-reduction): a definite `1` anywhere forces `1`; otherwise any `x`/`z` forces `x`; else `0`.
+  - `^` (XOR-reduction): any `x`/`z` bit forces `x`; otherwise odd-parity (`1` for an odd count of `1` bits, else `0`).
+  - `~&`/`~|`/`~^`/`^~`: the bitwise NOT of the corresponding positive reduction.
 
 ### Packed vs unpacked array
 
