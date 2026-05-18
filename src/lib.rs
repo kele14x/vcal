@@ -45,6 +45,11 @@ pub struct IntegerValue {
     signed: bool,
     base: Base,
     bits: Vec<LogicBit>,
+    // True for literals parsed without an explicit size (LRM 3.5.1 default
+    // width). Drives Table 5-22 footnote a's MSB-fill extension when the
+    // propagated context is wider than the default. Always false for sized
+    // literals and for any value produced by an operator.
+    unsized_literal: bool,
 }
 
 impl IntegerValue {
@@ -155,8 +160,20 @@ impl IntegerValue {
     }
 
     fn resized_to_context(&self, width: usize, context_signed: bool) -> Self {
+        // LRM Table 5-22 footnote a: unsized constants in an expression wider
+        // than 32 bits extend per the literal itself, not per the propagated
+        // context. The MSB-fill case (x/z) and the literal's own signedness
+        // both differ from §5.5.4, so we have to carve out a separate path
+        // here rather than reuse `context_extension_bit`.
+        if self.unsized_literal && width > self.width {
+            return self.extend_unsized_to(width);
+        }
+
         if width == self.width {
-            return self.clone();
+            return Self {
+                unsized_literal: false,
+                ..self.clone()
+            };
         }
 
         let mut bits = self.bits.clone();
@@ -172,13 +189,42 @@ impl IntegerValue {
             signed: context_signed,
             base: self.base,
             bits,
+            unsized_literal: false,
+        }
+    }
+
+    // LRM Table 5-22 footnote a / §3.5.1 literal-fill rule: unsized constants
+    // extend by their own MSB (x/z) or by their own declared signedness
+    // (sign-extend if signed, zero-extend if unsigned). This is independent of
+    // the propagated context signedness, which is why iverilog
+    //   'bx        | 64'sb0  → 64'bxxxx...x  (MSB-fill ignores propagated sign)
+    //   'shFFFFFFFF| 64'b0   → 64'hFFFFFFFFFFFFFFFF (own-signed sign-extend
+    //                          even though propagated context is unsigned)
+    // both diverge from §5.5.4. For sized literals §5.5.4 still applies.
+    fn extend_unsized_to(&self, width: usize) -> Self {
+        let msb = self.bits.last().copied().unwrap_or(LogicBit::Zero);
+        let fill = match msb {
+            LogicBit::X => LogicBit::X,
+            LogicBit::Z => LogicBit::Z,
+            _ if self.signed => msb,
+            _ => LogicBit::Zero,
+        };
+        let mut bits = self.bits.clone();
+        bits.resize(width, fill);
+        Self {
+            width,
+            signed: self.signed,
+            base: self.base,
+            bits,
+            unsized_literal: false,
         }
     }
 
     fn context_extension_bit(&self, context_signed: bool) -> LogicBit {
-        // LRM 5.5.4: the "fill with x/z when sign bit is x/z" rule applies
-        // only when resizing into a SIGNED wider width. Unsigned extension is
-        // always zero-fill regardless of the source MSB. iverilog confirmed.
+        // LRM §5.5.4 for sized operands: signed propagated context sign-extends
+        // (propagating x/z if the MSB is x/z), unsigned propagated context
+        // zero-extends. Unsized literals follow Table 5-22 footnote a instead;
+        // see `extend_unsized_to`.
         if !context_signed {
             return LogicBit::Zero;
         }
@@ -204,6 +250,7 @@ impl IntegerValue {
             signed,
             base,
             bits: bigint_to_bits_with_width(&value, width),
+            unsized_literal: false,
         }
     }
 
@@ -213,6 +260,7 @@ impl IntegerValue {
             signed,
             base,
             bits: vec![LogicBit::X; width],
+            unsized_literal: false,
         }
     }
 }
@@ -1271,6 +1319,7 @@ fn evaluate_unary_expr(
             signed: effective_meta.signed,
             base: meta.base,
             bits,
+            unsized_literal: false,
         });
     }
 
@@ -1467,6 +1516,7 @@ fn evaluate_binary_expr(
                 signed: meta.signed,
                 base: meta.base,
                 bits,
+                unsized_literal: false,
             })
         }
         BinaryOp::LessThan
@@ -1567,6 +1617,7 @@ fn evaluate_shift_expr(
         signed: effective_meta.signed,
         base: meta.base,
         bits: result_bits,
+        unsized_literal: false,
     })
 }
 
@@ -1629,6 +1680,7 @@ fn comparison_result_value(bit: LogicBit) -> IntegerValue {
         signed: false,
         base: Base::Binary,
         bits: vec![bit],
+        unsized_literal: false,
     }
 }
 
@@ -1829,6 +1881,7 @@ fn evaluate_conditional_expr(
         signed: effective_meta.signed,
         base: meta.base,
         bits,
+        unsized_literal: false,
     })
 }
 
@@ -2108,6 +2161,7 @@ fn parse_unsized_decimal(input: &str) -> Result<IntegerValue, String> {
         signed: true,
         base: Base::Decimal,
         bits: biguint_to_bits_with_width(&value, width),
+        unsized_literal: true,
     })
 }
 
@@ -2160,6 +2214,8 @@ fn parse_based_decimal(
 ) -> Result<IntegerValue, String> {
     let digits = strip_underscores(digits);
 
+    let unsized_literal = width_hint.is_none();
+
     if digits.chars().all(is_x_digit) {
         let width = width_hint.unwrap_or(32);
         return Ok(IntegerValue {
@@ -2167,6 +2223,7 @@ fn parse_based_decimal(
             signed,
             base: Base::Decimal,
             bits: vec![LogicBit::X; width],
+            unsized_literal,
         });
     }
 
@@ -2177,6 +2234,7 @@ fn parse_based_decimal(
             signed,
             base: Base::Decimal,
             bits: vec![LogicBit::Z; width],
+            unsized_literal,
         });
     }
 
@@ -2190,6 +2248,7 @@ fn parse_based_decimal(
         signed,
         base: Base::Decimal,
         bits: biguint_to_bits_with_width(&value, width),
+        unsized_literal,
     })
 }
 
@@ -2206,6 +2265,7 @@ fn parse_based_radix(
         bits.extend(digit_to_bits(digit, base)?);
     }
 
+    let unsized_literal = width_hint.is_none();
     let width = width_hint.unwrap_or_else(|| usize::max(bits.len(), 32));
     let extension = extension_bit(digits.chars().next().expect("digits is not empty"));
 
@@ -2220,6 +2280,7 @@ fn parse_based_radix(
         signed,
         base,
         bits,
+        unsized_literal,
     })
 }
 
@@ -2605,6 +2666,92 @@ mod tests {
         let evaluation =
             evaluate_input("4294967296").expect("wide unsized decimal literal should parse");
         assert_eq!(evaluation.output, "34'sd4294967296");
+    }
+
+    // LRM Table 5-22 footnote a (iverilog-confirmed): an unsized x/z-leading
+    // constant in an expression wider than 32 bits extends by the MSB
+    // regardless of the propagated context signedness. Sized x/z operands
+    // still follow §5.5.4 (zero-fill in unsigned propagated context).
+    #[test]
+    fn unsized_x_literal_msb_extends_in_wider_unsigned_context() {
+        let bitwise = evaluate_input("'bx | 64'b0").expect("expression should evaluate");
+        assert_eq!(
+            bitwise.output,
+            "64'bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        );
+
+        let case_eq = evaluate_input("'bx === 64'bx").expect("expression should evaluate");
+        assert_eq!(case_eq.output, "1'b1");
+    }
+
+    #[test]
+    fn unsized_x_literal_msb_extends_regardless_of_mixed_signedness() {
+        let unsigned_unsized_signed_sized =
+            evaluate_input("'bx | 64'sb0").expect("expression should evaluate");
+        assert_eq!(
+            unsigned_unsized_signed_sized.output,
+            "64'bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        );
+
+        let signed_unsized_unsigned_sized =
+            evaluate_input("'sbx | 64'b0").expect("expression should evaluate");
+        assert_eq!(
+            signed_unsized_unsigned_sized.output,
+            "64'bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        );
+    }
+
+    #[test]
+    fn unsized_signed_literal_sign_extends_per_own_signedness_in_unsigned_context() {
+        // 'shFFFFFFFF is signed with MSB=1 at the 32-bit default. Per footnote
+        // a's "Otherwise" branch, the own (signed) signedness drives a sign-
+        // extend even though the propagated context is unsigned. §5.5.4 would
+        // instead zero-extend and yield 64'h00000000FFFFFFFF.
+        let evaluation =
+            evaluate_input("'shFFFFFFFF | 64'b0").expect("expression should evaluate");
+        assert_eq!(evaluation.output, "64'hffffffffffffffff");
+    }
+
+    #[test]
+    fn outer_context_propagates_to_unsized_leaf_through_inner_expression() {
+        let nested = evaluate_input("('bx | 4'b0) | 64'b0").expect("expression should evaluate");
+        assert_eq!(
+            nested.output,
+            "64'bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        );
+
+        // Without the outer 64-bit context the inner expression stays at its
+        // own self-determined max(32, 4) = 32 bits.
+        let alone = evaluate_input("('bx | 4'b0)").expect("expression should evaluate");
+        assert_eq!(alone.output, "32'bxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    }
+
+    #[test]
+    fn sized_operands_still_follow_propagated_context_extension() {
+        // 32'sbx is sized signed with MSB=x. Mixed with 34'b0 (unsigned) the
+        // propagated context is unsigned, so §5.5.4 zero-fills the two extra
+        // MSB positions even though the operand's MSB is x.
+        let mixed = evaluate_input("32'sbx | 34'b0").expect("expression should evaluate");
+        assert_eq!(mixed.output, "34'b00xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+
+        // Both signed → propagated signed → MSB-fill carries x up.
+        let both_signed = evaluate_input("32'sbx | 34'sb0").expect("expression should evaluate");
+        assert_eq!(
+            both_signed.output,
+            "34'sbxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        );
+    }
+
+    #[test]
+    fn unsized_value_literals_unchanged_in_wider_context() {
+        // Sanity: value (non-x/z) literals should produce the same bits
+        // whether we eager-size at 32 + §5.5.4 extend, or footnote-a extend.
+        let unsigned_hex =
+            evaluate_input("'h7FFFFFFF | 64'b0").expect("expression should evaluate");
+        assert_eq!(unsigned_hex.output, "64'h000000007fffffff");
+
+        let signed_decimal = evaluate_input("42 + 64'sb0").expect("expression should evaluate");
+        assert_eq!(signed_decimal.output, "64'sd42");
     }
 
     #[test]

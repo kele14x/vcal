@@ -377,6 +377,7 @@ Imports notes (which follows LRM but specified here as notes):
 - Unsized number (simple decimal number or a number without size) shall be at least 32 bits, but may be longer than 32 if the value needs more bits
 - If the value digits occupy fewer bits than the literal width (or fewer than 32 bits for an unsized literal), the value is left-extended. Ordinary unsigned digits are zero-extended, `x` digits are extended with `x`, and `z`/`?` digits are extended with `z`. This literal-digit padding rule is not sign extension.
 - There could be spaces between the 3 tokens (size, base, value) of integer constants. For example `8 'd 5` is the same as `8'd5`. However there should be no spaces between the `'` and the base (`b`, `o`, `d`, `h`, `sb`, `so`, `sd`, `sh`). Also there should be not spaces between `s` and the base.
+- An unsized constant remains "unsized" after parsing — its default ≥32-bit form is just an intermediate. When it ends up as an operand of an expression wider than 32 bits, the leaf-extension follows LRM Table 5-22 footnote a (not §5.5.4): if the literal's MSB is `x`/`z` it extends with that MSB regardless of the propagated context signedness; otherwise it sign-extends if the literal itself was declared signed (simple decimal, `'sb`/`'sh`/...) and zero-extends if unsigned. Sized literals continue to follow §5.5.4 (extension driven by propagated context signedness). See "Width rules" below for the full split and iverilog-confirmed examples.
 
 ### Operator precedence
 
@@ -407,6 +408,13 @@ Notes:
   - Second pass: top-down context-determined evaluation so a parent expression can widen child arithmetic before truncation. Required for cases like `(a + b) + 0`, where the outer expression width widens the inner arithmetic before overflow is applied.
 - For arithmetic operators (`+`, `-`, `*`, `/`, `%`, `**`), if any operand contains `x` or `z`, the result becomes all-`x` bits at the effective result width.
 - The exponent operand of `**` is treated as self-determined.
+- Leaf-extension splits on whether the leaf is a **sized** literal or an **unsized** literal:
+  - **Sized leaf** — extension uses the propagated context signedness (§5.5.4 + §5.5.2's propagated-type rule). Signed propagated context sign-extends (and propagates `x`/`z` if the MSB is `x`/`z`); unsigned propagated context zero-extends regardless of the MSB. This is the same rule already documented under "Relational/Equality operators".
+  - **Unsized leaf** — extension uses LRM Table 5-22 footnote a (independent of propagated signedness). If the literal's MSB is `x` or `z`, fill with that MSB; otherwise fill per the **literal's own** declared signedness (sign-extend if signed, zero-extend if unsigned). The literal also keeps its self-determined ≥32 bit width if the context is narrower.
+- Footnote a diverges from §5.5.4 in two iverilog-confirmed corners (vcal follows iverilog/footnote a for unsized leaves):
+  - `'bx | 64'b0` → `64'bxxxx…x` (footnote a x-extends the MSB; §5.5.4 would zero-fill the upper 32).
+  - `'shFFFFFFFF | 64'b0` → `64'hFFFF_FFFF_FFFF_FFFF` (footnote a sign-extends per the literal's own `'sh`; §5.5.4 would zero-extend because the propagated context is unsigned).
+- For sized operands the propagated context still wins, so `32'sbx | 34'b0` is `34'b00xx…x` (zero-fill the two new MSBs even though the operand's MSB is `x`). Inside a context-determined sub-expression the outer width propagates all the way down to leaf literals, so `('bx | 4'b0) | 64'b0` is also `64'bxxxx…x` (the inner `'bx` sees the outer 64-bit context).
 
 ### Signedness rules
 
