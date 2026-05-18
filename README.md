@@ -164,8 +164,8 @@ This is final support target matrix, not means currently supported or implemente
       - [ ] `$atanh`
 
 - [ ] Supported operators
-  - [ ] `{}` Concatenation
-  - [ ] `{{}}` Replication
+  - [x] `{}` Concatenation
+  - [x] `{{}}` Replication
   - [x] unary `+` Unary positive
   - [x] unary `-` Unary negative
   - [x] `+` Arithmetic add
@@ -558,6 +558,36 @@ Verilog's only ternary operator, written `expression1 ? expression2 : expression
 vcal deliberately diverges from LRM Table 5-21 on the ambiguous-cond merge. The strict table reduces *every* combination other than `(0,0)` and `(1,1)` to `x` — including `(x,x)` and `(z,z)`. iverilog (and most other simulators) instead use the value-preserving rule above, on the principle that if both branches put the same `x` (or `z`) at the same position regardless of cond, the result is necessarily that bit and reducing it to `x` would discard information. So `1'bx ? 4'b01xz : 4'b01xz` is `4'b01xz` here (and in iverilog), not the `4'b01xx` the LRM table prescribes. vcal follows iverilog as the practical reference, the same call already made for `>>>` fill behavior in the shift section.
 
 Width extension of the two branches has the same §5.1.13-vs-§5.5.2 inconsistency the bitwise section already calls out. §5.1.13's last paragraph says the shorter operand "shall be lengthened to match the longer and zero-filled from the left", but §5.5.2 says a narrower operand is sign-extended whenever the propagated type is signed (which, by §5.5.1, happens when both branches are signed). For `1 ? 4'shF : 8'sh0` the two rules disagree — §5.1.13 would give `8'sh0f`, §5.5.2 gives `8'shff`. vcal follows §5.5.2 and matches iverilog, exactly as we do for bitwise: sign-extend when both branches are signed, zero-extend otherwise. So `1 ? 4'shF : 8'sh0` is `8'shff` and `1 ? 4'shF : 8'h0` is `8'h0f` (the unsigned `8'h0` flips the propagated context to unsigned, restoring zero-fill).
+
+#### Concatenation and replication operators
+
+The brace forms (LRM §5.1.14) are two related but distinct operators that share the same syntactic level. Both are primaries — they sit alongside literals and parenthesised expressions, no precedence concerns.
+
+- **Concatenation** — `{ expr {, expr} }`. Joins one or more sub-expressions into a single bit vector. The leftmost sub-expression occupies the most-significant bit positions of the result; the rightmost occupies the least-significant bit positions. Result width is the sum of operand widths.
+- **Replication** — `{ count_expr { expr {, expr} } }`. Repeats the inner concatenation `count_expr` times. Result width is `count_expr × inner_width`.
+
+Both forms share these rules:
+
+- Each inner sub-expression is **self-determined** — its width is decided by itself, with no width or signedness propagated down from outside the braces. An outer context (e.g. the `+` in `{4'b1010} + 8'd0`) only zero-extends the joined result, never reaches into the operands.
+- The result is **always unsigned** (LRM §5.5.1 last paragraph + §5.1.14). Even `{4'sb1000, 4'sb0001}` is unsigned `8'b10000001`, not `-8'sd127`.
+- The result base inherits **leftmost-wins** (vcal display convention, same as arithmetic/bitwise/shift). `{4'h1, 4'b10}` → `8'h12`; `{4'b10, 4'h1}` → `8'b00100001`.
+- Bit values pass through unchanged, **including `x` and `z`**. Concatenation never reduces unknown bits — `{2'bxz, 2'b01}` → `4'bxz01`.
+
+Indefinite-width operands are rejected. LRM §5.1.14 says "unsized constant numbers shall not be allowed in concatenations" — vcal extends this to any expression whose self-determined width is determined by an unsized literal, matching iverilog's "Concatenation operand has indefinite width" rejection. The flag propagates through every context-determined operator (arithmetic, bitwise, power, shift LHS, conditional branches, unary `+`/`-`/`~`) but stops at every operator that produces a definite 1-bit result (relational, equality, logical, reduction). So:
+
+- `{1, 4'd2}` — error (bare unsized).
+- `{4'd1 + 1, 4'd2}` — error (the `1` is unsized; arithmetic propagates).
+- `{1 << 1, 4'd2}` — error (shift width comes from the unsized LHS).
+- `{1'b1 ? 1 : 4'd2, 4'd2}` — error (conditional width is `max(then, else)`, the unsized branch poisons it).
+- `{4'd1 + 4'd1, 4'd2}` — OK (both sized; result is 4-bit).
+- `{1 == 2, 4'd2}` — OK (`==` always produces 1-bit, regardless of operand sizes).
+
+Replication count rules:
+
+- Must be a constant expression (always true in vcal — there are no variables).
+- Must be **non-negative, non-`x`, non-`z`** (LRM §5.1.14).
+- Read as a math integer using its declared signedness — `-1` is rejected as negative even though its bit pattern reads unsigned as a large positive.
+- **Zero replication** is allowed, but only when the replication appears inside a concatenation that has at least one *other* operand of positive size (LRM §5.1.14: "Such a replication shall appear only within a concatenation in which at least one of the operands of the concatenation has a positive size."). The zero-rep contributes no bits; the surrounding concatenation supplies the result. So `{{0{1'b1}}, 1'b1}` is `1'b1`, but a top-level `{0{1'b1}}` or a concatenation whose every operand is zero-sized (e.g. `{{0{1'b1}}}`, `{{0{1'b1}}, {0{1'b1}}}`, `{N{{0{1'b1}}}}`) is rejected. The zero-permission also applies through `Grouped` wrappers, so `{({0{1'b1}}), 1'b1}` is treated the same as the unwrapped form.
 
 ### Packed vs unpacked array
 

@@ -303,6 +303,22 @@ enum Expr {
         then_expr: Box<Expr>,
         else_expr: Box<Expr>,
     },
+    // LRM 5.1.14: `{a, b, ...}`. Items are stored in source order — leftmost
+    // first — but during evaluation the leftmost item ends up in the most
+    // significant bit positions of the result. Result is unsigned (LRM 5.5.1
+    // last paragraph) and self-determined; outer context only zero-extends
+    // the joined result, never propagates into the items.
+    Concatenation {
+        items: Vec<Expr>,
+    },
+    // LRM 5.1.14: `{count{items...}}`. `count` is a constant non-negative
+    // non-x/non-z expression (rejected at evaluation time otherwise). `items`
+    // is the inner concatenation list — same self-determined semantics as
+    // `Concatenation`.
+    Replication {
+        count: Box<Expr>,
+        items: Vec<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,6 +398,9 @@ enum Token {
     ArithmeticShiftRight,
     Question,
     Colon,
+    LBrace,
+    RBrace,
+    Comma,
 }
 
 struct Parser {
@@ -652,6 +671,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             }
             '?' => tokens.push(Token::Question),
             ':' => tokens.push(Token::Colon),
+            '{' => tokens.push(Token::LBrace),
+            '}' => tokens.push(Token::RBrace),
+            ',' => tokens.push(Token::Comma),
             '\'' => {
                 tokens.push(Token::IntegerLiteral(read_based_literal_after_apostrophe(
                     &mut chars,
@@ -825,6 +847,9 @@ fn is_expression_delimiter(ch: char) -> bool {
             | '^'
             | '~'
             | ':'
+            | '{'
+            | '}'
+            | ','
     )
 }
 
@@ -1125,6 +1150,7 @@ impl Parser {
                     _ => Err("missing closing parenthesis".to_string()),
                 }
             }
+            Some(Token::LBrace) => self.parse_brace_primary(),
             Some(Token::RParen) => Err("unexpected closing parenthesis".to_string()),
             Some(Token::Plus) | Some(Token::Minus) | Some(Token::Star) | Some(Token::Slash)
             | Some(Token::Percent) | Some(Token::Power) | Some(Token::Less)
@@ -1136,10 +1162,57 @@ impl Parser {
             | Some(Token::BitwiseNand) | Some(Token::BitwiseNor)
             | Some(Token::LogicalShiftLeft) | Some(Token::LogicalShiftRight)
             | Some(Token::ArithmeticShiftLeft) | Some(Token::ArithmeticShiftRight)
-            | Some(Token::Question) | Some(Token::Colon) => {
+            | Some(Token::Question) | Some(Token::Colon)
+            | Some(Token::RBrace) | Some(Token::Comma) => {
                 Err("expected expression operand".to_string())
             }
             None => Err("unexpected end of expression".to_string()),
+        }
+    }
+
+    // LRM 5.1.14: `{ expr {, expr} }` (concatenation) or
+    // `{ count_expr { expr {, expr} } }` (multiple concatenation /
+    // replication). Disambiguated by what follows the first inner expression:
+    // a `{` starts the inner concatenation list (replication form), anything
+    // else (`,` or `}`) means we're in plain concatenation. The leading `{`
+    // has already been consumed by `parse_primary`.
+    fn parse_brace_primary(&mut self) -> Result<Expr, String> {
+        let first = self.parse_expression()?;
+
+        if matches!(self.peek(), Some(Token::LBrace)) {
+            self.index += 1;
+            let items = self.parse_concatenation_items()?;
+            match self.next() {
+                Some(Token::RBrace) => {}
+                _ => return Err("missing closing brace in replication".to_string()),
+            }
+            return Ok(Expr::Replication {
+                count: Box::new(first),
+                items,
+            });
+        }
+
+        let mut items = vec![first];
+        while matches!(self.peek(), Some(Token::Comma)) {
+            self.index += 1;
+            items.push(self.parse_expression()?);
+        }
+        match self.next() {
+            Some(Token::RBrace) => {}
+            _ => return Err("missing closing brace in concatenation".to_string()),
+        }
+        Ok(Expr::Concatenation { items })
+    }
+
+    fn parse_concatenation_items(&mut self) -> Result<Vec<Expr>, String> {
+        let mut items = vec![self.parse_expression()?];
+        while matches!(self.peek(), Some(Token::Comma)) {
+            self.index += 1;
+            items.push(self.parse_expression()?);
+        }
+        match self.next() {
+            Some(Token::RBrace) => Ok(items),
+            _ => Err("missing closing brace in concatenation".to_string()),
         }
     }
 
@@ -1177,6 +1250,8 @@ fn evaluate_expr_in_context(
             then_expr,
             else_expr,
         } => evaluate_conditional_expr(cond, then_expr, else_expr, context),
+        Expr::Concatenation { items } => evaluate_concatenation_expr(items, context),
+        Expr::Replication { count, items } => evaluate_replication_expr(count, items, context),
     }
 }
 
@@ -1221,6 +1296,47 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
                 width: usize::max(then_meta.width, else_meta.width),
                 signed: then_meta.signed && else_meta.signed,
                 base: then_meta.base,
+            })
+        }
+        // LRM 5.1.14: width = sum of operand widths, always unsigned. Base
+        // follows leftmost-wins (consistent with arithmetic/bitwise/shift).
+        Expr::Concatenation { items } => {
+            let mut total_width = 0usize;
+            let mut leftmost_base = Base::Binary;
+            for (idx, item) in items.iter().enumerate() {
+                let item_meta = infer_expr_meta(item)?;
+                total_width = total_width.saturating_add(item_meta.width);
+                if idx == 0 {
+                    leftmost_base = item_meta.base;
+                }
+            }
+            Ok(ExprMeta {
+                width: total_width,
+                signed: false,
+                base: leftmost_base,
+            })
+        }
+        // Replication width depends on the constant count value, so we
+        // evaluate it eagerly. We use the lenient count helper here — a
+        // zero-replication is structurally valid (it just yields width 0)
+        // and the per-position constraint is enforced at evaluation time
+        // by `evaluate_replication_expr` (top-level) or
+        // `collect_concatenation_bits` (the surrounding-list check).
+        Expr::Replication { count, items } => {
+            let count = evaluate_replication_count_allow_zero(count)?;
+            let mut inner_width = 0usize;
+            let mut leftmost_base = Base::Binary;
+            for (idx, item) in items.iter().enumerate() {
+                let item_meta = infer_expr_meta(item)?;
+                inner_width = inner_width.saturating_add(item_meta.width);
+                if idx == 0 {
+                    leftmost_base = item_meta.base;
+                }
+            }
+            Ok(ExprMeta {
+                width: inner_width.saturating_mul(count),
+                signed: false,
+                base: leftmost_base,
             })
         }
     }
@@ -1889,6 +2005,212 @@ fn evaluate_conditional_expr(
     ))
 }
 
+// LRM 5.1.14: every concatenation operand "shall be sized" — an operand
+// with indefinite width (i.e. one whose self-determined width comes from an
+// unsized literal) is rejected. The flag propagates through context-determined
+// operators that take width from their operands (arithmetic/bitwise/power,
+// shift LHS, conditional branches, unary +/-/~), but stops at any operator
+// with a definite 1-bit result (relational/equality/logical/reduction) and at
+// concatenation/replication themselves (their result widths are summed/
+// multiplied integers, never indefinite). Matches iverilog's "indefinite
+// width" rejection (e.g. `{4'd1 + 1, 4'd2}` → error because the `1` is
+// unsized).
+fn is_indefinite_width(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(value) => value.unsized_literal,
+        Expr::Grouped(inner) => is_indefinite_width(inner),
+        Expr::Unary { op, expr } => match op {
+            UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitwiseNot => is_indefinite_width(expr),
+            UnaryOp::LogicalNot
+            | UnaryOp::ReductionAnd
+            | UnaryOp::ReductionNand
+            | UnaryOp::ReductionOr
+            | UnaryOp::ReductionNor
+            | UnaryOp::ReductionXor
+            | UnaryOp::ReductionXnor => false,
+        },
+        Expr::Binary { op, lhs, rhs } => match op {
+            BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Divide
+            | BinaryOp::Modulus
+            | BinaryOp::BitwiseAnd
+            | BinaryOp::BitwiseOr
+            | BinaryOp::BitwiseXor
+            | BinaryOp::BitwiseXnor => is_indefinite_width(lhs) || is_indefinite_width(rhs),
+            BinaryOp::Power => is_indefinite_width(lhs),
+            BinaryOp::LogicalShiftLeft
+            | BinaryOp::LogicalShiftRight
+            | BinaryOp::ArithmeticShiftLeft
+            | BinaryOp::ArithmeticShiftRight => is_indefinite_width(lhs),
+            BinaryOp::LessThan
+            | BinaryOp::GreaterThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThanOrEqual
+            | BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::CaseEqual
+            | BinaryOp::CaseNotEqual
+            | BinaryOp::LogicalAnd
+            | BinaryOp::LogicalOr => false,
+        },
+        Expr::Conditional {
+            cond: _,
+            then_expr,
+            else_expr,
+        } => is_indefinite_width(then_expr) || is_indefinite_width(else_expr),
+        Expr::Concatenation { .. } | Expr::Replication { .. } => false,
+    }
+}
+
+// Replication count must be a constant, non-negative, non-x, non-z value
+// (LRM 5.1.14). `to_usize` doubles as the "fits in addressable space" check;
+// vcal uses `usize` for widths, so an oversized count surfaces as a clean
+// error rather than overflowing. Zero is allowed at parse-meta level — the
+// position-sensitive rule (zero is valid only inside a concatenation whose
+// other operands sum to positive width) is enforced separately in
+// `evaluate_replication_count` (top-level) and `collect_concatenation_bits`
+// (the surrounding-list check).
+fn evaluate_replication_count_allow_zero(count_expr: &Expr) -> Result<usize, String> {
+    let value = evaluate_expr_in_context(count_expr, None)?;
+    if value.has_unknown_bits() {
+        return Err("replication count contains unknown bits".to_string());
+    }
+    let count = value.as_bigint(value.signed);
+    if count.sign() == Sign::Minus {
+        return Err("replication count must be non-negative".to_string());
+    }
+    count
+        .to_usize()
+        .ok_or_else(|| "replication count too large".to_string())
+}
+
+// Strict variant: a top-level replication (one whose result is the whole
+// expression, or whose only consumers are non-concatenation operators) needs
+// a positive count, since it would otherwise produce a zero-width
+// `IntegerValue` in a position where vcal can't represent it. iverilog
+// rejects the same case ("Concatenation repeat may not be zero in this
+// context").
+fn evaluate_replication_count(count_expr: &Expr) -> Result<usize, String> {
+    let count = evaluate_replication_count_allow_zero(count_expr)?;
+    if count == 0 {
+        return Err("replication count must be positive in this context".to_string());
+    }
+    Ok(count)
+}
+
+// Walk through `Grouped` wrappers without evaluating. Used so that
+// `({0{1'b1}})` is treated the same as `{0{1'b1}}` when the parent is
+// looking for a Replication child to allow zero replication on
+// (matching iverilog).
+fn unwrap_grouped(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Grouped(inner) => unwrap_grouped(inner),
+        other => other,
+    }
+}
+
+// LRM 5.1.14: each operand is self-determined (no context propagated down)
+// and must have a definite width — bare unsized literals (and any expression
+// whose width derives from one) are rejected. Bits are joined MSB-first: the
+// leftmost item ends up in the high bits of the result. Result is always
+// unsigned; outer context can only widen the joined value (zero-extending),
+// never reach into the operands.
+fn evaluate_concatenation_expr(
+    items: &[Expr],
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let bits = collect_concatenation_bits(items)?;
+    let leftmost_base = infer_expr_meta(&items[0])?.base;
+    let natural_width = bits.len();
+    let result = IntegerValue::computed(natural_width, false, leftmost_base, bits);
+    Ok(extend_to_outer_context(result, context))
+}
+
+fn evaluate_replication_expr(
+    count_expr: &Expr,
+    items: &[Expr],
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let count = evaluate_replication_count(count_expr)?;
+    let inner_bits = collect_concatenation_bits(items)?;
+    let leftmost_base = infer_expr_meta(&items[0])?.base;
+
+    let mut bits = Vec::with_capacity(inner_bits.len().saturating_mul(count));
+    for _ in 0..count {
+        bits.extend(inner_bits.iter().copied());
+    }
+    let natural_width = bits.len();
+    let result = IntegerValue::computed(natural_width, false, leftmost_base, bits);
+    Ok(extend_to_outer_context(result, context))
+}
+
+// Joins the bit patterns of every item in a concatenation list (used both
+// for plain `{a, b, ...}` and for the inner list of `{N{a, b, ...}}`).
+//
+// LRM 5.1.14 lets a replication's count be zero when it sits directly inside
+// a concatenation — the zero-rep contributes no bits, but the surrounding
+// list must still have at least one operand of positive size. So we
+// special-case Replication items here (looking through `Grouped`) to permit
+// a zero count, then verify the joined width is non-zero. This rejects
+// `{ {0{1'b1}} }` and `{N{ {0{1'b1}} }}` (no positive-size sibling) while
+// accepting `{ {0{1'b1}}, 1'b1 }` and `{N{ {0{1'b1}}, 1'b1 }}` — matching
+// iverilog.
+fn collect_concatenation_bits(items: &[Expr]) -> Result<Vec<LogicBit>, String> {
+    if items.is_empty() {
+        return Err("concatenation requires at least one operand".to_string());
+    }
+    for item in items {
+        if is_indefinite_width(item) {
+            return Err("concatenation operand has indefinite width".to_string());
+        }
+    }
+    // Items are in source order (leftmost first → MSB-side). Our bit vectors
+    // are LSB-first, so we feed bits starting from the rightmost item.
+    let mut bits = Vec::new();
+    for item in items.iter().rev() {
+        bits.extend(evaluate_concatenation_item_bits(item)?);
+    }
+    if bits.is_empty() {
+        // Every operand collapsed to zero width — the concatenation has no
+        // positive-size operand, which is the case LRM 5.1.14 forbids.
+        return Err(
+            "concatenation must have at least one operand with positive size".to_string(),
+        );
+    }
+    Ok(bits)
+}
+
+fn evaluate_concatenation_item_bits(item: &Expr) -> Result<Vec<LogicBit>, String> {
+    if let Expr::Replication { count, items } = unwrap_grouped(item) {
+        let count = evaluate_replication_count_allow_zero(count)?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let inner_bits = collect_concatenation_bits(items)?;
+        let mut bits = Vec::with_capacity(inner_bits.len().saturating_mul(count));
+        for _ in 0..count {
+            bits.extend(inner_bits.iter().copied());
+        }
+        return Ok(bits);
+    }
+    let value = evaluate_expr_in_context(item, None)?;
+    Ok(value.bits)
+}
+
+// Concatenation/replication results are unsigned; if an outer context is
+// wider, zero-extend (reusing the existing §5.5.4 path via
+// `resized_to_context` with context_signed = false). If the outer context is
+// narrower or absent we keep the natural width — concatenation is
+// self-determined, so the joined width never shrinks below itself.
+fn extend_to_outer_context(value: IntegerValue, context: Option<ExprMeta>) -> IntegerValue {
+    match context {
+        Some(ctx) if ctx.width > value.width => value.resized_to_context(ctx.width, false),
+        _ => value,
+    }
+}
+
 fn widen_relational_result(result: IntegerValue, context: Option<ExprMeta>) -> IntegerValue {
     match context {
         Some(ctx) if ctx.width > 1 => result.resized_to_context(ctx.width, false),
@@ -2065,6 +2387,16 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                 return Err("expression contains unknown bits".to_string());
             }
             Ok(value.as_bigint(value.signed))
+        }
+        // Concatenation/replication results are bit-pattern values — read
+        // them as unsigned integers (LRM 5.1.14: "The result of a
+        // concatenation is treated as an unsigned vector").
+        Expr::Concatenation { .. } | Expr::Replication { .. } => {
+            let value = evaluate_expr_in_context(expr, None)?;
+            if value.has_unknown_bits() {
+                return Err("expression contains unknown bits".to_string());
+            }
+            Ok(value.as_bigint(false))
         }
     }
 }
@@ -4846,5 +5178,272 @@ mod tests {
         // `0 ? 1 : (0 ? 2 : 3)` = `0 ? 1 : 3` = 3.
         let result = evaluate_input("1'b0 ? 4'd1 : 1'b0 ? 4'd2 : 4'd3").expect("eval");
         assert_eq!(result.output, "4'd3");
+    }
+
+    // -------- Concatenation / replication (LRM 5.1.14) --------
+
+    #[test]
+    fn concatenation_joins_operands_msb_first() {
+        // Leftmost operand occupies the high bits. iverilog reference:
+        //   $display("%b", {2'b10, 2'b01}); // → 1001
+        let result = evaluate_input("{2'b10, 2'b01}").expect("eval");
+        assert_eq!(result.output, "4'b1001");
+    }
+
+    #[test]
+    fn concatenation_supports_more_than_two_operands() {
+        let result = evaluate_input("{1'b1, 2'b00, 1'b1}").expect("eval");
+        assert_eq!(result.output, "4'b1001");
+    }
+
+    #[test]
+    fn concatenation_inherits_leftmost_operand_base() {
+        // Same leftmost-wins rule as arithmetic/bitwise/shift (vcal display
+        // convention; LRM doesn't prescribe one). iverilog confirms the bit
+        // pattern (`8'h12`); the base choice is ours.
+        let hex_first = evaluate_input("{4'h1, 4'b10}").expect("eval");
+        let bin_first = evaluate_input("{4'b10, 4'h1}").expect("eval");
+        assert_eq!(hex_first.output, "8'h12");
+        assert_eq!(bin_first.output, "8'b00100001");
+    }
+
+    #[test]
+    fn concatenation_preserves_x_and_z_bits() {
+        // Concatenation never reduces unknown bits — each position is copied
+        // through. iverilog confirms `xz01`.
+        let result = evaluate_input("{2'bxz, 2'b01}").expect("eval");
+        assert_eq!(result.output, "4'bxz01");
+    }
+
+    #[test]
+    fn concatenation_result_is_unsigned_even_when_operands_signed() {
+        // LRM 5.5.1 last paragraph + 5.1.14: result is unsigned regardless
+        // of operand signedness. iverilog confirms the bit pattern.
+        let result = evaluate_input("{4'sb1000, 4'sb0001}").expect("eval");
+        assert_eq!(result.output, "8'b10000001");
+    }
+
+    #[test]
+    fn single_element_concatenation_is_identity_on_bits() {
+        // `{x}` is legal LRM syntax and produces the operand's bit pattern
+        // re-flagged as unsigned. iverilog accepts it as an identity.
+        let result = evaluate_input("{4'b1010}").expect("eval");
+        assert_eq!(result.output, "4'b1010");
+    }
+
+    #[test]
+    fn concatenation_widens_through_outer_arithmetic_context() {
+        // The joined value (4 bits) zero-extends to the outer context width
+        // (8 bits) before the addition runs — concatenation is unsigned, so
+        // §5.5.4 zero-fills regardless of operand signedness.
+        let result = evaluate_input("{4'b1010} + 8'd0").expect("eval");
+        assert_eq!(result.output, "8'b00001010");
+    }
+
+    #[test]
+    fn replication_repeats_inner_concatenation() {
+        // {N{...}} — N copies of the inner concatenation joined back to back.
+        let single = evaluate_input("{4{1'b1}}").expect("eval");
+        let multi = evaluate_input("{2{2'b01, 2'b10}}").expect("eval");
+        assert_eq!(single.output, "4'b1111");
+        assert_eq!(multi.output, "8'b01100110");
+    }
+
+    #[test]
+    fn replication_count_can_be_a_constant_expression() {
+        // The count is any constant expression (LRM 5.1.14). vcal has no
+        // variables, so any well-formed expression qualifies.
+        let result = evaluate_input("{(1+3){1'b1}}").expect("eval");
+        assert_eq!(result.output, "4'b1111");
+    }
+
+    #[test]
+    fn replication_can_nest_when_inner_is_braced() {
+        // `{2{ {2{1'b1}} }}` — outer rep of an inner replication. Note the
+        // inner `{2{1'b1}}` must itself be a brace primary; iverilog also
+        // rejects `{2{2{1'b1}}}` as a syntax error since `2{1'b1}` is not a
+        // standalone primary.
+        let result = evaluate_input("{2{ {2{1'b1}} }}").expect("eval");
+        assert_eq!(result.output, "4'b1111");
+    }
+
+    #[test]
+    fn concatenation_rejects_bare_unsized_literal_operand() {
+        // LRM 5.1.14: "Unsized constant numbers shall not be allowed in
+        // concatenations." iverilog rejects this with "indefinite width".
+        let err = evaluate_input("{1, 4'd2}").expect_err("indefinite");
+        assert_eq!(err, "concatenation operand has indefinite width");
+    }
+
+    #[test]
+    fn concatenation_rejects_arithmetic_with_unsized_operand() {
+        // The indefinite-width flag propagates through context-determined
+        // arithmetic: `4'd1 + 1` is indefinite because the `1` is unsized.
+        // iverilog rejects with "Concatenation operand ... has indefinite
+        // width."
+        let err = evaluate_input("{4'd1 + 1, 4'd2}").expect_err("indefinite");
+        assert_eq!(err, "concatenation operand has indefinite width");
+    }
+
+    #[test]
+    fn concatenation_accepts_arithmetic_when_all_operands_sized() {
+        // `4'd1 + 4'd1` is sized (both operands sized → result is 4-bit), so
+        // the operand has a definite width and concatenation succeeds.
+        // iverilog: `00100010` = 8'd34.
+        let result = evaluate_input("{4'd1 + 4'd1, 4'd2}").expect("eval");
+        assert_eq!(result.output, "8'd34");
+    }
+
+    #[test]
+    fn concatenation_accepts_one_bit_results_with_unsized_subexpressions() {
+        // Relational/equality/logical/reduction always produce 1-bit results
+        // — they have a definite width even when their operands are unsized.
+        // iverilog: `{1==2, 4'd2}` → `00010` = 5 bits.
+        let result = evaluate_input("{1==2, 4'd2}").expect("eval");
+        assert_eq!(result.output, "5'b00010");
+    }
+
+    #[test]
+    fn concatenation_rejects_shift_with_unsized_lhs() {
+        // Shifts take their result width from the LHS only (LRM 5.1.12), so
+        // an unsized LHS makes the whole expression indefinite. iverilog
+        // also rejects `{1 << 1, 4'd2}` as indefinite.
+        let err = evaluate_input("{1 << 1, 4'd2}").expect_err("indefinite");
+        assert_eq!(err, "concatenation operand has indefinite width");
+    }
+
+    #[test]
+    fn concatenation_rejects_conditional_with_unsized_branch() {
+        // Conditional width is max(then, else) (LRM 5.1.13), so an unsized
+        // branch makes the whole conditional indefinite. iverilog rejects
+        // `{1'b1 ? 1 : 4'd2, 4'd2}` as indefinite.
+        let err = evaluate_input("{1'b1 ? 1 : 4'd2, 4'd2}").expect_err("indefinite");
+        assert_eq!(err, "concatenation operand has indefinite width");
+    }
+
+    #[test]
+    fn top_level_replication_rejects_zero_count() {
+        // LRM 5.1.14 only permits zero replication when it sits inside a
+        // concatenation with at least one positive-size operand; a top-level
+        // `{0{...}}` (no enclosing concat) is rejected. iverilog produces
+        // "Concatenation repeat may not be zero in this context."
+        let err = evaluate_input("{0{1'b1}}").expect_err("zero count");
+        assert_eq!(err, "replication count must be positive in this context");
+    }
+
+    #[test]
+    fn zero_replication_inside_concatenation_contributes_no_bits() {
+        // LRM 5.1.14: a replication may have a zero count when it is one of
+        // the operands of a concatenation whose other operands sum to a
+        // positive width. The zero-rep simply contributes nothing.
+        // iverilog: `{{0{1'b1}}, 1'b1}` → `1`.
+        let prefix = evaluate_input("{ {0{1'b1}}, 1'b1 }").expect("zero rep prefix");
+        let suffix = evaluate_input("{ 4'b1010, {0{1'b1}} }").expect("zero rep suffix");
+        let middle = evaluate_input("{ 1'b1, {0{1'b1}}, 1'b0 }").expect("zero rep middle");
+        let multiple = evaluate_input("{ {0{1'b1}}, {0{1'b1}}, 1'b1 }").expect("zero rep many");
+
+        assert_eq!(prefix.output, "1'b1");
+        assert_eq!(suffix.output, "4'b1010");
+        assert_eq!(middle.output, "2'b10");
+        assert_eq!(multiple.output, "1'b1");
+    }
+
+    #[test]
+    fn zero_replication_through_grouped_is_treated_the_same() {
+        // `({0{1'b1}})` is `Grouped(Replication{0, ...})`. iverilog accepts
+        // it inside a concatenation; vcal looks through `Grouped` to find
+        // the underlying Replication node when applying the zero-permission.
+        let result = evaluate_input("{ ({0{1'b1}}), 1'b1 }").expect("grouped zero rep");
+        assert_eq!(result.output, "1'b1");
+    }
+
+    #[test]
+    fn zero_replication_inside_nested_replication_inner_list() {
+        // The zero-permission also applies to a replication's *inner*
+        // concatenation list, since that list is itself a concatenation.
+        // iverilog: `{2{ {0{1'b1}}, 1'b1 }}` → `11`.
+        let result = evaluate_input("{2{ {0{1'b1}}, 1'b1 }}").expect("nested zero rep");
+        assert_eq!(result.output, "2'b11");
+    }
+
+    #[test]
+    fn concatenation_of_only_zero_replication_is_rejected() {
+        // `{ {0{1'b1}} }` — one operand, and it has zero size. No
+        // positive-size sibling, so the surrounding concatenation has no
+        // positive-size operand. iverilog: "Concatenation/replication may
+        // not have zero width in this context."
+        let solo =
+            evaluate_input("{ {0{1'b1}} }").expect_err("solo zero rep in concat");
+        let pair = evaluate_input("{ {0{1'b1}}, {0{1'b1}} }")
+            .expect_err("two zero reps no positive sibling");
+        let nested =
+            evaluate_input("{2{ {0{1'b1}} }}").expect_err("outer rep over zero-only inner");
+        assert_eq!(
+            solo,
+            "concatenation must have at least one operand with positive size"
+        );
+        assert_eq!(
+            pair,
+            "concatenation must have at least one operand with positive size"
+        );
+        assert_eq!(
+            nested,
+            "concatenation must have at least one operand with positive size"
+        );
+    }
+
+    #[test]
+    fn replication_rejects_negative_count() {
+        // `-1` is signed-negative — read as a math integer, sign() = Minus.
+        let err = evaluate_input("{-1{1'b1}}").expect_err("negative count");
+        assert_eq!(err, "replication count must be non-negative");
+    }
+
+    #[test]
+    fn replication_rejects_unknown_count() {
+        // A count with any x or z bit is rejected — same self-determined
+        // count check that iverilog applies (the count must be "a constant
+        // expression that is non-negative, non-x, non-z").
+        let err = evaluate_input("{1'bx{1'b1}}").expect_err("unknown count");
+        assert_eq!(err, "replication count contains unknown bits");
+    }
+
+    #[test]
+    fn empty_braces_is_a_parse_error() {
+        // `{}` — no expressions inside; LRM grammar requires at least one.
+        let err = evaluate_input("{}").expect_err("empty");
+        assert_eq!(err, "expected expression operand");
+    }
+
+    #[test]
+    fn unclosed_concatenation_is_a_parse_error() {
+        let err = evaluate_input("{4'd1, 4'd2").expect_err("unclosed");
+        assert_eq!(err, "missing closing brace in concatenation");
+    }
+
+    #[test]
+    fn tokenizes_braces_and_comma_as_separate_tokens() {
+        // Braces and comma must split adjacent literals — `1,2'b10` should
+        // tokenize as `1`, `,`, `2'b10`, not be swallowed into a single
+        // integer literal.
+        let tokens = tokenize("{1'd1,2'b10}").expect("tokens");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::LBrace,
+                Token::IntegerLiteral("1'd1".to_string()),
+                Token::Comma,
+                Token::IntegerLiteral("2'b10".to_string()),
+                Token::RBrace,
+            ]
+        );
+    }
+
+    #[test]
+    fn replication_widens_through_outer_arithmetic_context() {
+        // Same self-determined-then-extend shape as plain concatenation: the
+        // 4-bit replication result zero-extends to the 8-bit outer context.
+        let result = evaluate_input("{4{1'b1}} + 8'd0").expect("eval");
+        assert_eq!(result.output, "8'b00001111");
     }
 }
