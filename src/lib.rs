@@ -236,6 +236,11 @@ enum Expr {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },
+    Conditional {
+        cond: Box<Expr>,
+        then_expr: Box<Expr>,
+        else_expr: Box<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,6 +318,8 @@ enum Token {
     LogicalShiftRight,
     ArithmeticShiftLeft,
     ArithmeticShiftRight,
+    Question,
+    Colon,
 }
 
 struct Parser {
@@ -581,6 +588,8 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     _ => tokens.push(Token::Tilde),
                 }
             }
+            '?' => tokens.push(Token::Question),
+            ':' => tokens.push(Token::Colon),
             '\'' => {
                 tokens.push(Token::IntegerLiteral(read_based_literal_after_apostrophe(
                     &mut chars,
@@ -646,11 +655,18 @@ where
                 break;
             }
 
-            chars.next();
+            // Whitespace before the first digit is OK (e.g. `8'd 6`); once
+            // we've started reading digits it terminates the literal so a
+            // following `?` (or any other char) tokenises separately.
             if next_ch.is_whitespace() {
+                if saw_digit {
+                    break;
+                }
+                chars.next();
                 continue;
             }
 
+            chars.next();
             literal.push(next_ch);
             saw_digit = true;
         }
@@ -695,11 +711,15 @@ where
             break;
         }
 
-        chars.next();
         if next_ch.is_whitespace() {
+            if saw_digit {
+                break;
+            }
+            chars.next();
             continue;
         }
 
+        chars.next();
         literal.push(next_ch);
         saw_digit = true;
     }
@@ -721,6 +741,11 @@ where
 }
 
 fn is_expression_delimiter(ch: char) -> bool {
+    // Note: `?` is intentionally NOT a delimiter even though it tokenises
+    // as the conditional operator's `?` — inside a based literal it is the
+    // alias for `z` (LRM 3.5), and `read_integer_literal`'s pre-apostrophe
+    // loop already exits on any non-digit, so `1?2` still tokenises as
+    // `1`, `?`, `2`.
     matches!(
         ch,
         '(' | ')'
@@ -737,12 +762,37 @@ fn is_expression_delimiter(ch: char) -> bool {
             | '|'
             | '^'
             | '~'
+            | ':'
     )
 }
 
 impl Parser {
     fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_logical_or()
+        self.parse_conditional()
+    }
+
+    // LRM Table 5-4: `?:` sits below `||`, above the lowest level.
+    // Right-associative — the middle parses as a full expression so a
+    // nested `?:` in the middle is anchored by the upcoming `:`, and the
+    // else recurses into parse_conditional so `a ? b : c ? d : e` becomes
+    // `a ? b : (c ? d : e)`.
+    fn parse_conditional(&mut self) -> Result<Expr, String> {
+        let cond = self.parse_logical_or()?;
+        if !matches!(self.peek(), Some(Token::Question)) {
+            return Ok(cond);
+        }
+        self.index += 1;
+        let then_expr = self.parse_expression()?;
+        match self.next() {
+            Some(Token::Colon) => {}
+            _ => return Err("expected `:` in conditional expression".to_string()),
+        }
+        let else_expr = self.parse_conditional()?;
+        Ok(Expr::Conditional {
+            cond: Box::new(cond),
+            then_expr: Box::new(then_expr),
+            else_expr: Box::new(else_expr),
+        })
     }
 
     fn parse_logical_or(&mut self) -> Result<Expr, String> {
@@ -1023,7 +1073,8 @@ impl Parser {
             | Some(Token::BitwiseOr) | Some(Token::BitwiseXor) | Some(Token::BitwiseXnor)
             | Some(Token::BitwiseNand) | Some(Token::BitwiseNor)
             | Some(Token::LogicalShiftLeft) | Some(Token::LogicalShiftRight)
-            | Some(Token::ArithmeticShiftLeft) | Some(Token::ArithmeticShiftRight) => {
+            | Some(Token::ArithmeticShiftLeft) | Some(Token::ArithmeticShiftRight)
+            | Some(Token::Question) | Some(Token::Colon) => {
                 Err("expected expression operand".to_string())
             }
             None => Err("unexpected end of expression".to_string()),
@@ -1059,6 +1110,11 @@ fn evaluate_expr_in_context(
         Expr::Grouped(expr) => evaluate_expr_in_context(expr, context),
         Expr::Unary { op, expr } => evaluate_unary_expr(*op, expr, context),
         Expr::Binary { op, lhs, rhs } => evaluate_binary_expr(*op, lhs, rhs, context),
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => evaluate_conditional_expr(cond, then_expr, else_expr, context),
     }
 }
 
@@ -1088,6 +1144,22 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
             let lhs_meta = infer_expr_meta(lhs)?;
             let rhs_meta = infer_expr_meta(rhs)?;
             Ok(combine_binary_meta(*op, lhs_meta, rhs_meta))
+        }
+        // LRM 5.1.13: cond is self-determined and contributes nothing to
+        // the result meta; then/else are context-determined and unify
+        // width (max) and signedness (any unsigned → unsigned, §5.5.1).
+        Expr::Conditional {
+            cond: _,
+            then_expr,
+            else_expr,
+        } => {
+            let then_meta = infer_expr_meta(then_expr)?;
+            let else_meta = infer_expr_meta(else_expr)?;
+            Ok(ExprMeta {
+                width: usize::max(then_meta.width, else_meta.width),
+                signed: then_meta.signed && else_meta.signed,
+                base: then_meta.base,
+            })
         }
     }
 }
@@ -1706,6 +1778,60 @@ fn evaluate_equality_expr(
     Ok(widen_relational_result(comparison_result_value(bit), context))
 }
 
+// LRM 5.1.13: cond is self-determined and reduced to a 1-bit logical the
+// way `&&`/`||`/`!` reduce their operands. then/else are context-determined
+// and unify width/sign with each other AND with the propagated outer
+// context. As with the shift path, signedness must consult the propagated
+// context — if the surrounding expression is unsigned (§5.5.1), the leaf
+// primaries of then/else must zero-fill rather than sign-fill.
+//
+// When cond is x or z, evaluate both branches and merge per bit: agreeing
+// bits stay, disagreeing bits become x. This preserves x/z agreement
+// (e.g. x ∩ x → x) and reduces any disagreement (including 0 vs x) to x.
+fn evaluate_conditional_expr(
+    cond: &Expr,
+    then_expr: &Expr,
+    else_expr: &Expr,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let then_meta = infer_expr_meta(then_expr)?;
+    let else_meta = infer_expr_meta(else_expr)?;
+    let meta = ExprMeta {
+        width: usize::max(then_meta.width, else_meta.width),
+        signed: then_meta.signed && else_meta.signed,
+        base: then_meta.base,
+    };
+    let effective_meta = ExprMeta {
+        width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
+        signed: context.map_or(meta.signed, |ctx| ctx.signed),
+        base: meta.base,
+    };
+
+    let cond_value = evaluate_expr_in_context(cond, None)?;
+    let cond_logical = logical_value(&cond_value);
+
+    let then_value = evaluate_expr_in_context(then_expr, Some(effective_meta))?;
+    let else_value = evaluate_expr_in_context(else_expr, Some(effective_meta))?;
+
+    let bits = match cond_logical {
+        LogicBit::One => then_value.bits,
+        LogicBit::Zero => else_value.bits,
+        LogicBit::X | LogicBit::Z => then_value
+            .bits
+            .iter()
+            .zip(else_value.bits.iter())
+            .map(|(t, e)| if t == e { *t } else { LogicBit::X })
+            .collect(),
+    };
+
+    Ok(IntegerValue {
+        width: effective_meta.width,
+        signed: effective_meta.signed,
+        base: meta.base,
+        bits,
+    })
+}
+
 fn widen_relational_result(result: IntegerValue, context: Option<ExprMeta>) -> IntegerValue {
     match context {
         Some(ctx) if ctx.width > 1 => result.resized_to_context(ctx.width, false),
@@ -1872,6 +1998,16 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                 | BinaryOp::ArithmeticShiftLeft
                 | BinaryOp::ArithmeticShiftRight => unreachable!("handled above"),
             }
+        }
+        // The result depends on width-aware extension of then/else and on
+        // a per-bit merge under an x/z cond, so route through the standard
+        // pipeline rather than reaching into bigint directly.
+        Expr::Conditional { .. } => {
+            let value = evaluate_expr_in_context(expr, None)?;
+            if value.has_unknown_bits() {
+                return Err("expression contains unknown bits".to_string());
+            }
+            Ok(value.as_bigint(value.signed))
         }
     }
 }
@@ -3634,6 +3770,23 @@ mod tests {
     }
 
     #[test]
+    fn bitwise_extends_per_5_5_2_not_per_5_1_10() {
+        // LRM §5.1.10 says the shorter operand "shall be zero-filled in the
+        // most significant bit positions", but §5.5.2 says signed-signed
+        // operands unify under a signed propagated context and the narrower
+        // side sign-extends. The two rules disagree for `4'shF | 8'sh0`.
+        // vcal follows §5.5.2 (matching iverilog, VCS, Xcelium, and the
+        // SystemVerilog clarification that drops the §5.1.10 sentence):
+        //   - both signed → sign-extend the narrower operand.
+        //   - any unsigned → unsigned context → zero-extend.
+        let both_signed = evaluate_input("4'shF | 8'sh0").expect("both signed");
+        let mixed_unsigned = evaluate_input("4'shF | 8'h0").expect("mixed");
+
+        assert_eq!(both_signed.output, "8'shff");
+        assert_eq!(mixed_unsigned.output, "8'h0f");
+    }
+
+    #[test]
     fn bitwise_binary_widens_through_outer_arithmetic_context() {
         // Without context-widening these would be 4-bit. With outer + 0
         // (32-bit signed 0 produces 32-bit unsigned shared context), the
@@ -4343,5 +4496,204 @@ mod tests {
         }
         let result = evaluate_input("&4'b1111 ** 2").expect("eval");
         assert_eq!(result.output, "1'b1");
+    }
+
+    #[test]
+    fn conditional_selects_then_when_cond_true() {
+        // LRM 5.1.13: a definite-true cond returns expression2, in the
+        // unified width of then/else (4 bits here).
+        let result = evaluate_input("1 ? 4'd5 : 4'd9").expect("eval");
+        assert_eq!(result.output, "4'd5");
+    }
+
+    #[test]
+    fn conditional_selects_else_when_cond_false() {
+        let result = evaluate_input("1'b0 ? 4'd5 : 4'd9").expect("eval");
+        assert_eq!(result.output, "4'd9");
+    }
+
+    #[test]
+    fn conditional_reduces_wide_cond_to_logical() {
+        // LRM 5.1.13: cond is self-determined and reduced to a 1-bit
+        // logical (any 1 → true, all 0 → false).
+        let any_one = evaluate_input("4'b1000 ? 4'd5 : 4'd9").expect("any 1");
+        let all_zero = evaluate_input("4'b0000 ? 4'd5 : 4'd9").expect("all 0");
+
+        assert_eq!(any_one.output, "4'd5");
+        assert_eq!(all_zero.output, "4'd9");
+    }
+
+    #[test]
+    fn conditional_ambiguous_cond_merges_when_branches_agree() {
+        // LRM 5.1.13: when cond is x, evaluate both branches and merge per
+        // bit. Identical branches collapse to the shared value.
+        let result = evaluate_input("1'bx ? 4'b1100 : 4'b1100").expect("eval");
+        assert_eq!(result.output, "4'b1100");
+    }
+
+    #[test]
+    fn conditional_ambiguous_cond_merges_per_bit_with_disagreement() {
+        // 1'bx ? 4'b1100 : 4'b1010 → bits are (1,1)=1, (1,0)=x, (0,1)=x,
+        // (0,0)=0. With LSB-first storage rendered MSB-first as `1xx0`.
+        let result = evaluate_input("1'bx ? 4'b1100 : 4'b1010").expect("eval");
+        assert_eq!(result.output, "4'b1xx0");
+    }
+
+    #[test]
+    fn conditional_ambiguous_cond_handles_xz_bits() {
+        // x agrees with x (stays x); z agrees with z (stays z, since the
+        // merge keeps the shared bit verbatim); x vs z disagrees → x.
+        let xx = evaluate_input("1'bx ? 1'bx : 1'bx").expect("xx");
+        let zz = evaluate_input("1'bx ? 1'bz : 1'bz").expect("zz");
+        let xz = evaluate_input("1'bx ? 1'bx : 1'bz").expect("xz");
+
+        assert_eq!(xx.output, "1'bx");
+        assert_eq!(zz.output, "1'bz");
+        assert_eq!(xz.output, "1'bx");
+    }
+
+    #[test]
+    fn conditional_unifies_then_else_widths() {
+        // Result width = max(L(then), L(else)). Selecting the narrower
+        // branch zero-extends to the unified width.
+        let result = evaluate_input("1 ? 4'd5 : 8'd1").expect("eval");
+        assert_eq!(result.output, "8'd5");
+    }
+
+    #[test]
+    fn conditional_signedness_propagates_per_5_5_1() {
+        // LRM 5.5.1: any unsigned operand → unsigned result. Pairing a
+        // signed and an unsigned branch yields an unsigned conditional.
+        let mixed = evaluate_input("1 ? 4'sd1 : 4'd1").expect("mixed");
+        let both_signed = evaluate_input("1 ? 4'sd1 : 4'sd1").expect("both signed");
+
+        assert_eq!(mixed.output, "4'd1");
+        assert_eq!(both_signed.output, "4'sd1");
+    }
+
+    #[test]
+    fn conditional_extends_per_5_5_2_not_per_5_1_13() {
+        // LRM §5.1.13 last paragraph says the shorter branch is zero-filled
+        // from the left, but §5.5.2 says signed-signed unifies under a
+        // signed propagated context and the narrower side sign-extends.
+        // The two rules disagree for `1 ? 4'shF : 8'sh0`. vcal follows
+        // §5.5.2 (matching iverilog and the bitwise path):
+        //   - both signed → sign-extend the narrower branch.
+        //   - any unsigned → unsigned context → zero-extend.
+        let both_signed = evaluate_input("1 ? 4'shF : 8'sh0").expect("both signed");
+        let mixed_unsigned = evaluate_input("1 ? 4'shF : 8'h0").expect("mixed");
+
+        assert_eq!(both_signed.output, "8'shff");
+        assert_eq!(mixed_unsigned.output, "8'h0f");
+    }
+
+    #[test]
+    fn conditional_outer_arithmetic_context_widens_branches() {
+        // Self-determined `1 ? 4'd8 : 4'd0` is 4'd8. Inside a 32-bit
+        // context the branches first widen to 32 bits before selection,
+        // matching the shape of the existing shift-widening test.
+        let self_determined = evaluate_input("1 ? 4'd8 : 4'd0").expect("self");
+        let widened = evaluate_input("(1 ? 4'd8 : 4'd0) + 0").expect("widened");
+
+        assert_eq!(self_determined.output, "4'd8");
+        assert_eq!(widened.output, "32'd8");
+    }
+
+    #[test]
+    fn conditional_outer_unsigned_context_zero_fills_signed_branch() {
+        // Mirror of the shift `>>>` propagation test. Same conditional, two
+        // outer contexts:
+        //   Self-determined: signed → 4'sb1000 sign-extends nowhere
+        //     (already 4 bits).
+        //   Mixed unsigned (8'd0): result type is unsigned → 4'sb1000
+        //     zero-extends to 8'b00001000.
+        //   All-signed (signed `0`): result type is signed → 4'sb1000
+        //     sign-extends to 32'sb1...11000.
+        let self_determined = evaluate_input("1 ? 4'sb1000 : 4'sb1000").expect("self");
+        let mixed = evaluate_input("(1 ? 4'sb1000 : 4'sb1000) + 8'd0").expect("mixed");
+        let all_signed = evaluate_input("(1 ? 4'sb1000 : 4'sb1000) + 0").expect("all signed");
+
+        assert_eq!(self_determined.output, "4'sb1000");
+        assert_eq!(mixed.output, "8'b00001000");
+        assert_eq!(
+            all_signed.output,
+            "32'sb11111111111111111111111111111000"
+        );
+    }
+
+    #[test]
+    fn conditional_is_right_associative() {
+        // `1'b0 ? 1 : 1'b1 ? 2 : 3` parses as `1'b0 ? 1 : (1'b1 ? 2 : 3)`.
+        // Cond is false, so the else branch runs, picking 2.
+        let expr = parse_expression("1'b0 ? 1 : 1'b1 ? 2 : 3").expect("parse");
+        match expr {
+            Expr::Conditional { else_expr, .. } => {
+                assert!(matches!(*else_expr, Expr::Conditional { .. }));
+            }
+            other => panic!("expected top-level conditional, got {other:?}"),
+        }
+        let result = evaluate_input("1'b0 ? 1 : 1'b1 ? 2 : 3").expect("eval");
+        // Unsized integer literals are 32-bit signed (LRM 3.5.1), so all
+        // three branches are signed and the result keeps signedness.
+        assert_eq!(result.output, "32'sd2");
+    }
+
+    #[test]
+    fn conditional_lower_precedence_than_logical_or() {
+        // LRM Table 5-4: `?:` sits below `||`. `1 || 0 ? 1 : 2` parses as
+        // `(1 || 0) ? 1 : 2`, picking the then branch.
+        let expr = parse_expression("1 || 0 ? 1 : 2").expect("parse");
+        match expr {
+            Expr::Conditional { cond, .. } => {
+                assert!(matches!(
+                    *cond,
+                    Expr::Binary {
+                        op: BinaryOp::LogicalOr,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected top-level conditional, got {other:?}"),
+        }
+        let result = evaluate_input("1 || 0 ? 1 : 2").expect("eval");
+        assert_eq!(result.output, "32'sd1");
+    }
+
+    #[test]
+    fn conditional_lower_precedence_than_relational_and_arithmetic() {
+        // `2 > 1 ? 5 : 6` parses as `(2 > 1) ? 5 : 6` and `1 + 1 ? 3 : 4`
+        // parses as `(1 + 1) ? 3 : 4` — both lower-precedence operators
+        // bind into the cond.
+        let relational = evaluate_input("2 > 1 ? 5 : 6").expect("relational cond");
+        let arithmetic = evaluate_input("1 + 1 ? 3 : 4").expect("arithmetic cond");
+
+        assert_eq!(relational.output, "32'sd5");
+        assert_eq!(arithmetic.output, "32'sd3");
+    }
+
+    #[test]
+    fn conditional_inherits_then_branch_base() {
+        // Result base follows the then branch (the leftmost bit-pattern
+        // operand after the cond), mirroring leftmost-wins for binaries.
+        let hex_then = evaluate_input("1 ? 8'h0a : 8'd5").expect("hex then");
+        let dec_then = evaluate_input("1 ? 8'd10 : 8'h05").expect("dec then");
+
+        assert_eq!(hex_then.output, "8'h0a");
+        assert_eq!(dec_then.output, "8'd10");
+    }
+
+    #[test]
+    fn conditional_missing_colon_is_parse_error() {
+        // A `?` without `:` should not silently parse as something else.
+        let err = evaluate_input("1 ? 2").expect_err("missing colon");
+        assert_eq!(err, "expected `:` in conditional expression");
+    }
+
+    #[test]
+    fn conditional_chained_in_else_position() {
+        // `0 ? 1 : 0 ? 2 : 3` is right-associative so it evaluates as
+        // `0 ? 1 : (0 ? 2 : 3)` = `0 ? 1 : 3` = 3.
+        let result = evaluate_input("1'b0 ? 4'd1 : 1'b0 ? 4'd2 : 4'd3").expect("eval");
+        assert_eq!(result.output, "4'd3");
     }
 }

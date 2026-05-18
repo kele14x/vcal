@@ -200,7 +200,7 @@ This is final support target matrix, not means currently supported or implemente
   - [x] `>>` Logical right shift
   - [x] `<<<` Arithmetic left shift
   - [x] `>>>` Arithmetic right shift
-  - [ ] `? :` Conditional
+  - [x] `? :` Conditional
 
 - [ ] Supported syntax definition
   - [ ] A.2 Declarations
@@ -535,6 +535,21 @@ There are 4 shift operators — `<<` (logical left), `<<<` (arithmetic left), `>
 - Result base inherits from the LHS (leftmost-wins), like the other binary operators.
 
 LHS bits that are not shifted out keep their value, including `x` and `z`, so `4'b01x0 << 1` is `4'b1x00`.
+
+#### Conditional operator
+
+Verilog's only ternary operator, written `expression1 ? expression2 : expression3` (LRM §5.1.13). It sits between `||` and the lowest precedence level (LRM Table 5-4) and is right-associative, so `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`.
+
+- `expression1` is **self-determined** and reduced to a 1-bit logical the same way `&&`/`||`/`!` reduce their operands: any `1` is true, all `0` is false, otherwise (any `x`/`z` and no definite `1`) the cond is ambiguous and reduces to `x`.
+- `expression2` and `expression3` are **context-determined** — both take the result width and signedness, with their leaf primaries extended accordingly.
+- Width = `max(L(expression2), L(expression3), L(context))`.
+- Signedness combines per §5.5.1 (any unsigned operand → unsigned result). As with shifts, the propagated outer signedness overrides the operand-derived signedness, so a mixed unsigned outer context zero-fills both branches at their leaves rather than sign-filling.
+- When the cond is a definite `0` or `1`, only the chosen branch's bits feed the result. When the cond is `x`/`z`, both branches are evaluated and merged per bit: agreeing bits stay (so `x`∩`x` is `x` and `z`∩`z` is `z`), disagreeing bits become `x` (so `1`∩`0` and `x`∩`0` both yield `x`).
+- Result base inherits from `expression2` (the leftmost bit-pattern operand after the cond), matching the leftmost-wins rule used elsewhere.
+
+vcal deliberately diverges from LRM Table 5-21 on the ambiguous-cond merge. The strict table reduces *every* combination other than `(0,0)` and `(1,1)` to `x` — including `(x,x)` and `(z,z)`. iverilog (and most other simulators) instead use the value-preserving rule above, on the principle that if both branches put the same `x` (or `z`) at the same position regardless of cond, the result is necessarily that bit and reducing it to `x` would discard information. So `1'bx ? 4'b01xz : 4'b01xz` is `4'b01xz` here (and in iverilog), not the `4'b01xx` the LRM table prescribes. vcal follows iverilog as the practical reference, the same call already made for `>>>` fill behavior in the shift section.
+
+Width extension of the two branches has the same §5.1.13-vs-§5.5.2 inconsistency the bitwise section already calls out. §5.1.13's last paragraph says the shorter operand "shall be lengthened to match the longer and zero-filled from the left", but §5.5.2 says a narrower operand is sign-extended whenever the propagated type is signed (which, by §5.5.1, happens when both branches are signed). For `1 ? 4'shF : 8'sh0` the two rules disagree — §5.1.13 would give `8'sh0f`, §5.5.2 gives `8'shff`. vcal follows §5.5.2 and matches iverilog, exactly as we do for bitwise: sign-extend when both branches are signed, zero-extend otherwise. So `1 ? 4'shF : 8'sh0` is `8'shff` and `1 ? 4'shF : 8'h0` is `8'h0f` (the unsigned `8'h0` flips the propagated context to unsigned, restoring zero-fill).
 
 ### Packed vs unpacked array
 
