@@ -363,14 +363,6 @@ There rules follows LRM but not directly written so noted here:
 
 Based on LRM, there could be spaces between the 3 tokens (size, base, value) of integer constants. For example `8 'd 5` is the same as `8'd5`. However there should be no spaces between the `'` and the base (`b`, `o`, `d`, `h`, `sb`, `so`, `sd`, `sh`). Also there should be not spaces between `s` and the base.
 
-### Integer Constants
-
-- Unsized number (simple decimal number or a number without size) shall be at least 32 bits, but may be longer than 32 if the value needs more bits instead of strictly truncated to 32-bits based on LRM.
-
-### Trailing semicolons
-
-The Verilog LRM requires a trailing semicolons for each statement. This is annoying for a calculator app. We should accept a optional trailing semicolons. Users could use a trailing semicolons to explicitly end the input phase and force the app to evaluate the input (works together with multi-line edit).
-
 ### Base rules
 
 The integer implementation should holds at least 4-fields for the features specified in LRM.
@@ -390,18 +382,6 @@ The base of an arithmetic result is inferred from its operands so the output kee
 - A binary operator (`+`, `-`, `*`, `/`, `%`, `**`) takes the **leftmost** operand's base. So `4'b0111 + 4'b1001` is `4'b0000`, `8'h0a + 8'b1` is `8'h0b`, and `8'b00001010 + 8'h05` is `8'b00001111`.
   - The leftmost-wins rule mirrors the left-to-right evaluation order of the supported operators. There is no automatic base "promotion" between bases.
 
-### Arithmetic operators
-
-The LRM specifies any unknown bits will cause the arithmetic operator returns all `x`.However in almost all implementation (`iverilog`, etc.), the `unary +` will return the bit the same, including `x` and `z`. For other arithmetic operators, if any operand's any bit value is `x` or `z`, then the entire result value shall be all `x`.
-
-### Bitwise operators
-
-LRM 1364-2005 has an internal inconsistency about operand extension: §5.1.10 says "the shorter operand is zero-filled in the most significant bit positions", but §5.5.2 says a narrower operand is sign-extended whenever the propagated type is signed (which, by §5.5.1, happens when *all* operands are signed). For `4'shF | 8'sh0` the two rules disagree — §5.1.10 would give `8'sh0F`, §5.5.2 gives `8'shFF`. vcal follows §5.5.2 (sign-extend when both signed, zero-extend otherwise), matching iverilog, VCS, Xcelium, and the IEEE 1800 (SystemVerilog) clarification that drops the §5.1.10 sentence entirely. This is the same extension rule already used by relational/equality/arithmetic in vcal, so all operators stay consistent.
-
-### Conditional operator
-
-vcal deliberately diverges from LRM Table 5-21 on the ambiguous-cond merge. The strict table reduces *every* combination other than `(0,0)` and `(1,1)` to `x` — including `(x,x)` and `(z,z)`. iverilog (and most other simulators) instead use the value-preserving rule above, on the principle that if both branches put the same `x` (or `z`) at the same position regardless of cond, the result is necessarily that bit and reducing it to `x` would discard information. So `1'bx ? 4'b01xz : 4'b01xz` is `4'b01xz` here (and in iverilog), not the `4'b01xx` the LRM table prescribes. vcal follows iverilog as the practical reference, the same call already made for `>>>` fill behavior in the shift section.
-
 ### Exit behavior
 
 - The system task `$finish` and `$stop` both ends the REPL.
@@ -419,3 +399,25 @@ Out[0]: 3
 In[1]: a + 2
 Out[1]: 5
 ```
+
+## Non-standard Behavior
+
+### Trailing semicolons
+
+The Verilog LRM requires a trailing semicolons for each statement. This is annoying for a calculator app. We should accept a optional trailing semicolons. Users could use a trailing semicolons to explicitly end the input phase and force the app to evaluate the input (works together with multi-line edit).
+
+### Integer Constants
+
+Unsized number (simple decimal number or a number without size) shall be at least 32 bits. We should use number of bits longer than 32 if the value needs more bits instead of strictly truncated to 32-bits based on LRM.
+
+### Arithmetic operators
+
+The LRM specifies any unknown bits will cause the arithmetic operator returns all `x`. However in almost all implementation (`iverilog`, etc.), the `unary +` will return the bit the same, including `x` and `z`. For other arithmetic operators, if any operand's any bit value is `x` or `z`, then the entire result value shall be all `x`.
+
+### Bitwise operators
+
+LRM 1364-2005 has an internal inconsistency about operand extension: §5.1.10 says "the shorter operand is zero-filled in the most significant bit positions", but §5.5.2 says a narrower operand is sign-extended whenever the propagated type is signed (which, by §5.5.1, happens when *all* operands are signed). For `4'shF | 8'sh0` the two rules disagree — §5.1.10 would give `8'sh0F`, §5.5.2 gives `8'shFF`. vcal follows §5.5.2 (sign-extend when both signed, zero-extend otherwise), matching iverilog, VCS, Xcelium, and the IEEE 1800 (SystemVerilog) clarification that drops the §5.1.10 sentence entirely. This is the same extension rule already used by relational/equality/arithmetic in vcal, so all operators stay consistent.
+
+### Conditional operator
+
+vcal deliberately diverges from LRM Table 5-21 on the ambiguous-cond merge. The strict table reduces *every* combination other than `(0,0)` and `(1,1)` to `x` — including `(x,x)` and `(z,z)`. iverilog (and most other simulators) instead use the value-preserving rule above, on the principle that if both branches put the same `x` (or `z`) at the same position regardless of cond, the result is necessarily that bit and reducing it to `x` would discard information. So `1'bx ? 4'b01xz : 4'b01xz` is `4'b01xz` here (and in iverilog), not the `4'b01xx` the LRM table prescribes. vcal follows iverilog as the practical reference.
