@@ -2,7 +2,7 @@
 
 ## Current State
 
-- Phases 1–7 complete. No active phase; next-phase scope is TBD — confirm with user before starting new work.
+- Phases 1–8 complete. No active phase; next-phase scope is TBD — confirm with user before starting new work.
 - Phase 1 — REPL shell, integer literals (all LRM forms), `$finish`/`$stop`. Done.
 - Phase 2 — arithmetic ops (`+ - * / % **`, unary), two-pass width handling, leftmost-base propagation, rustyline history. Done.
 - Phase 3 — relational ops (`<`, `>`, `<=`, `>=`) with LRM 5.5.2 propagated-context unification (zero-extend at the leaf primary when context is unsigned, sign-extend when signed), 1-bit unsigned result, x/z propagation. Done.
@@ -11,6 +11,7 @@
 - Phase 6a — per-bit bitwise ops (`~`, `&`, `|`, `^`, `~^`/`^~`). New parser band `&` > `^/~^/^~` > `|` between `==` and `&&`; LRM §5.1.10 truth tables zipped per position with no all-x short-circuit; context-determined width like arithmetic; bare `&`/`|` now lex as bitwise (the Phase 5 reject is replaced); `~^` and `^~` collapse to one token. Done.
 - Phase 6b — reduction unaries (`unary & ~& | ~| ^ ~^/^~`). New `~&`/`~|` tokens; binary `&`/`|`/`^`/`~^`/`^~` tokens are reused at unary position via parse-position disambiguation (no token rewrite). Single `reduce_bits` helper folds operand bits via the binary 4-state truth tables from 6a; identity element is `1` for AND-fold and `0` for OR/XOR; negated forms invert the fold. Self-determined 1-bit unsigned result that widens through outer arithmetic context like `!`/`&&`/`||`/relational/equality. `~&`/`~|` are unary-only (no binary parse level consumes them, so `a ~& b` correctly errors). Done.
 - Phase 7 — shift operators `<< >> <<< >>>`. New parse band `parse_shift` between additive and relational (LRM Table 5-4); greedy lex of `<<<`/`<<` and `>>>`/`>>` doesn't disturb `<=`/`>=`/`<`/`>`. LHS context-determined like arithmetic; RHS self-determined and read as unsigned bits — never widens the LHS or flips result signedness (LRM §5.1.12). Shift count clamped to the result width so `BigUint`-sized counts saturate to all-fill. RHS x/z poisons the whole result to all-x. `<<`/`<<<`/`>>` always zero-fill; `>>>` fills with the LHS sign bit only when the **propagated** context is signed (so an unsigned outer context turns `>>>` into a logical right shift, matching iverilog). Done.
+- Phase 8 — conditional operator `?:` (the only ternary, LRM §5.1.13). New `Expr::Conditional` AST variant and `parse_conditional` slot between `parse_expression` and `parse_logical_or`; right-associative via recursive descent on the else branch. Cond is self-determined and reduced to a 1-bit logical (reuses `logical_value`). then/else are context-determined, unify width = `max(L(then), L(else), L(context))` and signedness per §5.5.1, with the same propagated-context override as the shift path so a mixed unsigned outer context zero-fills both branches. When cond is x/z, both branches evaluate and merge per bit (agreeing bits stay, disagreeing → x). Result base inherits from the then branch. Side effect: `is_expression_delimiter` now lists `:`, and the based-literal post-apostrophe loop terminates on whitespace once `saw_digit` is true so `1'b0 ? 4'd5 : 4'd9` no longer swallows the `?` and `4'd5` as digits (`?` stays a valid z alias inside contiguous literal text). Done.
 
 ## Current Scope
 
@@ -24,10 +25,11 @@
 - Bitwise (per-bit) operators (`~`, `&`, `|`, `^`, `~^`/`^~`)
 - Reduction unaries (`unary & ~& | ~| ^ ~^/^~`)
 - Shift operators (`<<`, `>>`, `<<<`, `>>>`) — LHS context-determined, RHS self-determined and treated as unsigned (LRM §5.1.12)
+- Conditional operator (`?:`) — right-associative ternary; cond self-determined and reduced to 1-bit logical, then/else context-determined; ambiguous-cond merge is per-bit
 
 ## Active Phase
 
-No active phase. Confirm next-phase scope with the user before starting new work — the conditional operator (`?:`), concatenation/replication (`{} {{}}`), and variables/declarations are all in the long-term backlog.
+No active phase. Confirm next-phase scope with the user before starting new work — concatenation/replication (`{} {{}}`) and variables/declarations are the remaining long-term backlog items.
 
 ## Backlog
 
