@@ -244,6 +244,20 @@ impl IntegerValue {
         }
     }
 
+    // Constructor for any value produced by an operator. Forces
+    // `unsized_literal: false` so the leaf-extension carve-out (Table 5-22
+    // footnote a) only fires for parser-produced unsized literals; computed
+    // values must extend per §5.5.4 even if their MSB happens to be x/z.
+    fn computed(width: usize, signed: bool, base: Base, bits: Vec<LogicBit>) -> Self {
+        Self {
+            width,
+            signed,
+            base,
+            bits,
+            unsized_literal: false,
+        }
+    }
+
     fn from_bigint(value: BigInt, width: usize, signed: bool, base: Base) -> Self {
         Self {
             width,
@@ -1314,13 +1328,12 @@ fn evaluate_unary_expr(
         // Per-bit flip: x and z both fold to x; no all-x short-circuit since
         // bitwise ops mix known and unknown bits per position.
         let bits: Vec<LogicBit> = operand.bits.iter().copied().map(bitwise_not_bit).collect();
-        return Ok(IntegerValue {
-            width: effective_meta.width,
-            signed: effective_meta.signed,
-            base: meta.base,
+        return Ok(IntegerValue::computed(
+            effective_meta.width,
+            effective_meta.signed,
+            meta.base,
             bits,
-            unsized_literal: false,
-        });
+        ));
     }
 
     if operand.has_unknown_bits() {
@@ -1511,13 +1524,12 @@ fn evaluate_binary_expr(
                 .map(|(l, r)| combine(*l, *r))
                 .collect();
 
-            Ok(IntegerValue {
-                width: effective_meta.width,
-                signed: meta.signed,
-                base: meta.base,
+            Ok(IntegerValue::computed(
+                effective_meta.width,
+                meta.signed,
+                meta.base,
                 bits,
-                unsized_literal: false,
-            })
+            ))
         }
         BinaryOp::LessThan
         | BinaryOp::GreaterThan
@@ -1612,13 +1624,12 @@ fn evaluate_shift_expr(
         _ => unreachable!("evaluate_shift_expr called with non-shift op"),
     };
 
-    Ok(IntegerValue {
-        width: effective_meta.width,
-        signed: effective_meta.signed,
-        base: meta.base,
-        bits: result_bits,
-        unsized_literal: false,
-    })
+    Ok(IntegerValue::computed(
+        effective_meta.width,
+        effective_meta.signed,
+        meta.base,
+        result_bits,
+    ))
 }
 
 fn shift_bits_left(bits: &[LogicBit], shift: usize) -> Vec<LogicBit> {
@@ -1675,13 +1686,7 @@ fn unify_comparison_operands(
 }
 
 fn comparison_result_value(bit: LogicBit) -> IntegerValue {
-    IntegerValue {
-        width: 1,
-        signed: false,
-        base: Base::Binary,
-        bits: vec![bit],
-        unsized_literal: false,
-    }
+    IntegerValue::computed(1, false, Base::Binary, vec![bit])
 }
 
 // LRM 5.1.9: an operand reduces to its logical value before the
@@ -1876,13 +1881,12 @@ fn evaluate_conditional_expr(
             .collect(),
     };
 
-    Ok(IntegerValue {
-        width: effective_meta.width,
-        signed: effective_meta.signed,
-        base: meta.base,
+    Ok(IntegerValue::computed(
+        effective_meta.width,
+        effective_meta.signed,
+        meta.base,
         bits,
-        unsized_literal: false,
-    })
+    ))
 }
 
 fn widen_relational_result(result: IntegerValue, context: Option<ExprMeta>) -> IntegerValue {
