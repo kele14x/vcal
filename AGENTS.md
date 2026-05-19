@@ -41,7 +41,12 @@ See README's "Supported Matrix" for the final target. Phase scoping beyond conca
 ## Structure
 
 - `src/main.rs` is the CLI entrypoint.
-- `src/lib.rs` holds the REPL and evaluation logic so behavior can be unit tested without spawning the binary.
+- `src/lib.rs` is the facade: public API (`evaluate_input`, `run_repl`, `run_interactive`, `Evaluation`, plus the `value` re-exports), the driver (`parse_line`, `parse_system_task`), and module declarations.
+- `src/value.rs` — `LogicBit`, `Base`, `IntegerValue` (incl. width/sign/base/extension logic), bit ↔ bigint helpers, 4-value truth tables.
+- `src/lexer.rs` — `Token`, `tokenize`, literal text readers.
+- `src/parser.rs` — `Expr`/`UnaryOp`/`BinaryOp` AST, `Parser` + precedence-climbing levels, `parse_integer` and literal-text parsing helpers.
+- `src/eval.rs` — `ExprMeta`, `evaluate_expr` and every per-operator evaluator, width/sign propagation (`infer_expr_meta`, `combine_binary_meta`), `evaluate_expr_as_math_bigint`, `evaluate_power`, reduction folds.
+- `src/tests.rs` — unit tests, declared via `#[cfg(test)] mod tests;` in `lib.rs`.
 
 ## Guidance
 
