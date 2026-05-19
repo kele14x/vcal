@@ -140,9 +140,8 @@ fn parse_system_task(input: &str) -> Result<Option<ParsedLine>, String> {
         }
     }
 
-    if input.starts_with('$') {
-        return Err(format!("unsupported system task: {input}"));
-    }
-
+    // Anything else starting with `$` is either a system function like
+    // `$signed`/`$unsigned` (handled by the expression parser) or an unknown
+    // identifier the parser will reject with its own diagnostic.
     Ok(None)
 }

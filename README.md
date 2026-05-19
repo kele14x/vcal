@@ -125,6 +125,9 @@ This is final support target matrix, not means currently supported or implemente
       - [ ] `$finish`
       - [ ] `$stop`
   - [ ] Supported system functions
+    - [ ] Sign-cast functions
+      - [x] `$signed`
+      - [x] `$unsigned`
     - [ ] Conversion functions
       - [ ] `$rtoi`
       - [ ] `$itor`

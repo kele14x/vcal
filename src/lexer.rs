@@ -1,6 +1,10 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Token {
     IntegerLiteral(String),
+    // `$identifier` — system task or function name. Per LRM A.9.3 the name
+    // matches `$[a-zA-Z0-9_$]+`; the `$` shall not be followed by white space
+    // (LRM 19.5 / README "Identifier white spaces").
+    SystemIdentifier(String),
     LParen,
     RParen,
     Plus,
@@ -181,6 +185,9 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     &mut chars,
                 )?));
             }
+            '$' => {
+                tokens.push(Token::SystemIdentifier(read_system_identifier(&mut chars)?));
+            }
             _ => {
                 tokens.push(Token::IntegerLiteral(read_integer_literal(ch, &mut chars)?));
             }
@@ -326,6 +333,31 @@ where
     }
 }
 
+// LRM A.9.3: `$[a-zA-Z0-9_$]+`. The leading `$` is already consumed; at least
+// one identifier character must follow, and per LRM 19.5 / README "Identifier
+// white spaces" the `$` shall not be followed by whitespace, so a bare `$` or
+// `$ name` is a lex error rather than silently accepting it.
+fn read_system_identifier<I>(chars: &mut std::iter::Peekable<I>) -> Result<String, String>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let mut name = String::from("$");
+    while let Some((_, ch)) = chars.peek().copied() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            chars.next();
+            name.push(ch);
+        } else {
+            break;
+        }
+    }
+
+    if name.len() == 1 {
+        return Err("missing identifier after `$`".to_string());
+    }
+
+    Ok(name)
+}
+
 fn is_expression_delimiter(ch: char) -> bool {
     // Note: `?` is intentionally NOT a delimiter even though it tokenises
     // as the conditional operator's `?` — inside a based literal it is the
@@ -352,5 +384,6 @@ fn is_expression_delimiter(ch: char) -> bool {
             | '{'
             | '}'
             | ','
+            | '$'
     )
 }

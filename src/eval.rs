@@ -40,6 +40,7 @@ fn evaluate_expr_in_context(
         } => evaluate_conditional_expr(cond, then_expr, else_expr, context),
         Expr::Concatenation { items } => evaluate_concatenation_expr(items, context),
         Expr::Replication { count, items } => evaluate_replication_expr(count, items, context),
+        Expr::SignCast { signed, arg } => evaluate_sign_cast_expr(*signed, arg, context),
     }
 }
 
@@ -125,6 +126,18 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
                 width: inner_width.saturating_mul(count),
                 signed: false,
                 base: leftmost_base,
+            })
+        }
+        // LRM 5.5: width and base come from the argument; signedness is
+        // whatever the cast specifies. The argument is self-determined inside
+        // the cast, but the cast's meta is what context-propagation sees from
+        // outside, so it must reflect the cast's signedness.
+        Expr::SignCast { signed, arg } => {
+            let arg_meta = infer_expr_meta(arg)?;
+            Ok(ExprMeta {
+                width: arg_meta.width,
+                signed: *signed,
+                base: arg_meta.base,
             })
         }
     }
@@ -848,6 +861,9 @@ fn is_indefinite_width(expr: &Expr) -> bool {
             else_expr,
         } => is_indefinite_width(then_expr) || is_indefinite_width(else_expr),
         Expr::Concatenation { .. } | Expr::Replication { .. } => false,
+        // `$signed`/`$unsigned` lock in the argument's evaluated width, so
+        // the cast result is always sized regardless of the argument shape.
+        Expr::SignCast { .. } => false,
     }
 }
 
@@ -991,6 +1007,35 @@ fn extend_to_outer_context(value: IntegerValue, context: Option<ExprMeta>) -> In
     match context {
         Some(ctx) if ctx.width > value.width => value.resized_to_context(ctx.width, false),
         _ => value,
+    }
+}
+
+// LRM 5.5: `$signed(e)` / `$unsigned(e)` evaluates `e` as a self-determined
+// expression and returns a value with the same size and bit pattern but with
+// the type set by the cast. The cast's type only feeds back into LRM 5.5.1's
+// "all operands signed?" check (which determines the propagated type of the
+// surrounding expression); extension at the cast leaf still follows the
+// propagated context per §5.5.2 ("each operand shall be sign-/zero-extended"
+// based on the propagated type), not the cast's own signedness. So
+// `$signed(4'b1111) + 8'b0` zero-extends the cast result (unsigned propagated
+// type) rather than sign-extending it.
+fn evaluate_sign_cast_expr(
+    signed: bool,
+    arg: &Expr,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let arg_value = evaluate_expr_in_context(arg, None)?;
+    let cast_value = IntegerValue::computed(
+        arg_value.width,
+        signed,
+        arg_value.base,
+        arg_value.bits,
+    );
+    match context {
+        Some(ctx) if ctx.width > cast_value.width => {
+            Ok(cast_value.resized_to_context(ctx.width, ctx.signed))
+        }
+        _ => Ok(cast_value),
     }
 }
 
@@ -1180,6 +1225,15 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                 return Err("expression contains unknown bits".to_string());
             }
             Ok(value.as_bigint(false))
+        }
+        // Route sign casts through the standard pipeline so the result's
+        // signedness flag is set correctly before we read its bigint value.
+        Expr::SignCast { .. } => {
+            let value = evaluate_expr_in_context(expr, None)?;
+            if value.has_unknown_bits() {
+                return Err("expression contains unknown bits".to_string());
+            }
+            Ok(value.as_bigint(value.signed))
         }
     }
 }

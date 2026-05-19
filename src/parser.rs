@@ -41,6 +41,14 @@ pub(crate) enum Expr {
         count: Box<Expr>,
         items: Vec<Expr>,
     },
+    // LRM 5.5: `$signed(expr)` / `$unsigned(expr)`. The argument is evaluated
+    // as a self-determined expression; the result has the same width and bits
+    // but with signedness set to `signed`. Outer-context width still flows
+    // back through it (handled in eval).
+    SignCast {
+        signed: bool,
+        arg: Box<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -396,6 +404,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.next() {
             Some(Token::IntegerLiteral(text)) => parse_integer(&text).map(Expr::Literal),
+            Some(Token::SystemIdentifier(name)) => self.parse_system_function_call(&name),
             Some(Token::LParen) => {
                 let expr = self.parse_expression()?;
                 match self.next() {
@@ -421,6 +430,35 @@ impl Parser {
             }
             None => Err("unexpected end of expression".to_string()),
         }
+    }
+
+    // LRM 5.5: `$signed(expr)` / `$unsigned(expr)` — exactly one argument,
+    // parentheses required. Other system identifiers aren't legal in
+    // expression position yet, so we reject them with a clear message instead
+    // of leaving the generic "expected expression operand" path to fire.
+    fn parse_system_function_call(&mut self, name: &str) -> Result<Expr, String> {
+        let signed = match name {
+            "$signed" => true,
+            "$unsigned" => false,
+            _ => return Err(format!("unsupported system function: {name}")),
+        };
+
+        match self.next() {
+            Some(Token::LParen) => {}
+            _ => return Err(format!("expected `(` after {name}")),
+        }
+
+        let arg = self.parse_expression()?;
+
+        match self.next() {
+            Some(Token::RParen) => {}
+            _ => return Err(format!("expected `)` after {name} argument")),
+        }
+
+        Ok(Expr::SignCast {
+            signed,
+            arg: Box::new(arg),
+        })
     }
 
     // LRM 5.1.14: `{ expr {, expr} }` (concatenation) or

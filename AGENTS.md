@@ -7,6 +7,7 @@ What works:
 - REPL shell
 - Integer literals (all LRM forms)
 - `$finish`/`$stop`
+- `$signed()` / `$unsigned()` sign-cast system functions (LRM 5.5)
 - All operators between integers
 - Two-pass context (width, signedness) propagation
 - Leftmost-base propagation
@@ -27,6 +28,7 @@ What works:
   - Shift operators `<< >> <<< >>>`
   - Conditional operator `?:` (the only ternary)
   - Concatenation `{a, b, ...}` and replication `{N{...}}`
+- System functions: `$signed(expr)`, `$unsigned(expr)` (LRM 5.5 sign casts)
 
 ## Backlog
 
