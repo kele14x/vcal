@@ -2927,24 +2927,26 @@ fn rejects_underscore_leading_exponent() {
     );
 }
 
-// README "Real numbers": an integer with x/z bits has no real equivalent,
-// so promotion to real (mixed-type arithmetic, comparison, etc.) yields
-// NaN. NaN then propagates through f64 ops.
+// LRM §3.5.3: "Individual bits that are x or z in the net or the
+// variable shall be treated as zero upon conversion." So promoting an
+// integer with x/z bits to real for mixed-type arithmetic substitutes 0
+// for each unknown bit and keeps the rest.
 #[test]
-fn xz_integer_promotes_to_nan_in_real_context() {
+fn xz_integer_promotes_to_zero_bits_in_real_context() {
     assert_eq!(
         evaluate_input("1'bx + 1.0").expect("x + real").output,
-        "NaN"
+        "1.0"
     );
     assert_eq!(
         evaluate_input("1'bz * 2.0").expect("z * real").output,
-        "NaN"
+        "0.0"
     );
+    // 4'b01x0 with x→0 is 4'b0100 = 4, so 4 + 1.0 = 5.0.
     assert_eq!(
         evaluate_input("4'b01x0 + 1.0")
             .expect("partial-x + real")
             .output,
-        "NaN"
+        "5.0"
     );
 }
 

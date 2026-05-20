@@ -88,14 +88,10 @@ fn expression_is_real(expr: &Expr) -> bool {
 // LRM §5.1.7: when one operand of a relational / equality is real, "the
 // other operand shall be converted to an equivalent real value". Same
 // principle applies to arithmetic with mixed real-int operands and to
-// conditional branches where one side is real. x/z bits in an integer
-// have no real equivalent — vcal returns NaN, which then propagates
-// through f64 ops and ends up as 0 in comparisons (IEEE 754 unordered
-// semantics). The README "Non-standard behavior" section documents this.
+// conditional branches where one side is real. LRM §3.5.3 specifies that
+// x/z bits "shall be treated as zero upon conversion" — `bits_to_biguint`
+// already does this, so the conversion runs unconditionally.
 fn integer_value_to_f64(value: &IntegerValue) -> f64 {
-    if value.has_unknown_bits() {
-        return f64::NAN;
-    }
     value
         .as_bigint(value.signed)
         .to_f64()

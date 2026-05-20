@@ -430,7 +430,6 @@ vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same f
   - `0.0 ** -1.0` → `inf`
   - `(-2.0) ** 0.5` → `NaN`
   These come from IEEE 754 directly. iverilog and VCS may differ on the exact value, so don't rely on a specific corner result.
-- An integer with x/z bits has no real equivalent, so when promoted to real (e.g. `'bx + 1.0`) it becomes `NaN`. NaN propagates through arithmetic, makes ordered comparisons false, and reduces to logical `x` for `!`/`&&`/`||`.
 - `1'bx ? real_a : real_b` cannot reproduce the integer per-bit-merge rule (real has no per-bit identity). vcal returns the common branch value when both branches agree bit-for-bit on `f64::to_bits`, and `NaN` otherwise.
 - Real values render in fixed-point for magnitudes in `[1e-4, 1e10)` and scientific notation outside that window — purely a display choice, not specified by the LRM.
 
