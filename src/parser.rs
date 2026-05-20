@@ -54,7 +54,7 @@ pub(crate) enum Expr {
         signed: bool,
         arg: Box<Expr>,
     },
-    // LRM 17.7.1: real-conversion system functions. Each maps between the
+    // LRM 17.8: real-conversion system functions. Each maps between the
     // integer and real domains with a specific semantic — see
     // RealConversionKind for the four variants.
     RealConversion {
@@ -458,7 +458,7 @@ impl Parser {
         }
     }
 
-    // LRM 5.5 / 17.7.1: every supported system function in expression
+    // LRM 5.5 / 17.8: every supported system function in expression
     // position takes exactly one parenthesised argument. Anything else
     // starting with `$` is rejected with a clear message so the generic
     // "expected expression operand" path doesn't fire for typos.

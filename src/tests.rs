@@ -3134,7 +3134,7 @@ fn accepts_underscore_separators_inside_digit_run() {
     );
 }
 
-// LRM 17.7.1: $rtoi truncates toward zero (NOT round). The example values
+// LRM 17.8: $rtoi truncates toward zero (NOT round). The example values
 // 123.45 → 123 and -22.7 → -22 come straight from the LRM clause. Result is
 // 32-bit signed (Verilog's `integer` type), displayed in decimal.
 #[test]
@@ -3206,7 +3206,7 @@ fn rtoi_accepts_integer_operand() {
     );
 }
 
-// LRM 17.7.1: $itor converts integer to real. §3.5.3 specifies the x/z → 0
+// LRM 17.8: $itor converts integer to real. §3.5.3 specifies the x/z → 0
 // rule for the underlying integer-to-real conversion, so $itor surfaces
 // known bits and ignores unknowns.
 #[test]
@@ -3294,7 +3294,7 @@ fn itor_nan_and_infinity_collapse_to_zero() {
     );
 }
 
-// LRM 17.7.1: $realtobits exposes the IEEE 754 binary64 bit pattern as a
+// LRM 17.8: $realtobits exposes the IEEE 754 binary64 bit pattern as a
 // 64-bit unsigned vector. The reference values come from the standard
 // encodings — 1.0 = 0x3FF0...0, +0.0 = all zeros, -1.0 = 0xBFF0...0.
 #[test]
@@ -3330,7 +3330,7 @@ fn realtobits_accepts_integer_operand() {
     );
 }
 
-// LRM 17.7.1: $bitstoreal is the inverse of $realtobits — same 64-bit
+// LRM 17.8: $bitstoreal is the inverse of $realtobits — same 64-bit
 // pattern, decoded as IEEE 754 binary64.
 #[test]
 fn bitstoreal_decodes_ieee754_pattern() {
@@ -3382,7 +3382,7 @@ fn bitstoreal_rejects_real_argument() {
     );
 }
 
-// LRM 17.7.1: $bitstoreal expects a 64-bit pattern. Anything narrower
+// LRM 17.8: $bitstoreal expects a 64-bit pattern. Anything narrower
 // would silently zero-extend and anything wider would silently truncate;
 // both are likely user mistakes, so we reject them up front. The width
 // check uses the argument's self-determined width, so a 32-bit unsized

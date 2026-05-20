@@ -82,7 +82,7 @@ fn expression_is_real(expr: &Expr) -> bool {
             ..
         } => expression_is_real(then_expr) || expression_is_real(else_expr),
         Expr::Concatenation { .. } | Expr::Replication { .. } | Expr::SignCast { .. } => false,
-        // LRM 17.7.1: $itor and $bitstoreal yield real values; $rtoi and
+        // LRM 17.8: $itor and $bitstoreal yield real values; $rtoi and
         // $realtobits yield integers (32-bit signed and 64-bit unsigned
         // respectively), so only the first two participate in real-result
         // type propagation.
@@ -220,7 +220,7 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
         }
         Expr::RealConversion { kind, arg } => match kind {
             RealConversionKind::IntegerToReal => {
-                // LRM 17.7.1 + §3.5.3: argument is logically integer, so a
+                // LRM 17.8 + §3.5.3: argument is logically integer, so a
                 // real operand goes through implicit real→integer→real. The
                 // implicit real→integer step rounds to the nearest integer
                 // with ties away from zero (§3.5.3), so e.g. $itor(-2.6) is
@@ -240,7 +240,7 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
                 }
             }
             RealConversionKind::BitsToReal => {
-                // LRM 17.7.1: reverse of $realtobits. Argument is the 64-bit
+                // LRM 17.8: reverse of $realtobits. Argument is the 64-bit
                 // IEEE 754 bit pattern, so we require an exactly 64-bit
                 // self-determined width — narrower operands (e.g. 32-bit
                 // unsized literals) and wider ones both get rejected to
@@ -453,7 +453,7 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
                 base: arg_meta.base,
             })
         }
-        // LRM 17.7.1: $rtoi yields a 32-bit signed integer; $realtobits
+        // LRM 17.8: $rtoi yields a 32-bit signed integer; $realtobits
         // yields a 64-bit unsigned vector. The real-result variants
         // ($itor/$bitstoreal) shouldn't reach the integer pipeline at all,
         // so querying their integer meta is a structural surprise.
@@ -1565,7 +1565,7 @@ fn evaluate_sign_cast_expr(
     }
 }
 
-// LRM 17.7.1: dispatch the integer-result real conversions ($rtoi and
+// LRM 17.8: dispatch the integer-result real conversions ($rtoi and
 // $realtobits). The real-result variants ($itor, $bitstoreal) are handled
 // by `evaluate_expr_as_real`. Outer-context widening mirrors $signed /
 // $unsigned: the cast's natural width drives the result, but a wider
@@ -1577,7 +1577,7 @@ fn evaluate_real_conversion_expr(
 ) -> Result<IntegerValue, String> {
     let result = match kind {
         RealConversionKind::RealToInteger => {
-            // LRM 17.7.1: "$rtoi converts real values to integers by
+            // LRM 17.8: "$rtoi converts real values to integers by
             // truncating the real value." Argument is real (or auto-promotes
             // from integer per §3.5.3). NaN / ±∞ have no integer image, so
             // we return 32 bits of x to surface "no defined integer";
@@ -1587,7 +1587,7 @@ fn evaluate_real_conversion_expr(
             real_to_integer_value(real_val)
         }
         RealConversionKind::RealToBits => {
-            // LRM 17.7.1: bitcast a real to its 64-bit IEEE 754
+            // LRM 17.8: bitcast a real to its 64-bit IEEE 754
             // representation. Display the result in hex since the value is a
             // bit pattern, not a magnitude.
             let real_val = evaluate_expr_as_real(arg)?;
@@ -1617,7 +1617,7 @@ fn real_to_integer_value(value: f64) -> IntegerValue {
     IntegerValue::from_bigint(bigint, 32, true, Base::Decimal)
 }
 
-// LRM 17.7.1: $bitstoreal reinterprets a 64-bit operand as an IEEE 754
+// LRM 17.8: $bitstoreal reinterprets a 64-bit operand as an IEEE 754
 // double. Width is enforced to be exactly 64 by the caller, so the loop
 // just packs the 64 LogicBits into a u64. x/z bits map to 0, mirroring
 // §3.5.3's integer-to-real conversion rule — `$bitstoreal` is a sibling
