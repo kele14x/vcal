@@ -1623,6 +1623,11 @@ fn real_to_integer_value(value: f64) -> IntegerValue {
 // §3.5.3's integer-to-real conversion rule — `$bitstoreal` is a sibling
 // conversion in the same clause and the LRM doesn't carve out a different
 // rule for it.
+//
+// Must stay a pure u64-pack-then-`f64::from_bits` transmute: any NaN
+// canonicalization here would break the
+// `$realtobits($bitstoreal(x)) == x` round-trip on non-finite payloads
+// (matching iverilog), which the test suite pins down.
 fn bits_value_to_real(value: &IntegerValue) -> f64 {
     let mut bits = 0u64;
     for (index, bit) in value.bits.iter().enumerate() {

@@ -3372,6 +3372,84 @@ fn realtobits_bitstoreal_round_trip() {
     );
 }
 
+// Non-finite IEEE 754 patterns decode to the f64 special values. The
+// textual rendering collapses every NaN to "NaN" and every infinity to
+// "inf"/"-inf" (per format_real in value.rs), so multiple distinct NaN
+// payloads share the same display — payload preservation is checked by
+// the round-trip test below.
+#[test]
+fn bitstoreal_decodes_non_finite_patterns() {
+    assert_eq!(
+        evaluate_input("$bitstoreal(64'hFFFFFFFFFFFFFFFF)")
+            .expect("all-1s NaN")
+            .output,
+        "NaN"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal(64'h7FF8000000000000)")
+            .expect("quiet NaN")
+            .output,
+        "NaN"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal(64'h7FF0000000000001)")
+            .expect("signaling NaN")
+            .output,
+        "NaN"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal(64'h7FF0000000000000)")
+            .expect("+inf")
+            .output,
+        "inf"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal(64'hFFF0000000000000)")
+            .expect("-inf")
+            .output,
+        "-inf"
+    );
+}
+
+// Round-trip preserves the full 64-bit payload even for NaN, matching
+// iverilog. The f64 carrying the value flows through evaluate_expr_as_real
+// as a pass-through (no arithmetic, no FPU register touch), so the
+// from_bits/to_bits pair stays a transparent transmute. Locks in the
+// contract that bits_value_to_real may not canonicalize NaN.
+#[test]
+fn realtobits_bitstoreal_round_trip_preserves_nan_payload() {
+    assert_eq!(
+        evaluate_input("$realtobits($bitstoreal(64'hFFFFFFFFFFFFFFFF))")
+            .expect("all-1s NaN round-trip")
+            .output,
+        "64'hffffffffffffffff"
+    );
+    assert_eq!(
+        evaluate_input("$realtobits($bitstoreal(64'h7FF8000000000000))")
+            .expect("quiet NaN round-trip")
+            .output,
+        "64'h7ff8000000000000"
+    );
+    assert_eq!(
+        evaluate_input("$realtobits($bitstoreal(64'h7FF0000000000001))")
+            .expect("signaling NaN round-trip")
+            .output,
+        "64'h7ff0000000000001"
+    );
+    assert_eq!(
+        evaluate_input("$realtobits($bitstoreal(64'h7FF0000000000000))")
+            .expect("+inf round-trip")
+            .output,
+        "64'h7ff0000000000000"
+    );
+    assert_eq!(
+        evaluate_input("$realtobits($bitstoreal(64'hFFF0000000000000))")
+            .expect("-inf round-trip")
+            .output,
+        "64'hfff0000000000000"
+    );
+}
+
 // $bitstoreal on a real argument has no defined bit-cast meaning (the
 // argument is already a real, not a 64-bit pattern). Reject explicitly.
 #[test]
