@@ -1,6 +1,14 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Token {
     IntegerLiteral(String),
+    // LRM §3.5.2 / A.8.7. Two forms are accepted, both required to have at
+    // least one digit on each side of the decimal point:
+    //   unsigned_number . unsigned_number
+    //   unsigned_number [. unsigned_number] [eE] [+|-] unsigned_number
+    // Underscores are legal inside any digit run and are stripped at parse
+    // time. The string here is the raw lexeme (still containing `_` and the
+    // original `e`/`E` casing); f64 conversion happens in the parser.
+    RealLiteral(String),
     // `$identifier` — system task or function name. Per LRM A.9.3 the name
     // matches `$[a-zA-Z0-9_$]+`; the `$` shall not be followed by white space
     // (LRM 19.5 / README "Identifier white spaces").
@@ -189,7 +197,7 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::SystemIdentifier(read_system_identifier(&mut chars)?));
             }
             _ => {
-                tokens.push(Token::IntegerLiteral(read_integer_literal(ch, &mut chars)?));
+                tokens.push(read_integer_or_real_literal(ch, &mut chars)?);
             }
         }
     }
@@ -197,15 +205,147 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     Ok(tokens)
 }
 
-fn read_integer_literal<I>(
+// Decides between Token::IntegerLiteral, Token::RealLiteral, and the based
+// integer form (which always lexes as IntegerLiteral). LRM §3.5.2 reals
+// require a digit on each side of the decimal point, so we only treat `.`
+// as part of the literal when both the preceding char is a digit and the
+// next char is a digit. An exponent (`e` or `E`) followed by an optional
+// sign and at least one digit is also accepted as the second real form.
+// If neither real-form continuation is found, fall back to the existing
+// integer / based-integer path.
+fn read_integer_or_real_literal<I>(
     first_ch: char,
+    chars: &mut std::iter::Peekable<I>,
+) -> Result<Token, String>
+where
+    I: Iterator<Item = (usize, char)> + Clone,
+{
+    // Non-digit starts cannot begin a real (LRM §3.5.2 requires digits on
+    // both sides of the decimal point and at the start of the exponent
+    // form). Defer to the permissive integer reader so the existing error
+    // path — token reaches parse_integer and fails there — is preserved.
+    if !first_ch.is_ascii_digit() {
+        return Ok(Token::IntegerLiteral(read_integer_literal_from_digits(
+            String::from(first_ch),
+            chars,
+        )?));
+    }
+
+    let mut digits = String::new();
+    digits.push(first_ch);
+    while let Some((_, next_ch)) = chars.peek().copied() {
+        if next_ch.is_ascii_digit() || next_ch == '_' {
+            chars.next();
+            digits.push(next_ch);
+        } else {
+            break;
+        }
+    }
+
+    // Real candidate: '.' immediately followed by a digit. We must NOT
+    // consume the '.' if the next char is not a digit (e.g. `5.` is an
+    // illegal real per §3.5.2; treating it as `5` followed by `.` lets the
+    // outer tokenizer surface the `.` as an unexpected character).
+    let real_after_dot = {
+        let mut lookahead = chars.clone();
+        matches!(lookahead.next(), Some((_, '.')))
+            && matches!(lookahead.peek(), Some((_, ch)) if ch.is_ascii_digit())
+    };
+
+    // Real candidate: a digit run followed by `e` / `E` is always a real
+    // attempt — there is no other token shape that starts that way (the
+    // based-integer path is gated on `'`, not `e`). We only check for the
+    // letter here; `consume_exponent` enforces the LRM A.8.7 digit-leading
+    // requirement on whatever follows, which lets us surface a precise
+    // "missing exponent digits in real literal" error for malformed forms
+    // like `1e_3` or `1e` instead of falling through to the integer path
+    // and producing a misleading "invalid decimal digits" message.
+    let real_after_exp = {
+        let mut lookahead = chars.clone();
+        matches!(lookahead.next(), Some((_, 'e' | 'E')))
+    };
+
+    if real_after_dot {
+        chars.next();
+        digits.push('.');
+        while let Some((_, next_ch)) = chars.peek().copied() {
+            if next_ch.is_ascii_digit() || next_ch == '_' {
+                chars.next();
+                digits.push(next_ch);
+            } else {
+                break;
+            }
+        }
+        // Optional exponent after the fractional part.
+        if let Some((_, exp_ch)) = chars.peek().copied()
+            && (exp_ch == 'e' || exp_ch == 'E')
+        {
+            consume_exponent(&mut digits, chars)?;
+        }
+        return Ok(Token::RealLiteral(digits));
+    }
+
+    if real_after_exp {
+        consume_exponent(&mut digits, chars)?;
+        return Ok(Token::RealLiteral(digits));
+    }
+
+    // No real continuation: fall through to the existing integer / based
+    // integer reader. We've already buffered the leading digit run, so
+    // delegate the post-digit logic (whitespace, apostrophe pickup) to the
+    // helper.
+    Ok(Token::IntegerLiteral(read_integer_literal_from_digits(
+        digits, chars,
+    )?))
+}
+
+fn consume_exponent<I>(
+    digits: &mut String,
+    chars: &mut std::iter::Peekable<I>,
+) -> Result<(), String>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let (_, exp_ch) = chars
+        .next()
+        .ok_or_else(|| "missing exponent in real literal".to_string())?;
+    digits.push(exp_ch);
+    if matches!(chars.peek(), Some((_, '+' | '-'))) {
+        let (_, sign_ch) = chars.next().expect("guarded by peek");
+        digits.push(sign_ch);
+    }
+
+    // LRM A.8.7: `unsigned_number ::= decimal_digit { _ | decimal_digit }`.
+    // The exponent's digit run must *start* with a decimal digit — a
+    // leading underscore (e.g. `5.0e_3`, `1e+_3`) is not a legal
+    // unsigned_number. Enforce digit-leading here; the trailing run can
+    // then freely mix digits and underscores.
+    match chars.peek().copied() {
+        Some((_, ch)) if ch.is_ascii_digit() => {
+            chars.next();
+            digits.push(ch);
+        }
+        _ => return Err("missing exponent digits in real literal".to_string()),
+    }
+    while let Some((_, next_ch)) = chars.peek().copied() {
+        if next_ch.is_ascii_digit() || next_ch == '_' {
+            chars.next();
+            digits.push(next_ch);
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn read_integer_literal_from_digits<I>(
+    initial: String,
     chars: &mut std::iter::Peekable<I>,
 ) -> Result<String, String>
 where
     I: Iterator<Item = (usize, char)> + Clone,
 {
-    let mut literal = String::new();
-    literal.push(first_ch);
+    let mut literal = initial;
 
     while let Some((_, next_ch)) = chars.peek().copied() {
         if next_ch.is_whitespace() || is_expression_delimiter(next_ch) || next_ch == '\'' {

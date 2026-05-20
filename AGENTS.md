@@ -6,6 +6,7 @@ What works:
 
 - REPL shell
 - Integer literals (all LRM forms)
+- Real literals and real arithmetic (LRM 3.5.2 / 5.1.5 / Tables 5-2, 5-3); mixed-type promotion (LRM 5.1.7)
 - `$finish`/`$stop`
 - `$signed()` / `$unsigned()` sign-cast system functions (LRM 5.5)
 - All operators between integers
@@ -16,9 +17,9 @@ What works:
 ## Active Scope
 
 - Single-line REPL input only
-- Integer literals and parentheses
-- No variables, declarations, strings, real numbers
-- All operators between integers
+- Integer and real literals, parentheses
+- No variables, declarations, strings
+- All operators between integers; arithmetic / relational / equality / logical / `?:` between reals (Table 5-2)
   - Arithmetic ops (`+ - * / % **`, unary +, unary -)
   - Relational ops (`<`, `>`, `<=`, `>=`)
   - Equality ops (`==`, `!=`, `===`, `!==`)
@@ -32,7 +33,7 @@ What works:
 
 ## Backlog
 
-See README's "Supported Matrix" for the final target. Phase scoping beyond concatenation (variables, multi-line input, real numbers, system functions, …) is TBD — confirm with the user before starting work outside the active scope.
+See README's "Supported Matrix" for the final target. Phase scoping beyond real numbers (variables, multi-line input, conversion / math system functions, …) is TBD — confirm with the user before starting work outside the active scope.
 
 ## Commands
 

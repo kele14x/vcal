@@ -102,7 +102,7 @@ This is final support target matrix, not means currently supported or implemente
   - [ ] Operator
   - [ ] Number
     - [ ] Integer constants
-    - [ ] Real constants
+    - [x] Real constants
     - [ ] Conversion
   - [ ] String
   - [ ] Identifier
@@ -420,6 +420,19 @@ The LRM specifies any unknown bits will cause the arithmetic operator returns al
 ### Bitwise operators
 
 LRM 1364-2005 has an internal inconsistency about operand extension: §5.1.10 says "the shorter operand is zero-filled in the most significant bit positions", but §5.5.2 says a narrower operand is sign-extended whenever the propagated type is signed (which, by §5.5.1, happens when *all* operands are signed). For `4'shF | 8'sh0` the two rules disagree — §5.1.10 would give `8'sh0F`, §5.5.2 gives `8'shFF`. vcal follows §5.5.2 (sign-extend when both signed, zero-extend otherwise), matching iverilog, VCS, Xcelium, and the IEEE 1800 (SystemVerilog) clarification that drops the §5.1.10 sentence entirely. This is the same extension rule already used by relational/equality/arithmetic in vcal, so all operators stay consistent.
+
+### Real numbers
+
+vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same format LRM §3.5.2 references. A few corners the LRM leaves to the implementation are pinned down here:
+
+- §5.1.5 says `0.0 ** ≤0` and `negative ** non-integral` are *unspecified* for real `**`. vcal returns whatever Rust's `f64::powf` produces:
+  - `0.0 ** 0.0` → `1.0`
+  - `0.0 ** -1.0` → `inf`
+  - `(-2.0) ** 0.5` → `NaN`
+  These come from IEEE 754 directly. iverilog and VCS may differ on the exact value, so don't rely on a specific corner result.
+- An integer with x/z bits has no real equivalent, so when promoted to real (e.g. `'bx + 1.0`) it becomes `NaN`. NaN propagates through arithmetic, makes ordered comparisons false, and reduces to logical `x` for `!`/`&&`/`||`.
+- `1'bx ? real_a : real_b` cannot reproduce the integer per-bit-merge rule (real has no per-bit identity). vcal returns the common branch value when both branches agree bit-for-bit on `f64::to_bits`, and `NaN` otherwise.
+- Real values render in fixed-point for magnitudes in `[1e-4, 1e10)` and scientific notation outside that window — purely a display choice, not specified by the LRM.
 
 ### Conditional operator
 

@@ -1,9 +1,9 @@
 use num_bigint::{BigInt, BigUint, Sign};
-use num_traits::{One, ToPrimitive, Zero};
+use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 
 use crate::parser::{BinaryOp, Expr, UnaryOp};
 use crate::value::{
-    Base, IntegerValue, LogicBit, bits_to_biguint, bitwise_and_bits, bitwise_not_bit,
+    Base, IntegerValue, LogicBit, Value, bits_to_biguint, bitwise_and_bits, bitwise_not_bit,
     bitwise_or_bits, bitwise_xnor_bits, bitwise_xor_bits,
 };
 
@@ -17,8 +17,258 @@ struct ExprMeta {
     base: Base,
 }
 
-pub(crate) fn evaluate_expr(expr: &Expr) -> Result<IntegerValue, String> {
-    evaluate_expr_in_context(expr, None)
+pub(crate) fn evaluate_expr(expr: &Expr) -> Result<Value, String> {
+    if expression_is_real(expr) {
+        evaluate_expr_as_real(expr).map(Value::Real)
+    } else {
+        evaluate_expr_in_context(expr, None).map(Value::Integer)
+    }
+}
+
+// LRM §5.1.1 / Table 5-2 / §5.1.5: an expression's *result* type is real
+// only for arithmetic ops with at least one real operand and for
+// conditionals where at least one branch is real. Relational, equality,
+// and logical ops always produce a 1-bit integer even with real operands;
+// this helper reports that result-type, not whether any operand is real.
+// Operators that aren't legal on reals (Table 5-3 — modulus, case
+// equality, bitwise, reductions, shifts, concatenation, replication,
+// $signed / $unsigned) are reported as integer-typed; their evaluators
+// reject real operands explicitly so the diagnostic names the operator.
+fn expression_is_real(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => false,
+        Expr::RealLiteral(_) => true,
+        Expr::Grouped(inner) => expression_is_real(inner),
+        Expr::Unary { op, expr } => match op {
+            UnaryOp::Plus | UnaryOp::Minus => expression_is_real(expr),
+            UnaryOp::BitwiseNot
+            | UnaryOp::LogicalNot
+            | UnaryOp::ReductionAnd
+            | UnaryOp::ReductionNand
+            | UnaryOp::ReductionOr
+            | UnaryOp::ReductionNor
+            | UnaryOp::ReductionXor
+            | UnaryOp::ReductionXnor => false,
+        },
+        Expr::Binary { op, lhs, rhs } => match op {
+            BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Divide
+            | BinaryOp::Power => expression_is_real(lhs) || expression_is_real(rhs),
+            BinaryOp::Modulus
+            | BinaryOp::CaseEqual
+            | BinaryOp::CaseNotEqual
+            | BinaryOp::BitwiseAnd
+            | BinaryOp::BitwiseOr
+            | BinaryOp::BitwiseXor
+            | BinaryOp::BitwiseXnor
+            | BinaryOp::LogicalShiftLeft
+            | BinaryOp::LogicalShiftRight
+            | BinaryOp::ArithmeticShiftLeft
+            | BinaryOp::ArithmeticShiftRight
+            | BinaryOp::LessThan
+            | BinaryOp::GreaterThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThanOrEqual
+            | BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::LogicalAnd
+            | BinaryOp::LogicalOr => false,
+        },
+        Expr::Conditional {
+            then_expr,
+            else_expr,
+            ..
+        } => expression_is_real(then_expr) || expression_is_real(else_expr),
+        Expr::Concatenation { .. } | Expr::Replication { .. } | Expr::SignCast { .. } => false,
+    }
+}
+
+// LRM §5.1.7: when one operand of a relational / equality is real, "the
+// other operand shall be converted to an equivalent real value". Same
+// principle applies to arithmetic with mixed real-int operands and to
+// conditional branches where one side is real. x/z bits in an integer
+// have no real equivalent — vcal returns NaN, which then propagates
+// through f64 ops and ends up as 0 in comparisons (IEEE 754 unordered
+// semantics). The README "Non-standard behavior" section documents this.
+fn integer_value_to_f64(value: &IntegerValue) -> f64 {
+    if value.has_unknown_bits() {
+        return f64::NAN;
+    }
+    value
+        .as_bigint(value.signed)
+        .to_f64()
+        .unwrap_or(f64::NAN)
+}
+
+// LRM §3.5.3: real → integer conversion uses round-to-nearest with
+// ties-away-from-zero. Rust's f64::round implements that exactly. NaN
+// and ±∞ have no integer representation, so we surface them as an
+// explicit error rather than silently mapping to zero.
+#[allow(dead_code)]
+fn real_to_integer_bigint(value: f64) -> Result<BigInt, String> {
+    if value.is_nan() {
+        return Err("cannot convert NaN to integer".to_string());
+    }
+    if value.is_infinite() {
+        return Err("cannot convert infinity to integer".to_string());
+    }
+    let rounded = value.round();
+    BigInt::from_f64(rounded).ok_or_else(|| "real value out of integer range".to_string())
+}
+
+// Reduce a real to its 1-bit logical value for !, &&, ||, and ?: cond.
+// Verilog has no defined behavior for NaN, so it folds into x. Zero
+// (including -0.0) is logical 0; every other finite value is logical 1.
+fn logical_value_of_real(value: f64) -> LogicBit {
+    if value.is_nan() {
+        LogicBit::X
+    } else if value == 0.0 {
+        LogicBit::Zero
+    } else {
+        LogicBit::One
+    }
+}
+
+// Walks the AST treating every leaf as a real value: integer-typed
+// sub-expressions go through the integer pipeline and convert at the
+// boundary, real-typed leaves and ops apply f64 directly. Operators
+// listed in Table 5-3 (modulus, ===, !==, bitwise, reductions, shifts,
+// concatenation, replication, $signed/$unsigned, bitwise NOT) reject
+// here because their ancestor was real-typed by `expression_is_real`,
+// meaning a real operand reached them; the integer pipeline rejects
+// the same operators when the operand is *directly* real.
+fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
+    if !expression_is_real(expr) {
+        return Ok(integer_value_to_f64(&evaluate_expr_in_context(expr, None)?));
+    }
+
+    match expr {
+        Expr::Literal(_) => unreachable!("integer literal handled by integer fast-path"),
+        Expr::RealLiteral(value) => Ok(*value),
+        Expr::Grouped(inner) => evaluate_expr_as_real(inner),
+        Expr::Unary { op, expr } => {
+            let value = evaluate_expr_as_real(expr)?;
+            match op {
+                UnaryOp::Plus => Ok(value),
+                UnaryOp::Minus => Ok(-value),
+                _ => Err(format!(
+                    "operator {} not allowed on real operand",
+                    unary_op_name(*op)
+                )),
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs_val = evaluate_expr_as_real(lhs)?;
+            let rhs_val = evaluate_expr_as_real(rhs)?;
+            match op {
+                BinaryOp::Add => Ok(lhs_val + rhs_val),
+                BinaryOp::Subtract => Ok(lhs_val - rhs_val),
+                BinaryOp::Multiply => Ok(lhs_val * rhs_val),
+                // LRM §5.1.5: "/" on real operands is real division — no
+                // truncation, no division-by-zero error, just IEEE 754
+                // semantics (returns ±∞ or NaN as appropriate).
+                BinaryOp::Divide => Ok(lhs_val / rhs_val),
+                // LRM §5.1.5: real ** with the unspecified corners
+                // (0**≤0, negative**non-integral) inherits whatever
+                // f64::powf returns (1.0 / +∞ / NaN). Documented in the
+                // README "Non-standard behavior" section.
+                BinaryOp::Power => Ok(lhs_val.powf(rhs_val)),
+                _ => Err(format!(
+                    "operator {} not allowed on real operand",
+                    binary_op_name(*op)
+                )),
+            }
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            let cond_logical = logical_value_of_expr(cond)?;
+            match cond_logical {
+                LogicBit::One => evaluate_expr_as_real(then_expr),
+                LogicBit::Zero => evaluate_expr_as_real(else_expr),
+                LogicBit::X | LogicBit::Z => {
+                    // Real has no per-bit identity to merge; if both
+                    // branches numerically agree (including NaN-bit
+                    // identity via to_bits), keep the value, otherwise
+                    // surface NaN. Mirrors the agree/disagree split the
+                    // integer path uses, with the practical caveat that
+                    // disagreement in real always collapses to NaN.
+                    let then_val = evaluate_expr_as_real(then_expr)?;
+                    let else_val = evaluate_expr_as_real(else_expr)?;
+                    if then_val.to_bits() == else_val.to_bits() {
+                        Ok(then_val)
+                    } else {
+                        Ok(f64::NAN)
+                    }
+                }
+            }
+        }
+        Expr::Concatenation { .. } | Expr::Replication { .. } => {
+            unreachable!("concatenation/replication never has real result type")
+        }
+        Expr::SignCast { .. } => {
+            unreachable!("$signed/$unsigned never has real result type")
+        }
+    }
+}
+
+// Reduce an arbitrary expression — integer- or real-typed — to its 1-bit
+// logical value. Used by ?: cond on both pipelines and by &&/|| operands
+// when at least one operand is real.
+fn logical_value_of_expr(expr: &Expr) -> Result<LogicBit, String> {
+    if expression_is_real(expr) {
+        Ok(logical_value_of_real(evaluate_expr_as_real(expr)?))
+    } else {
+        Ok(logical_value(&evaluate_expr_in_context(expr, None)?))
+    }
+}
+
+fn unary_op_name(op: UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Plus => "+",
+        UnaryOp::Minus => "-",
+        UnaryOp::LogicalNot => "!",
+        UnaryOp::BitwiseNot => "~",
+        UnaryOp::ReductionAnd => "&",
+        UnaryOp::ReductionNand => "~&",
+        UnaryOp::ReductionOr => "|",
+        UnaryOp::ReductionNor => "~|",
+        UnaryOp::ReductionXor => "^",
+        UnaryOp::ReductionXnor => "~^",
+    }
+}
+
+fn binary_op_name(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Subtract => "-",
+        BinaryOp::Multiply => "*",
+        BinaryOp::Divide => "/",
+        BinaryOp::Modulus => "%",
+        BinaryOp::Power => "**",
+        BinaryOp::LessThan => "<",
+        BinaryOp::GreaterThan => ">",
+        BinaryOp::LessThanOrEqual => "<=",
+        BinaryOp::GreaterThanOrEqual => ">=",
+        BinaryOp::Equal => "==",
+        BinaryOp::NotEqual => "!=",
+        BinaryOp::CaseEqual => "===",
+        BinaryOp::CaseNotEqual => "!==",
+        BinaryOp::LogicalAnd => "&&",
+        BinaryOp::LogicalOr => "||",
+        BinaryOp::BitwiseAnd => "&",
+        BinaryOp::BitwiseOr => "|",
+        BinaryOp::BitwiseXor => "^",
+        BinaryOp::BitwiseXnor => "~^",
+        BinaryOp::LogicalShiftLeft => "<<",
+        BinaryOp::LogicalShiftRight => ">>",
+        BinaryOp::ArithmeticShiftLeft => "<<<",
+        BinaryOp::ArithmeticShiftRight => ">>>",
+    }
 }
 
 fn evaluate_expr_in_context(
@@ -30,6 +280,12 @@ fn evaluate_expr_in_context(
             Some(context) => value.resized_to_context(context.width, context.signed),
             None => value.clone(),
         }),
+        // Reaching the integer pipeline with a real-typed expression at
+        // the top means our dispatch missed a real-result case. Surface
+        // an error rather than silently fabricating an integer.
+        Expr::RealLiteral(_) => {
+            Err("real value cannot be used as an integer expression here".to_string())
+        }
         Expr::Grouped(expr) => evaluate_expr_in_context(expr, context),
         Expr::Unary { op, expr } => evaluate_unary_expr(*op, expr, context),
         Expr::Binary { op, lhs, rhs } => evaluate_binary_expr(*op, lhs, rhs, context),
@@ -51,6 +307,12 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
             signed: value.signed,
             base: value.base,
         }),
+        // Real has no width/sign/base; reaching this branch means an
+        // integer-pipeline operator looked at a real-typed sub-expression
+        // for context, which the dispatch should have prevented.
+        Expr::RealLiteral(_) => {
+            Err("real value has no integer width or signedness".to_string())
+        }
         Expr::Grouped(expr) => infer_expr_meta(expr),
         Expr::Unary { op, expr } => match op {
             UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitwiseNot => infer_expr_meta(expr),
@@ -196,6 +458,45 @@ fn evaluate_unary_expr(
     expr: &Expr,
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
+    // LRM Table 5-3: bitwise ~ and reductions are illegal on reals.
+    // LRM Table 5-2: !, unary +, and unary - are legal on reals; +/- are
+    // only reachable here when the *result* type is integer (an
+    // arithmetic +/- on a real operand has real result, handled by the
+    // real path), so a real operand to + or - here is a structural
+    // surprise and we reject it consistently with the operator-name
+    // diagnostic shape used elsewhere.
+    if expression_is_real(expr) {
+        match op {
+            UnaryOp::LogicalNot => {
+                let value = evaluate_expr_as_real(expr)?;
+                let bit = match logical_value_of_real(value) {
+                    LogicBit::One => LogicBit::Zero,
+                    LogicBit::Zero => LogicBit::One,
+                    LogicBit::X | LogicBit::Z => LogicBit::X,
+                };
+                return Ok(widen_relational_result(
+                    comparison_result_value(bit),
+                    context,
+                ));
+            }
+            UnaryOp::BitwiseNot
+            | UnaryOp::ReductionAnd
+            | UnaryOp::ReductionNand
+            | UnaryOp::ReductionOr
+            | UnaryOp::ReductionNor
+            | UnaryOp::ReductionXor
+            | UnaryOp::ReductionXnor => {
+                return Err(format!(
+                    "operator {} not allowed on real operand",
+                    unary_op_name(op)
+                ));
+            }
+            UnaryOp::Plus | UnaryOp::Minus => {
+                unreachable!("unary +/- on real is handled by the real path")
+            }
+        }
+    }
+
     if op == UnaryOp::LogicalNot {
         // LRM 5.4: logical operands are self-determined — evaluate without
         // pushing a context down, reduce to the operand's logical value, then
@@ -289,6 +590,51 @@ fn evaluate_binary_expr(
     rhs: &Expr,
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
+    // LRM Table 5-3: %, ===, !==, bitwise, and shift are all illegal on
+    // reals. Arithmetic with a real operand is real-typed and handled by
+    // the real path before reaching this evaluator. Relational, equality,
+    // and logical ops are 1-bit-integer-typed even with real operands, so
+    // they branch into a real-comparison path inside their helpers.
+    if expression_is_real(lhs) || expression_is_real(rhs) {
+        match op {
+            BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Divide
+            | BinaryOp::Power => {
+                unreachable!("real arithmetic should be handled by the real path")
+            }
+            BinaryOp::Modulus
+            | BinaryOp::CaseEqual
+            | BinaryOp::CaseNotEqual
+            | BinaryOp::BitwiseAnd
+            | BinaryOp::BitwiseOr
+            | BinaryOp::BitwiseXor
+            | BinaryOp::BitwiseXnor
+            | BinaryOp::LogicalShiftLeft
+            | BinaryOp::LogicalShiftRight
+            | BinaryOp::ArithmeticShiftLeft
+            | BinaryOp::ArithmeticShiftRight => {
+                return Err(format!(
+                    "operator {} not allowed on real operand",
+                    binary_op_name(op)
+                ));
+            }
+            BinaryOp::LessThan
+            | BinaryOp::GreaterThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThanOrEqual => {
+                return evaluate_real_relational_expr(op, lhs, rhs, context);
+            }
+            BinaryOp::Equal | BinaryOp::NotEqual => {
+                return evaluate_real_equality_expr(op, lhs, rhs, context);
+            }
+            BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
+                return evaluate_real_logical_expr(op, lhs, rhs, context);
+            }
+        }
+    }
+
     let lhs_meta = infer_expr_meta(lhs)?;
     let rhs_meta = infer_expr_meta(rhs)?;
 
@@ -650,6 +996,78 @@ fn evaluate_logical_expr(
     Ok(widen_relational_result(comparison_result_value(bit), context))
 }
 
+// LRM §5.1.7: with at least one real operand, relational comparison runs
+// in real space — the integer side is converted via §3.5.3 conversion
+// rules (handled by `integer_value_to_f64`). NaN comparisons follow IEEE
+// 754: every ordered comparison is false, so e.g. `NaN < x` is `1'b0`.
+fn evaluate_real_relational_expr(
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let lhs_val = evaluate_expr_as_real(lhs)?;
+    let rhs_val = evaluate_expr_as_real(rhs)?;
+    let result = match op {
+        BinaryOp::LessThan => lhs_val < rhs_val,
+        BinaryOp::GreaterThan => lhs_val > rhs_val,
+        BinaryOp::LessThanOrEqual => lhs_val <= rhs_val,
+        BinaryOp::GreaterThanOrEqual => lhs_val >= rhs_val,
+        _ => unreachable!("non-relational op in evaluate_real_relational_expr"),
+    };
+    let bit = if result { LogicBit::One } else { LogicBit::Zero };
+    Ok(widen_relational_result(comparison_result_value(bit), context))
+}
+
+// `==` and `!=` on reals follow f64 equality: both NaN-tainted ops are
+// false for `==` and true for `!=` (IEEE 754 unordered semantics). LRM
+// Table 5-3 forbids `===`/`!==` on reals — those are rejected upstream
+// in evaluate_binary_expr.
+fn evaluate_real_equality_expr(
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let lhs_val = evaluate_expr_as_real(lhs)?;
+    let rhs_val = evaluate_expr_as_real(rhs)?;
+    let result = match op {
+        BinaryOp::Equal => lhs_val == rhs_val,
+        BinaryOp::NotEqual => lhs_val != rhs_val,
+        _ => unreachable!("non-equality op in evaluate_real_equality_expr"),
+    };
+    let bit = if result { LogicBit::One } else { LogicBit::Zero };
+    Ok(widen_relational_result(comparison_result_value(bit), context))
+}
+
+// `&&` and `||` on reals follow the §5.1.9 truth table after each
+// operand reduces to a 1-bit logical value via `logical_value_of_expr`.
+// NaN reduces to x, so NaN || 1 is 1, NaN && 0 is 0, mirroring how the
+// integer path treats unknown bits.
+fn evaluate_real_logical_expr(
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let lhs_logical = logical_value_of_expr(lhs)?;
+    let rhs_logical = logical_value_of_expr(rhs)?;
+    let bit = match op {
+        BinaryOp::LogicalAnd => match (lhs_logical, rhs_logical) {
+            (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
+            (LogicBit::One, LogicBit::One) => LogicBit::One,
+            _ => LogicBit::X,
+        },
+        BinaryOp::LogicalOr => match (lhs_logical, rhs_logical) {
+            (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
+            (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
+            _ => LogicBit::X,
+        },
+        _ => unreachable!("non-logical op in evaluate_real_logical_expr"),
+    };
+    Ok(widen_relational_result(comparison_result_value(bit), context))
+}
+
 fn evaluate_relational_expr(
     op: BinaryOp,
     lhs: &Expr,
@@ -768,6 +1186,9 @@ fn evaluate_conditional_expr(
     else_expr: &Expr,
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
+    if expression_is_real(then_expr) || expression_is_real(else_expr) {
+        unreachable!("real-typed conditional should be handled by the real path")
+    }
     let then_meta = infer_expr_meta(then_expr)?;
     let else_meta = infer_expr_meta(else_expr)?;
     let meta = ExprMeta {
@@ -781,8 +1202,10 @@ fn evaluate_conditional_expr(
         base: meta.base,
     };
 
-    let cond_value = evaluate_expr_in_context(cond, None)?;
-    let cond_logical = logical_value(&cond_value);
+    // Cond may itself be real even when both branches are integer
+    // (e.g. `1.0 ? 1 : 2`); reduce it through `logical_value_of_expr`
+    // which dispatches between the real and integer reductions.
+    let cond_logical = logical_value_of_expr(cond)?;
 
     let then_value = evaluate_expr_in_context(then_expr, Some(effective_meta))?;
     let else_value = evaluate_expr_in_context(else_expr, Some(effective_meta))?;
@@ -818,6 +1241,11 @@ fn evaluate_conditional_expr(
 fn is_indefinite_width(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(value) => value.unsized_literal,
+        // Real values are always rejected from concatenation by
+        // `evaluate_concatenation_expr` with a clearer message; mark
+        // them as indefinite-width here so any reachable check still
+        // refuses them.
+        Expr::RealLiteral(_) => true,
         Expr::Grouped(inner) => is_indefinite_width(inner),
         Expr::Unary { op, expr } => match op {
             UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitwiseNot => is_indefinite_width(expr),
@@ -921,6 +1349,14 @@ fn evaluate_concatenation_expr(
     items: &[Expr],
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
+    // LRM Table 5-3: concatenation is illegal on reals. Detect it here
+    // before `collect_concatenation_bits` would surface the less-helpful
+    // "indefinite width" error from `is_indefinite_width`.
+    for item in items {
+        if expression_is_real(item) {
+            return Err("concatenation operand cannot be real".to_string());
+        }
+    }
     let bits = collect_concatenation_bits(items)?;
     let leftmost_base = infer_expr_meta(&items[0])?.base;
     let natural_width = bits.len();
@@ -933,6 +1369,14 @@ fn evaluate_replication_expr(
     items: &[Expr],
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
+    if expression_is_real(count_expr) {
+        return Err("replication count cannot be real".to_string());
+    }
+    for item in items {
+        if expression_is_real(item) {
+            return Err("replication operand cannot be real".to_string());
+        }
+    }
     let count = evaluate_replication_count(count_expr)?;
     let inner_bits = collect_concatenation_bits(items)?;
     let leftmost_base = infer_expr_meta(&items[0])?.base;
@@ -1024,6 +1468,15 @@ fn evaluate_sign_cast_expr(
     arg: &Expr,
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
+    // $signed/$unsigned are integer-only — applying them to a real value
+    // has no meaning under §5.5 (signedness is a property of the integer
+    // value set, not the floating-point one).
+    if expression_is_real(arg) {
+        return Err(format!(
+            "{} argument cannot be real",
+            if signed { "$signed" } else { "$unsigned" }
+        ));
+    }
     let arg_value = evaluate_expr_in_context(arg, None)?;
     let cast_value = IntegerValue::computed(
         arg_value.width,
@@ -1055,6 +1508,11 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
 
             Ok(value.as_bigint(value.signed))
         }
+        // Reaching this helper with a real-typed expression means the
+        // integer-power exponent path was entered with a real exponent,
+        // which expression_is_real would have caught earlier. Surface a
+        // clear error rather than fabricating an integer.
+        Expr::RealLiteral(_) => Err("real value cannot be used as an integer here".to_string()),
         Expr::Grouped(expr) => evaluate_expr_as_math_bigint(expr),
         Expr::Unary { op, expr } => {
             if matches!(op, UnaryOp::LogicalNot) || is_reduction_op(*op) {

@@ -8,7 +8,7 @@ mod value;
 #[cfg(test)]
 mod tests;
 
-pub use value::{Base, IntegerValue, LogicBit};
+pub use value::{Base, IntegerValue, LogicBit, Value};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Evaluation {
@@ -17,7 +17,7 @@ pub struct Evaluation {
 }
 
 enum ParsedLine {
-    Value(IntegerValue),
+    Value(Value),
     Exit,
 }
 

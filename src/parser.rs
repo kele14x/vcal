@@ -7,9 +7,14 @@ use crate::value::{
     signed_decimal_bit_len,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Expr {
     Literal(IntegerValue),
+    // LRM §3.5.2: a real constant is stored as a 64-bit IEEE 754 double.
+    // Width / signedness / base / x-z don't apply (Table 5-9 lists real as
+    // "Signed, floating point"), so we keep the f64 directly rather than
+    // shoe-horning it into IntegerValue.
+    RealLiteral(f64),
     Grouped(Box<Expr>),
     Unary {
         op: UnaryOp,
@@ -404,6 +409,7 @@ impl Parser {
     fn parse_primary(&mut self) -> Result<Expr, String> {
         match self.next() {
             Some(Token::IntegerLiteral(text)) => parse_integer(&text).map(Expr::Literal),
+            Some(Token::RealLiteral(text)) => parse_real(&text).map(Expr::RealLiteral),
             Some(Token::SystemIdentifier(name)) => self.parse_system_function_call(&name),
             Some(Token::LParen) => {
                 let expr = self.parse_expression()?;
@@ -520,6 +526,17 @@ impl Parser {
     }
 }
 
+// LRM §3.5.2: real constants follow IEEE 754 binary64. The lexer has
+// already validated the digit-on-each-side rule and the optional exponent
+// form, so here we only strip underscores (legal anywhere except the first
+// position, ignored per §3.5.2) and hand the result to f64::from_str.
+pub(crate) fn parse_real(input: &str) -> Result<f64, String> {
+    let stripped = strip_underscores(input);
+    stripped
+        .parse::<f64>()
+        .map_err(|_| format!("invalid real literal: {input}"))
+}
+
 pub(crate) fn parse_integer(input: &str) -> Result<IntegerValue, String> {
     match input.find('\'') {
         Some(apostrophe_index) => parse_based_integer(input, apostrophe_index),
@@ -528,6 +545,7 @@ pub(crate) fn parse_integer(input: &str) -> Result<IntegerValue, String> {
 }
 
 fn parse_unsized_decimal(input: &str) -> Result<IntegerValue, String> {
+    ensure_no_leading_underscore(input)?;
     let digits = strip_underscores(input);
     ensure_decimal_digits(&digits)?;
 
@@ -574,6 +592,7 @@ fn parse_based_integer(input: &str, apostrophe_index: usize) -> Result<IntegerVa
         _ => return Err(format!("unsupported integer base: {base_char}")),
     };
 
+    ensure_no_leading_underscore(rest)?;
     let digits = strip_underscores(rest);
     if digits.is_empty() {
         return Err("missing digits in integer literal".to_string());
@@ -663,6 +682,7 @@ fn parse_based_radix(
 }
 
 fn parse_size(input: &str) -> Result<usize, String> {
+    ensure_no_leading_underscore(input)?;
     let digits = strip_underscores(input);
     if digits.is_empty() {
         return Err("missing integer size".to_string());
@@ -697,6 +717,19 @@ fn ensure_decimal_digits(digits: &str) -> Result<(), String> {
         return Err(format!("invalid decimal digits: {digits}"));
     }
 
+    Ok(())
+}
+
+// LRM A.8.7: every number grammar — `unsigned_number`,
+// `non_zero_unsigned_number`, and the per-base `*_value` rules — has the
+// shape `<digit> { _ | <digit> }`. The leading character is always a
+// digit (or `x_digit`/`z_digit` for the based forms); `_` is a separator,
+// not a prefix. This must run *before* `strip_underscores`, otherwise an
+// illegal leading underscore is silently absorbed and `_1` parses as `1`.
+fn ensure_no_leading_underscore(input: &str) -> Result<(), String> {
+    if input.starts_with('_') {
+        return Err(format!("number cannot start with underscore: {input}"));
+    }
     Ok(())
 }
 

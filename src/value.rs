@@ -1,6 +1,95 @@
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{One, Zero};
 
+// LRM §3.5.2 / §4.8: real numbers are IEEE 754 double-precision and live
+// alongside integers as a separate value kind. Operators that are legal on
+// reals (Table 5-2) operate in f64; operators that are illegal (Table 5-3)
+// reject before evaluating. Reals never carry width, signedness, base, or
+// x/z bits — once a sub-expression is real, the integer leaf-extension and
+// context-propagation machinery does not apply.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    Integer(IntegerValue),
+    Real(f64),
+}
+
+impl Value {
+    pub fn canonical(&self) -> String {
+        match self {
+            Self::Integer(value) => value.canonical(),
+            Self::Real(value) => format_real(*value),
+        }
+    }
+}
+
+// Render an f64 in a Verilog-friendly form. Goals: always produce a token
+// the lexer can read back (so a decimal point or exponent is always
+// present), keep ordinary magnitudes readable as "1.0" / "2.5", and switch
+// to scientific notation for magnitudes outside [1e-4, 1e10) where the
+// non-scientific form would be either lossy or unwieldy. NaN/±∞ go through
+// even though the LRM doesn't enumerate them — they only arise from the
+// "unspecified" real-power corners (§5.1.5), and emitting the literal Rust
+// names keeps them visible to the user instead of silently masking them.
+fn format_real(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "-inf".to_string()
+        } else {
+            "inf".to_string()
+        };
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "0.0".to_string()
+        };
+    }
+
+    // [1e-4, 1e10) is the "human-readable fixed-point" window. Outside it
+    // we switch to scientific so very large / very small magnitudes don't
+    // become illegible runs of zeros — 1.2E12 stays as `1.2e+12` rather
+    // than `1200000000000.0`.
+    let abs = value.abs();
+    if !(1e-4..1e10).contains(&abs) {
+        let formatted = format!("{value:e}");
+        return ensure_exponent_has_sign(&formatted);
+    }
+
+    let formatted = format!("{value}");
+    if formatted.contains('.') || formatted.contains('e') || formatted.contains('E') {
+        formatted
+    } else {
+        format!("{formatted}.0")
+    }
+}
+
+// Rust's {:e} omits the '+' on positive exponents (e.g. "1e10"). Verilog's
+// LRM examples and most simulators print with an explicit sign on the
+// exponent, and round-tripping through our own lexer is easier when the
+// sign is always present.
+fn ensure_exponent_has_sign(formatted: &str) -> String {
+    if let Some(index) = formatted.find('e') {
+        let (mantissa, exponent) = formatted.split_at(index);
+        let exponent = &exponent[1..];
+        let mantissa = if mantissa.contains('.') {
+            mantissa.to_string()
+        } else {
+            format!("{mantissa}.0")
+        };
+        if exponent.starts_with('+') || exponent.starts_with('-') {
+            format!("{mantissa}e{exponent}")
+        } else {
+            format!("{mantissa}e+{exponent}")
+        }
+    } else {
+        formatted.to_string()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogicBit {
     Zero,
