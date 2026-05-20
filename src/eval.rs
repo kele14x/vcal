@@ -99,27 +99,28 @@ fn expression_is_real(expr: &Expr) -> bool {
 // conditional branches where one side is real. LRM §3.5.3 specifies that
 // x/z bits "shall be treated as zero upon conversion" — `bits_to_biguint`
 // already does this, so the conversion runs unconditionally.
+//
+// `BigInt::to_f64` always returns `Some` (rounding huge magnitudes to ±∞),
+// so the unwrap is total.
 fn integer_value_to_f64(value: &IntegerValue) -> f64 {
     value
         .as_bigint(value.signed)
         .to_f64()
-        .unwrap_or(f64::NAN)
+        .expect("BigInt::to_f64 is total")
 }
 
-// LRM §3.5.3: real → integer conversion uses round-to-nearest with
+// LRM §3.5.3: implicit real→integer conversion rounds to nearest with
 // ties-away-from-zero. Rust's f64::round implements that exactly. NaN
-// and ±∞ have no integer representation, so we surface them as an
-// explicit error rather than silently mapping to zero.
-#[allow(dead_code)]
-fn real_to_integer_bigint(value: f64) -> Result<BigInt, String> {
-    if value.is_nan() {
-        return Err("cannot convert NaN to integer".to_string());
-    }
-    if value.is_infinite() {
-        return Err("cannot convert infinity to integer".to_string());
+// and ±∞ have no integer image, surfaced as `None` so callers can apply
+// whatever "no integer" handling fits their context (e.g. $itor's chain
+// into x→0 below; an integer assignment lvalue would surface 32 bits of x
+// the way $rtoi does).
+fn real_to_integer_bigint(value: f64) -> Option<BigInt> {
+    if value.is_nan() || value.is_infinite() {
+        return None;
     }
     let rounded = value.round();
-    BigInt::from_f64(rounded).ok_or_else(|| "real value out of integer range".to_string())
+    Some(BigInt::from_f64(rounded).expect("finite f64 rounds to a representable BigInt"))
 }
 
 // Reduce a real to its 1-bit logical value for !, &&, ||, and ?: cond.
@@ -226,10 +227,17 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
                 // -3.0, not -2.0 (which is what $rtoi's truncation gives).
                 // For an integer-typed operand, evaluate_expr_as_real returns
                 // an already-integer-valued f64 (with x/z → 0 per §3.5.3),
-                // and f64::round is a no-op on it. NaN / ±∞ pass through
-                // unchanged since f64::round leaves them as-is.
+                // and the round step is a no-op on it.
+                //
+                // NaN / ±∞ have no integer image, so `real_to_integer_bigint`
+                // returns `None` — matching the rule $rtoi already documents.
+                // §3.5.3's int→real then maps every x bit to 0, so the chain
+                // collapses to 0.0, keeping $itor self-consistent with $rtoi.
                 let real_val = evaluate_expr_as_real(arg)?;
-                Ok(real_val.round())
+                match real_to_integer_bigint(real_val) {
+                    Some(bigint) => Ok(bigint.to_f64().expect("BigInt::to_f64 is total")),
+                    None => Ok(0.0),
+                }
             }
             RealConversionKind::BitsToReal => {
                 // LRM 17.7.1: reverse of $realtobits. Argument is the 64-bit
@@ -1019,7 +1027,7 @@ fn comparison_result_value(bit: LogicBit) -> IntegerValue {
 // true; all-zero is definitely false; otherwise (any x/z, no 1) the
 // operand is ambiguous and reduces to x.
 fn logical_value(value: &IntegerValue) -> LogicBit {
-    if value.bits.iter().any(|bit| *bit == LogicBit::One) {
+    if value.bits.contains(&LogicBit::One) {
         LogicBit::One
     } else if value.bits.iter().all(|bit| *bit == LogicBit::Zero) {
         LogicBit::Zero

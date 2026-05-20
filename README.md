@@ -346,6 +346,7 @@ This is final support target matrix, not means currently supported or implemente
 ## Main Gap
 
 - Ways of multi-line editor is not clear yet
+- Malformed real literals like `1._0` or `9.` surface as `invalid decimal digits: 1.0` after the underscore-strip / digit-strip step, because the lexer's `real_after_dot` lookahead requires `.` followed by a digit and otherwise falls through to the integer path. The diagnostic is correct in spirit (the literal is not a valid real) but the message is misleading. A future pass should recognize "digit-run + `.`" as a real-literal commitment and emit a real-specific error.
 
 ## Detailed Implementation
 
@@ -433,6 +434,7 @@ vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same f
 - `1'bx ? real_a : real_b` cannot reproduce the integer per-bit-merge rule (real has no per-bit identity). vcal returns the common branch value when both branches agree bit-for-bit on `f64::to_bits`, and `NaN` otherwise.
 - Real values render in fixed-point for magnitudes in `[1e-4, 1e10)` and scientific notation outside that window — purely a display choice, not specified by the LRM.
 - §17.7.1 doesn't address NaN / ±∞ in `$rtoi`. vcal returns 32 bits of `x` to surface "no defined integer image" rather than silently mapping to zero. Out-of-range finite values wrap mod 2³² (the same overflow rule the rest of the integer pipeline uses).
+- §17.7.1 doesn't address NaN / ±∞ in `$itor` either. `$itor` on a real argument goes through implicit real→integer→real; the implicit real→int step has no integer image for NaN/±∞, so it yields `x` (matching the `$rtoi` rule above), and §3.5.3's int→real then maps every `x` bit to `0`. So `$itor(0.0/0.0)` and `$itor(±1.0/0.0)` all collapse to `0.0`, keeping `$itor` self-consistent with `$rtoi`.
 - §17.7.1 doesn't carve out an x/z rule for `$bitstoreal`. vcal applies §3.5.3's "x/z → 0" rule to its 64-bit operand for consistency with the sibling integer-to-real conversions, so `$bitstoreal(64'bx)` decodes as `+0.0`.
 
 ### Conditional operator

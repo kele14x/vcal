@@ -3272,6 +3272,28 @@ fn itor_real_argument_rounds_half_away_from_zero() {
     );
 }
 
+// $itor with a real argument goes through implicit real→integer→real.
+// NaN/±∞ have no integer image, so the implicit real→int step yields x
+// (matching $rtoi(NaN/±∞) → 32'sdx), and §3.5.3's int→real then maps each
+// x bit to 0 — so the whole chain collapses to 0.0.
+#[test]
+fn itor_nan_and_infinity_collapse_to_zero() {
+    assert_eq!(
+        evaluate_input("$itor(0.0 / 0.0)").expect("$itor NaN").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$itor(1.0 / 0.0)").expect("$itor +inf").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$itor(-1.0 / 0.0)")
+            .expect("$itor -inf")
+            .output,
+        "0.0"
+    );
+}
+
 // LRM 17.7.1: $realtobits exposes the IEEE 754 binary64 bit pattern as a
 // 64-bit unsigned vector. The reference values come from the standard
 // encodings — 1.0 = 0x3FF0...0, +0.0 = all zeros, -1.0 = 0xBFF0...0.
