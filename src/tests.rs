@@ -3553,3 +3553,318 @@ fn rejects_real_conversion_missing_parenthesis() {
         "expected `)` after $itor argument"
     );
 }
+
+// LRM 17.11: $clog2 returns the ceiling of log base 2 of an unsigned
+// argument; $clog2(0) is defined to be 0.
+#[test]
+fn clog2_returns_ceiling_log2() {
+    assert_eq!(
+        evaluate_input("$clog2(0)").expect("$clog2(0)").output,
+        "32'sd0"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(1)").expect("$clog2(1)").output,
+        "32'sd0"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(2)").expect("$clog2(2)").output,
+        "32'sd1"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(3)").expect("$clog2(3)").output,
+        "32'sd2"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(4)").expect("$clog2(4)").output,
+        "32'sd2"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(5)").expect("$clog2(5)").output,
+        "32'sd3"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(8)").expect("$clog2(8)").output,
+        "32'sd3"
+    );
+}
+
+// LRM 17.11: "the argument shall be treated as an unsigned value", so the
+// operand's natural width drives the result — a 64-bit all-ones is 2^64-1
+// and clog2 = 64, not 32.
+#[test]
+fn clog2_uses_argument_natural_width_unsigned() {
+    assert_eq!(
+        evaluate_input("$clog2(64'hFFFFFFFFFFFFFFFF)")
+            .expect("$clog2 wide")
+            .output,
+        "32'sd64"
+    );
+    // -1 is 32'shFFFF_FFFF — as unsigned, 2^32-1. clog2 = 32.
+    assert_eq!(
+        evaluate_input("$clog2(-1)").expect("$clog2(-1)").output,
+        "32'sd32"
+    );
+    // 8'sb1000_0000 is signed -128 — as unsigned 8-bit, 128. clog2 = 7.
+    assert_eq!(
+        evaluate_input("$clog2(8'sb10000000)")
+            .expect("$clog2 signed-msb")
+            .output,
+        "32'sd7"
+    );
+}
+
+// LRM is silent on x/z bits in $clog2. vcal surfaces 32 bits of x to mark
+// "no defined image", mirroring the $rtoi NaN/±∞ rule.
+#[test]
+fn clog2_xz_bits_collapse_to_x_result() {
+    assert_eq!(
+        evaluate_input("$clog2(4'b01x0)").expect("$clog2 x").output,
+        "32'sdx"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(4'b01z0)").expect("$clog2 z").output,
+        "32'sdx"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(1'bx)").expect("$clog2 pure x").output,
+        "32'sdx"
+    );
+}
+
+// Real argument promotes via §3.5.3 (round half away from zero), then is
+// interpreted as unsigned per LRM. Mirrors $rtoi's NaN/±∞ → 32'sdx rule
+// for non-finite reals.
+#[test]
+fn clog2_accepts_real_argument() {
+    assert_eq!(
+        evaluate_input("$clog2(8.0)").expect("$clog2 real").output,
+        "32'sd3"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(7.5)")
+            .expect("$clog2 round up")
+            .output,
+        "32'sd3"
+    );
+    // -2.5 rounds to -3 → 32-bit pattern 0xFFFF_FFFD → unsigned huge → 32.
+    assert_eq!(
+        evaluate_input("$clog2(-2.5)")
+            .expect("$clog2 negative real")
+            .output,
+        "32'sd32"
+    );
+}
+
+#[test]
+fn clog2_nan_and_infinity_yield_x() {
+    assert_eq!(
+        evaluate_input("$clog2(0.0 / 0.0)")
+            .expect("$clog2 NaN")
+            .output,
+        "32'sdx"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(1.0 / 0.0)")
+            .expect("$clog2 +inf")
+            .output,
+        "32'sdx"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(-1.0 / 0.0)")
+            .expect("$clog2 -inf")
+            .output,
+        "32'sdx"
+    );
+}
+
+// $clog2's 32-bit signed result widens under outer arithmetic context
+// the same way $rtoi does.
+#[test]
+fn clog2_widens_in_outer_context() {
+    assert_eq!(
+        evaluate_input("$clog2(8) + 64'sd0")
+            .expect("$clog2 widens")
+            .output,
+        "64'sd3"
+    );
+}
+
+// LRM 17.11: real-typed math functions follow the C standard library;
+// Rust's f64::* methods wrap libm so semantics match by construction.
+#[test]
+fn real_math_basic_results() {
+    assert_eq!(
+        evaluate_input("$sqrt(4.0)").expect("$sqrt").output,
+        "2.0"
+    );
+    assert_eq!(
+        evaluate_input("$ln(1.0)").expect("$ln(1)").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$log10(100.0)").expect("$log10").output,
+        "2.0"
+    );
+    assert_eq!(
+        evaluate_input("$exp(0.0)").expect("$exp(0)").output,
+        "1.0"
+    );
+    assert_eq!(
+        evaluate_input("$floor(2.7)").expect("$floor").output,
+        "2.0"
+    );
+    assert_eq!(
+        evaluate_input("$ceil(2.3)").expect("$ceil").output,
+        "3.0"
+    );
+    assert_eq!(
+        evaluate_input("$sin(0.0)").expect("$sin(0)").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$cos(0.0)").expect("$cos(0)").output,
+        "1.0"
+    );
+    assert_eq!(
+        evaluate_input("$tan(0.0)").expect("$tan(0)").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$asin(0.0)").expect("$asin(0)").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$atan(0.0)").expect("$atan(0)").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$sinh(0.0)").expect("$sinh(0)").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$cosh(0.0)").expect("$cosh(0)").output,
+        "1.0"
+    );
+    assert_eq!(
+        evaluate_input("$tanh(0.0)").expect("$tanh(0)").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$asinh(0.0)").expect("$asinh(0)").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$acosh(1.0)").expect("$acosh(1)").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$atanh(0.0)").expect("$atanh(0)").output,
+        "0.0"
+    );
+}
+
+// Integer arguments auto-promote to real via §3.5.3 (x/z → 0), so users
+// can write `$sqrt(4)` without an explicit `$itor` wrapper.
+#[test]
+fn real_math_accepts_integer_argument() {
+    assert_eq!(
+        evaluate_input("$sqrt(4)").expect("$sqrt int").output,
+        "2.0"
+    );
+    // 4'b01x0 → x/z→0 → 0100 → 4 → sqrt = 2.0
+    assert_eq!(
+        evaluate_input("$sqrt(4'b01x0)")
+            .expect("$sqrt with x bits")
+            .output,
+        "2.0"
+    );
+    assert_eq!(
+        evaluate_input("$exp(0)").expect("$exp int").output,
+        "1.0"
+    );
+}
+
+// 2-arg math functions: $pow, $atan2, $hypot.
+#[test]
+fn real_math_two_argument_functions() {
+    assert_eq!(
+        evaluate_input("$pow(2.0, 10.0)").expect("$pow").output,
+        "1024.0"
+    );
+    assert_eq!(
+        evaluate_input("$atan2(0.0, 1.0)").expect("$atan2").output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$hypot(3.0, 4.0)").expect("$hypot").output,
+        "5.0"
+    );
+}
+
+// $pow shares f64::powf with the `**` operator on reals — same corners
+// (0**0=1.0, neg**non-integral=NaN, 0**neg=+inf) the README pins down.
+#[test]
+fn pow_matches_real_power_operator_corners() {
+    assert_eq!(
+        evaluate_input("$pow(0.0, 0.0)").expect("0**0").output,
+        "1.0"
+    );
+    assert_eq!(
+        evaluate_input("$pow(0.0, -1.0)").expect("0**neg").output,
+        "inf"
+    );
+    assert_eq!(
+        evaluate_input("$pow(-2.0, 0.5)")
+            .expect("neg ** non-integral")
+            .output,
+        "NaN"
+    );
+}
+
+// IEEE 754 propagation for NaN/±∞ flows through f64 directly.
+#[test]
+fn real_math_nan_and_infinity_propagate() {
+    assert_eq!(
+        evaluate_input("$sqrt(-1.0)").expect("$sqrt neg").output,
+        "NaN"
+    );
+    assert_eq!(
+        evaluate_input("$ln(0.0)").expect("$ln(0)").output,
+        "-inf"
+    );
+    assert_eq!(
+        evaluate_input("$ln(-1.0)").expect("$ln neg").output,
+        "NaN"
+    );
+    assert_eq!(
+        evaluate_input("$acos(2.0)")
+            .expect("$acos out of range")
+            .output,
+        "NaN"
+    );
+}
+
+// Parser: missing parens, wrong arity.
+#[test]
+fn math_function_parser_errors() {
+    assert_eq!(
+        evaluate_input("$sqrt 4.0").expect_err("missing `(`"),
+        "expected `(` after $sqrt"
+    );
+    assert_eq!(
+        evaluate_input("$pow(2.0").expect_err("missing `)`"),
+        "expected `)` after $pow argument"
+    );
+    assert_eq!(
+        evaluate_input("$pow(1.0)").expect_err("$pow 1 arg"),
+        "$pow expects 2 arguments, got 1"
+    );
+    assert_eq!(
+        evaluate_input("$sqrt(1.0, 2.0)").expect_err("$sqrt 2 args"),
+        "$sqrt expects 1 argument, got 2"
+    );
+    assert_eq!(
+        evaluate_input("$clog2(1, 2)").expect_err("$clog2 2 args"),
+        "$clog2 expects 1 argument, got 2"
+    );
+}

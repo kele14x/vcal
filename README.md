@@ -143,28 +143,28 @@ This is final support target matrix, not means currently supported or implemente
       - [ ] `$dist_t`
       - [ ] `$dist_erlang`
     - [ ] Math functions
-      - [ ] `$clog2`
-      - [ ] `$ln`
-      - [ ] `$log10`
-      - [ ] `$exp`
-      - [ ] `$sqrt`
-      - [ ] `$pow`
-      - [ ] `$floor`
-      - [ ] `$ceil`
-      - [ ] `$sin`
-      - [ ] `$cos`
-      - [ ] `$tan`
-      - [ ] `$asin`
-      - [ ] `$acos`
-      - [ ] `$atan`
-      - [ ] `$atan2`
-      - [ ] `$hypot`
-      - [ ] `$sinh`
-      - [ ] `$cosh`
-      - [ ] `$tanh`
-      - [ ] `$asinh`
-      - [ ] `$acosh`
-      - [ ] `$atanh`
+      - [x] `$clog2`
+      - [x] `$ln`
+      - [x] `$log10`
+      - [x] `$exp`
+      - [x] `$sqrt`
+      - [x] `$pow`
+      - [x] `$floor`
+      - [x] `$ceil`
+      - [x] `$sin`
+      - [x] `$cos`
+      - [x] `$tan`
+      - [x] `$asin`
+      - [x] `$acos`
+      - [x] `$atan`
+      - [x] `$atan2`
+      - [x] `$hypot`
+      - [x] `$sinh`
+      - [x] `$cosh`
+      - [x] `$tanh`
+      - [x] `$asinh`
+      - [x] `$acosh`
+      - [x] `$atanh`
 
 - [ ] Supported operators
   - [x] `{}` Concatenation
@@ -436,6 +436,7 @@ vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same f
 - §17.8 doesn't address NaN / ±∞ in `$rtoi`. vcal returns 32 bits of `x` to surface "no defined integer image" rather than silently mapping to zero. Out-of-range finite values wrap mod 2³² (the same overflow rule the rest of the integer pipeline uses).
 - §17.8 doesn't address NaN / ±∞ in `$itor` either. `$itor` on a real argument goes through implicit real→integer→real; the implicit real→int step has no integer image for NaN/±∞, so it yields `x` (matching the `$rtoi` rule above), and §3.5.3's int→real then maps every `x` bit to `0`. So `$itor(0.0/0.0)` and `$itor(±1.0/0.0)` all collapse to `0.0`, keeping `$itor` self-consistent with `$rtoi`.
 - §17.8 doesn't carve out an x/z rule for `$bitstoreal`. vcal applies §3.5.3's "x/z → 0" rule to its 64-bit operand for consistency with the sibling integer-to-real conversions, so `$bitstoreal(64'bx)` decodes as `+0.0`.
+- §17.11 doesn't address x/z bits in `$clog2`. vcal returns 32 bits of `x` whenever the operand contains any x or z bit, mirroring the `$rtoi` NaN/±∞ rule (surface "no defined image" rather than silently mapping to zero). Real arguments take the §3.5.3 round-half-away-from-zero path, so NaN/±∞ collapse to `32'sdx` the same way they do under `$rtoi`. Finite reals wrap mod 2³² before the unsigned interpretation, matching `$rtoi`'s 32-bit signed result domain. Per LRM the operand is "treated as an unsigned value" of its natural width, so `$clog2(64'hFFFF_FFFF_FFFF_FFFF)` is `32'sd64` and `$clog2(-1)` (32-bit signed) is `32'sd32`.
 
 ### Conditional operator
 

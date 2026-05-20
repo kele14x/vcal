@@ -1,7 +1,7 @@
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 
-use crate::parser::{BinaryOp, Expr, RealConversionKind, UnaryOp};
+use crate::parser::{BinaryOp, Expr, MathFunctionKind, RealConversionKind, UnaryOp};
 use crate::value::{
     Base, IntegerValue, LogicBit, Value, bits_to_biguint, bitwise_and_bits, bitwise_not_bit,
     bitwise_or_bits, bitwise_xnor_bits, bitwise_xor_bits,
@@ -90,6 +90,8 @@ fn expression_is_real(expr: &Expr) -> bool {
             kind,
             RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal
         ),
+        // LRM 17.11: every math function except $clog2 returns real.
+        Expr::MathFunction { kind, .. } => kind.is_real_result(),
     }
 }
 
@@ -263,7 +265,62 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
                 unreachable!("integer-result conversions handled by integer pipeline")
             }
         },
+        // LRM 17.11: real-typed math functions. Each arg evaluates as
+        // real (integer args auto-promote via §3.5.3 inside
+        // `evaluate_expr_as_real`'s integer-leaf fallback at the top).
+        // Rust's `f64::*` methods wrap libm `pow/sin/...`, so the result
+        // matches C's standard library exactly. NaN/±∞ propagate through
+        // the underlying f64 op — the existing `**` paragraph in README
+        // covers the same corner cases.
+        Expr::MathFunction { kind, args } => {
+            if !kind.is_real_result() {
+                unreachable!("integer-result math functions handled by integer pipeline");
+            }
+            evaluate_real_math_function(*kind, args)
+        }
     }
+}
+
+fn evaluate_real_math_function(kind: MathFunctionKind, args: &[Expr]) -> Result<f64, String> {
+    if kind.arity() == 1 {
+        let x = evaluate_expr_as_real(&args[0])?;
+        return Ok(match kind {
+            MathFunctionKind::Ln => x.ln(),
+            MathFunctionKind::Log10 => x.log10(),
+            MathFunctionKind::Exp => x.exp(),
+            MathFunctionKind::Sqrt => x.sqrt(),
+            MathFunctionKind::Floor => x.floor(),
+            MathFunctionKind::Ceil => x.ceil(),
+            MathFunctionKind::Sin => x.sin(),
+            MathFunctionKind::Cos => x.cos(),
+            MathFunctionKind::Tan => x.tan(),
+            MathFunctionKind::Asin => x.asin(),
+            MathFunctionKind::Acos => x.acos(),
+            MathFunctionKind::Atan => x.atan(),
+            MathFunctionKind::Sinh => x.sinh(),
+            MathFunctionKind::Cosh => x.cosh(),
+            MathFunctionKind::Tanh => x.tanh(),
+            MathFunctionKind::Asinh => x.asinh(),
+            MathFunctionKind::Acosh => x.acosh(),
+            MathFunctionKind::Atanh => x.atanh(),
+            MathFunctionKind::Clog2
+            | MathFunctionKind::Pow
+            | MathFunctionKind::Atan2
+            | MathFunctionKind::Hypot => unreachable!("kind handled by other arity branch"),
+        });
+    }
+
+    let x = evaluate_expr_as_real(&args[0])?;
+    let y = evaluate_expr_as_real(&args[1])?;
+    Ok(match kind {
+        // LRM 17.11 + README "Real numbers": $pow shares f64::powf with
+        // the `**` operator on reals, so corner-case results
+        // (0.0**0.0=1.0, negative**non-integral=NaN, 0.0**neg=±∞) match.
+        MathFunctionKind::Pow => x.powf(y),
+        MathFunctionKind::Atan2 => x.atan2(y),
+        MathFunctionKind::Hypot => x.hypot(y),
+        _ => unreachable!("kind handled by other arity branch"),
+    })
 }
 
 // Reduce an arbitrary expression — integer- or real-typed — to its 1-bit
@@ -348,6 +405,7 @@ fn evaluate_expr_in_context(
         Expr::Replication { count, items } => evaluate_replication_expr(count, items, context),
         Expr::SignCast { signed, arg } => evaluate_sign_cast_expr(*signed, arg, context),
         Expr::RealConversion { kind, arg } => evaluate_real_conversion_expr(*kind, arg, context),
+        Expr::MathFunction { kind, args } => evaluate_math_function_expr(*kind, args, context),
     }
 }
 
@@ -472,6 +530,20 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
                 Err("real value has no integer width or signedness".to_string())
             }
         },
+        // LRM 17.11: $clog2 yields a 32-bit signed integer (mirrors $rtoi).
+        // Real-result math functions don't have an integer meta and reaching
+        // this branch means the dispatch missed a real-result expression.
+        Expr::MathFunction { kind, args: _ } => {
+            if kind.is_real_result() {
+                Err("real value has no integer width or signedness".to_string())
+            } else {
+                Ok(ExprMeta {
+                    width: 32,
+                    signed: true,
+                    base: Base::Decimal,
+                })
+            }
+        }
     }
 }
 
@@ -1365,6 +1437,9 @@ fn is_indefinite_width(expr: &Expr) -> bool {
         // $rtoi / $realtobits have fixed result widths (32 / 64); the
         // real-result conversions never reach width-sensitive paths.
         Expr::RealConversion { .. } => false,
+        // $clog2 is fixed 32-bit; real-result math functions never reach
+        // width-sensitive paths the way real conversions don't.
+        Expr::MathFunction { .. } => false,
     }
 }
 
@@ -1617,6 +1692,73 @@ fn real_to_integer_value(value: f64) -> IntegerValue {
     IntegerValue::from_bigint(bigint, 32, true, Base::Decimal)
 }
 
+// LRM 17.11: dispatch the integer-result math functions. Today only
+// $clog2 lands here; real-result kinds are handled by
+// `evaluate_expr_as_real`. Outer-context widening mirrors
+// `evaluate_real_conversion_expr` for $rtoi / $realtobits.
+fn evaluate_math_function_expr(
+    kind: MathFunctionKind,
+    args: &[Expr],
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let result = match kind {
+        MathFunctionKind::Clog2 => evaluate_clog2(&args[0])?,
+        _ => unreachable!("real-result math functions handled by evaluate_expr_as_real"),
+    };
+
+    match context {
+        Some(ctx) if ctx.width > result.width => {
+            Ok(result.resized_to_context(ctx.width, ctx.signed))
+        }
+        _ => Ok(result),
+    }
+}
+
+// LRM 17.11: $clog2 returns the ceiling of log base 2 of the unsigned
+// argument; $clog2(0) is defined to be 0.
+//
+// Argument typing follows the user's "implicit type conversion" rule:
+//   - real argument: rounded to integer via §3.5.3 (round half away from
+//     zero). NaN/±∞ has no integer image, so the result is 32 bits of x —
+//     mirroring the $rtoi NaN/±∞ rule. Finite reals wrap mod 2^32 to
+//     match $rtoi's "implicit integer data type is 32 bits signed"
+//     behavior, then are interpreted as unsigned per LRM.
+//   - integer argument: bits with x/z anywhere collapse the result to
+//     32'sdx. The LRM is silent on x/z in $clog2; vcal surfaces "no
+//     defined image" rather than silently mapping x/z → 0, matching the
+//     $rtoi NaN/±∞ rule. The width used for the unsigned interpretation
+//     is the operand's natural width, so $clog2(64'hFFFF…F) is 64.
+fn evaluate_clog2(arg: &Expr) -> Result<IntegerValue, String> {
+    if expression_is_real(arg) {
+        let real_val = evaluate_expr_as_real(arg)?;
+        let Some(bigint) = real_to_integer_bigint(real_val) else {
+            return Ok(IntegerValue::all_x(32, true, Base::Decimal));
+        };
+        // Wrap to a 32-bit pattern, matching $rtoi's truncation domain;
+        // the resulting IntegerValue's bits are then interpreted as the
+        // unsigned 32-bit value the LRM requires.
+        let wrapped = IntegerValue::from_bigint(bigint, 32, true, Base::Decimal);
+        let unsigned = bits_to_biguint(&wrapped.bits);
+        return Ok(clog2_result_value(unsigned));
+    }
+
+    let value = evaluate_expr_in_context(arg, None)?;
+    if value.has_unknown_bits() {
+        return Ok(IntegerValue::all_x(32, true, Base::Decimal));
+    }
+    let unsigned = bits_to_biguint(&value.bits);
+    Ok(clog2_result_value(unsigned))
+}
+
+fn clog2_result_value(value: BigUint) -> IntegerValue {
+    let result = if value.is_zero() {
+        BigUint::zero()
+    } else {
+        BigUint::from((value - BigUint::one()).bits())
+    };
+    IntegerValue::from_bigint(BigInt::from(result), 32, true, Base::Decimal)
+}
+
 // LRM 17.8: $bitstoreal reinterprets a 64-bit operand as an IEEE 754
 // double. Width is enforced to be exactly 64 by the caller, so the loop
 // just packs the 64 LogicBits into a u64. x/z bits map to 0, mirroring
@@ -1846,6 +1988,17 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
         // since they're real-result and not legal as a power exponent etc.,
         // but the pipeline already rejects real values via its own path.
         Expr::RealConversion { .. } => {
+            let value = evaluate_expr_in_context(expr, None)?;
+            if value.has_unknown_bits() {
+                return Err("expression contains unknown bits".to_string());
+            }
+            Ok(value.as_bigint(value.signed))
+        }
+        // $clog2 is integer-result (route through the integer pipeline so
+        // its 32-bit signed result is materialized before the bigint read).
+        // Real-result math functions reaching here would have been rejected
+        // upstream, but the integer pipeline's own real-rejection covers them.
+        Expr::MathFunction { .. } => {
             let value = evaluate_expr_in_context(expr, None)?;
             if value.has_unknown_bits() {
                 return Err("expression contains unknown bits".to_string());

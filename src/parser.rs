@@ -61,6 +61,15 @@ pub(crate) enum Expr {
         kind: RealConversionKind,
         arg: Box<Expr>,
     },
+    // LRM 17.11: math system functions. `$clog2` returns a 32-bit signed
+    // integer; the other 21 are real-typed (1- or 2-arg) and follow the
+    // C standard library semantics — Rust's `f64::*` methods wrap libm,
+    // so the implementation matches by construction. Arity is validated
+    // at parse time; see `MathFunctionKind::arity`.
+    MathFunction {
+        kind: MathFunctionKind,
+        args: Vec<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +83,77 @@ pub(crate) enum RealConversionKind {
     // `$bitstoreal(int)` — reverse bitcast; takes a 64-bit value and
     // reinterprets the bit pattern as an IEEE 754 double.
     BitsToReal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MathFunctionKind {
+    // Integer-result. Argument is integer-typed; a real argument
+    // implicitly rounds via §3.5.3.
+    Clog2,
+    // Real-result, 1 arg. Argument is real-typed; an integer argument
+    // implicitly promotes via §3.5.3 (x/z → 0).
+    Ln,
+    Log10,
+    Exp,
+    Sqrt,
+    Floor,
+    Ceil,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    // Real-result, 2 args.
+    Pow,
+    Atan2,
+    Hypot,
+}
+
+impl MathFunctionKind {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            MathFunctionKind::Clog2 => "$clog2",
+            MathFunctionKind::Ln => "$ln",
+            MathFunctionKind::Log10 => "$log10",
+            MathFunctionKind::Exp => "$exp",
+            MathFunctionKind::Sqrt => "$sqrt",
+            MathFunctionKind::Floor => "$floor",
+            MathFunctionKind::Ceil => "$ceil",
+            MathFunctionKind::Sin => "$sin",
+            MathFunctionKind::Cos => "$cos",
+            MathFunctionKind::Tan => "$tan",
+            MathFunctionKind::Asin => "$asin",
+            MathFunctionKind::Acos => "$acos",
+            MathFunctionKind::Atan => "$atan",
+            MathFunctionKind::Sinh => "$sinh",
+            MathFunctionKind::Cosh => "$cosh",
+            MathFunctionKind::Tanh => "$tanh",
+            MathFunctionKind::Asinh => "$asinh",
+            MathFunctionKind::Acosh => "$acosh",
+            MathFunctionKind::Atanh => "$atanh",
+            MathFunctionKind::Pow => "$pow",
+            MathFunctionKind::Atan2 => "$atan2",
+            MathFunctionKind::Hypot => "$hypot",
+        }
+    }
+
+    pub(crate) fn arity(self) -> usize {
+        match self {
+            MathFunctionKind::Pow | MathFunctionKind::Atan2 | MathFunctionKind::Hypot => 2,
+            _ => 1,
+        }
+    }
+
+    pub(crate) fn is_real_result(self) -> bool {
+        !matches!(self, MathFunctionKind::Clog2)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -466,6 +546,7 @@ impl Parser {
         enum SystemFn {
             SignCast(bool),
             RealConversion(RealConversionKind),
+            MathFunction(MathFunctionKind),
         }
 
         let kind = match name {
@@ -475,12 +556,59 @@ impl Parser {
             "$itor" => SystemFn::RealConversion(RealConversionKind::IntegerToReal),
             "$realtobits" => SystemFn::RealConversion(RealConversionKind::RealToBits),
             "$bitstoreal" => SystemFn::RealConversion(RealConversionKind::BitsToReal),
+            "$clog2" => SystemFn::MathFunction(MathFunctionKind::Clog2),
+            "$ln" => SystemFn::MathFunction(MathFunctionKind::Ln),
+            "$log10" => SystemFn::MathFunction(MathFunctionKind::Log10),
+            "$exp" => SystemFn::MathFunction(MathFunctionKind::Exp),
+            "$sqrt" => SystemFn::MathFunction(MathFunctionKind::Sqrt),
+            "$floor" => SystemFn::MathFunction(MathFunctionKind::Floor),
+            "$ceil" => SystemFn::MathFunction(MathFunctionKind::Ceil),
+            "$sin" => SystemFn::MathFunction(MathFunctionKind::Sin),
+            "$cos" => SystemFn::MathFunction(MathFunctionKind::Cos),
+            "$tan" => SystemFn::MathFunction(MathFunctionKind::Tan),
+            "$asin" => SystemFn::MathFunction(MathFunctionKind::Asin),
+            "$acos" => SystemFn::MathFunction(MathFunctionKind::Acos),
+            "$atan" => SystemFn::MathFunction(MathFunctionKind::Atan),
+            "$sinh" => SystemFn::MathFunction(MathFunctionKind::Sinh),
+            "$cosh" => SystemFn::MathFunction(MathFunctionKind::Cosh),
+            "$tanh" => SystemFn::MathFunction(MathFunctionKind::Tanh),
+            "$asinh" => SystemFn::MathFunction(MathFunctionKind::Asinh),
+            "$acosh" => SystemFn::MathFunction(MathFunctionKind::Acosh),
+            "$atanh" => SystemFn::MathFunction(MathFunctionKind::Atanh),
+            "$pow" => SystemFn::MathFunction(MathFunctionKind::Pow),
+            "$atan2" => SystemFn::MathFunction(MathFunctionKind::Atan2),
+            "$hypot" => SystemFn::MathFunction(MathFunctionKind::Hypot),
             _ => return Err(format!("unsupported system function: {name}")),
         };
 
         match self.next() {
             Some(Token::LParen) => {}
             _ => return Err(format!("expected `(` after {name}")),
+        }
+
+        if let SystemFn::MathFunction(math_kind) = kind {
+            let mut args = vec![self.parse_expression()?];
+            while matches!(self.peek(), Some(Token::Comma)) {
+                self.index += 1;
+                args.push(self.parse_expression()?);
+            }
+            match self.next() {
+                Some(Token::RParen) => {}
+                _ => return Err(format!("expected `)` after {name} argument")),
+            }
+            let expected = math_kind.arity();
+            if args.len() != expected {
+                return Err(format!(
+                    "{} expects {expected} argument{plural}, got {actual}",
+                    math_kind.name(),
+                    plural = if expected == 1 { "" } else { "s" },
+                    actual = args.len()
+                ));
+            }
+            return Ok(Expr::MathFunction {
+                kind: math_kind,
+                args,
+            });
         }
 
         let arg = self.parse_expression()?;
@@ -499,6 +627,7 @@ impl Parser {
                 kind,
                 arg: Box::new(arg),
             },
+            SystemFn::MathFunction(_) => unreachable!("MathFunction handled above"),
         })
     }
 

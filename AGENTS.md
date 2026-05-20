@@ -9,6 +9,8 @@ What works:
 - Real literals and real arithmetic (LRM 3.5.2 / 5.1.5 / Tables 5-2, 5-3); mixed-type promotion (LRM 5.1.7)
 - `$finish`/`$stop`
 - `$signed()` / `$unsigned()` sign-cast system functions (LRM 5.5)
+- Real-conversion system functions: `$rtoi`, `$itor`, `$realtobits`, `$bitstoreal` (LRM 17.7.1 / §3.5.3)
+- Math system functions: `$clog2` plus 21 real-math functions (`$ln`/`$log10`/`$exp`/`$sqrt`/`$floor`/`$ceil`, the trig/hyperbolic family, `$pow`/`$atan2`/`$hypot`) per LRM 17.11; real-math wraps libm via Rust's `f64::*` to match the C standard library
 - All operators between integers
 - Two-pass context (width, signedness) propagation
 - Leftmost-base propagation
@@ -29,11 +31,14 @@ What works:
   - Shift operators `<< >> <<< >>>`
   - Conditional operator `?:` (the only ternary)
   - Concatenation `{a, b, ...}` and replication `{N{...}}`
-- System functions: `$signed(expr)`, `$unsigned(expr)` (LRM 5.5 sign casts)
+- System functions:
+  - Sign casts (LRM 5.5): `$signed`, `$unsigned`
+  - Real conversions (LRM 17.7.1): `$rtoi`, `$itor`, `$realtobits`, `$bitstoreal`
+  - Math (LRM 17.11): `$clog2`; `$ln`, `$log10`, `$exp`, `$sqrt`, `$pow`, `$floor`, `$ceil`, `$sin`, `$cos`, `$tan`, `$asin`, `$acos`, `$atan`, `$atan2`, `$hypot`, `$sinh`, `$cosh`, `$tanh`, `$asinh`, `$acosh`, `$atanh`
 
 ## Backlog
 
-See README's "Supported Matrix" for the final target. Phase scoping beyond real numbers (variables, multi-line input, conversion / math system functions, …) is TBD — confirm with the user before starting work outside the active scope.
+See README's "Supported Matrix" for the final target. Phase scoping beyond real numbers (variables, multi-line input, …) is TBD — confirm with the user before starting work outside the active scope.
 
 ## Commands
 
