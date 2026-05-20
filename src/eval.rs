@@ -1,7 +1,7 @@
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 
-use crate::parser::{BinaryOp, Expr, UnaryOp};
+use crate::parser::{BinaryOp, Expr, RealConversionKind, UnaryOp};
 use crate::value::{
     Base, IntegerValue, LogicBit, Value, bits_to_biguint, bitwise_and_bits, bitwise_not_bit,
     bitwise_or_bits, bitwise_xnor_bits, bitwise_xor_bits,
@@ -82,6 +82,14 @@ fn expression_is_real(expr: &Expr) -> bool {
             ..
         } => expression_is_real(then_expr) || expression_is_real(else_expr),
         Expr::Concatenation { .. } | Expr::Replication { .. } | Expr::SignCast { .. } => false,
+        // LRM 17.7.1: $itor and $bitstoreal yield real values; $rtoi and
+        // $realtobits yield integers (32-bit signed and 64-bit unsigned
+        // respectively), so only the first two participate in real-result
+        // type propagation.
+        Expr::RealConversion { kind, .. } => matches!(
+            kind,
+            RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal
+        ),
     }
 }
 
@@ -209,6 +217,44 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
         Expr::SignCast { .. } => {
             unreachable!("$signed/$unsigned never has real result type")
         }
+        Expr::RealConversion { kind, arg } => match kind {
+            RealConversionKind::IntegerToReal => {
+                // LRM 17.7.1 + §3.5.3: argument is logically integer, so a
+                // real operand goes through implicit real→integer→real. The
+                // implicit real→integer step rounds to the nearest integer
+                // with ties away from zero (§3.5.3), so e.g. $itor(-2.6) is
+                // -3.0, not -2.0 (which is what $rtoi's truncation gives).
+                // For an integer-typed operand, evaluate_expr_as_real returns
+                // an already-integer-valued f64 (with x/z → 0 per §3.5.3),
+                // and f64::round is a no-op on it. NaN / ±∞ pass through
+                // unchanged since f64::round leaves them as-is.
+                let real_val = evaluate_expr_as_real(arg)?;
+                Ok(real_val.round())
+            }
+            RealConversionKind::BitsToReal => {
+                // LRM 17.7.1: reverse of $realtobits. Argument is the 64-bit
+                // IEEE 754 bit pattern, so we require an exactly 64-bit
+                // self-determined width — narrower operands (e.g. 32-bit
+                // unsized literals) and wider ones both get rejected to
+                // avoid silent zero-extension or truncation. Real operand
+                // has no defined bit-cast here, so reject it too.
+                if expression_is_real(arg) {
+                    return Err("$bitstoreal argument cannot be real".to_string());
+                }
+                let arg_meta = infer_expr_meta(arg)?;
+                if arg_meta.width != 64 {
+                    return Err(format!(
+                        "$bitstoreal argument must be 64 bits wide, got {}",
+                        arg_meta.width
+                    ));
+                }
+                let int_val = evaluate_expr_in_context(arg, None)?;
+                Ok(bits_value_to_real(&int_val))
+            }
+            RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {
+                unreachable!("integer-result conversions handled by integer pipeline")
+            }
+        },
     }
 }
 
@@ -293,6 +339,7 @@ fn evaluate_expr_in_context(
         Expr::Concatenation { items } => evaluate_concatenation_expr(items, context),
         Expr::Replication { count, items } => evaluate_replication_expr(count, items, context),
         Expr::SignCast { signed, arg } => evaluate_sign_cast_expr(*signed, arg, context),
+        Expr::RealConversion { kind, arg } => evaluate_real_conversion_expr(*kind, arg, context),
     }
 }
 
@@ -398,6 +445,25 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
                 base: arg_meta.base,
             })
         }
+        // LRM 17.7.1: $rtoi yields a 32-bit signed integer; $realtobits
+        // yields a 64-bit unsigned vector. The real-result variants
+        // ($itor/$bitstoreal) shouldn't reach the integer pipeline at all,
+        // so querying their integer meta is a structural surprise.
+        Expr::RealConversion { kind, arg: _ } => match kind {
+            RealConversionKind::RealToInteger => Ok(ExprMeta {
+                width: 32,
+                signed: true,
+                base: Base::Decimal,
+            }),
+            RealConversionKind::RealToBits => Ok(ExprMeta {
+                width: 64,
+                signed: false,
+                base: Base::Hex,
+            }),
+            RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => {
+                Err("real value has no integer width or signedness".to_string())
+            }
+        },
     }
 }
 
@@ -1288,6 +1354,9 @@ fn is_indefinite_width(expr: &Expr) -> bool {
         // `$signed`/`$unsigned` lock in the argument's evaluated width, so
         // the cast result is always sized regardless of the argument shape.
         Expr::SignCast { .. } => false,
+        // $rtoi / $realtobits have fixed result widths (32 / 64); the
+        // real-result conversions never reach width-sensitive paths.
+        Expr::RealConversion { .. } => false,
     }
 }
 
@@ -1488,6 +1557,74 @@ fn evaluate_sign_cast_expr(
     }
 }
 
+// LRM 17.7.1: dispatch the integer-result real conversions ($rtoi and
+// $realtobits). The real-result variants ($itor, $bitstoreal) are handled
+// by `evaluate_expr_as_real`. Outer-context widening mirrors $signed /
+// $unsigned: the cast's natural width drives the result, but a wider
+// propagated context extends per its own signedness (§5.5.2).
+fn evaluate_real_conversion_expr(
+    kind: RealConversionKind,
+    arg: &Expr,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    let result = match kind {
+        RealConversionKind::RealToInteger => {
+            // LRM 17.7.1: "$rtoi converts real values to integers by
+            // truncating the real value." Argument is real (or auto-promotes
+            // from integer per §3.5.3). NaN / ±∞ have no integer image, so
+            // we return 32 bits of x to surface "no defined integer";
+            // out-of-range finite values wrap mod 2^32, consistent with the
+            // rest of the integer pipeline's overflow handling.
+            let real_val = evaluate_expr_as_real(arg)?;
+            real_to_integer_value(real_val)
+        }
+        RealConversionKind::RealToBits => {
+            // LRM 17.7.1: bitcast a real to its 64-bit IEEE 754
+            // representation. Display the result in hex since the value is a
+            // bit pattern, not a magnitude.
+            let real_val = evaluate_expr_as_real(arg)?;
+            let bits = real_val.to_bits();
+            IntegerValue::from_bigint(BigInt::from(bits), 64, false, Base::Hex)
+        }
+        RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => {
+            unreachable!("real-result conversions handled by evaluate_expr_as_real")
+        }
+    };
+
+    match context {
+        Some(ctx) if ctx.width > result.width => {
+            Ok(result.resized_to_context(ctx.width, ctx.signed))
+        }
+        _ => Ok(result),
+    }
+}
+
+fn real_to_integer_value(value: f64) -> IntegerValue {
+    if value.is_nan() || value.is_infinite() {
+        return IntegerValue::all_x(32, true, Base::Decimal);
+    }
+    let truncated = value.trunc();
+    let bigint = BigInt::from_f64(truncated)
+        .expect("finite f64 truncates to a representable BigInt");
+    IntegerValue::from_bigint(bigint, 32, true, Base::Decimal)
+}
+
+// LRM 17.7.1: $bitstoreal reinterprets a 64-bit operand as an IEEE 754
+// double. Width is enforced to be exactly 64 by the caller, so the loop
+// just packs the 64 LogicBits into a u64. x/z bits map to 0, mirroring
+// §3.5.3's integer-to-real conversion rule — `$bitstoreal` is a sibling
+// conversion in the same clause and the LRM doesn't carve out a different
+// rule for it.
+fn bits_value_to_real(value: &IntegerValue) -> f64 {
+    let mut bits = 0u64;
+    for (index, bit) in value.bits.iter().enumerate() {
+        if *bit == LogicBit::One {
+            bits |= 1u64 << index;
+        }
+    }
+    f64::from_bits(bits)
+}
+
 fn widen_relational_result(result: IntegerValue, context: Option<ExprMeta>) -> IntegerValue {
     match context {
         Some(ctx) if ctx.width > 1 => result.resized_to_context(ctx.width, false),
@@ -1683,6 +1820,19 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
         // Route sign casts through the standard pipeline so the result's
         // signedness flag is set correctly before we read its bigint value.
         Expr::SignCast { .. } => {
+            let value = evaluate_expr_in_context(expr, None)?;
+            if value.has_unknown_bits() {
+                return Err("expression contains unknown bits".to_string());
+            }
+            Ok(value.as_bigint(value.signed))
+        }
+        // $rtoi / $realtobits are integer-result; route through the standard
+        // pipeline so width/signedness are pinned (32-bit signed / 64-bit
+        // unsigned) before we read the bigint. $itor / $bitstoreal would
+        // bubble up an "expression contains unknown bits"-style error here
+        // since they're real-result and not legal as a power exponent etc.,
+        // but the pipeline already rejects real values via its own path.
+        Expr::RealConversion { .. } => {
             let value = evaluate_expr_in_context(expr, None)?;
             if value.has_unknown_bits() {
                 return Err("expression contains unknown bits".to_string());

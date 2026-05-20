@@ -129,10 +129,10 @@ This is final support target matrix, not means currently supported or implemente
       - [x] `$signed`
       - [x] `$unsigned`
     - [ ] Conversion functions
-      - [ ] `$rtoi`
-      - [ ] `$itor`
-      - [ ] `$realtobits`
-      - [ ] `$bitstoreal`
+      - [x] `$rtoi`
+      - [x] `$itor`
+      - [x] `$realtobits`
+      - [x] `$bitstoreal`
     - [ ] Probabilistic distribution functions
       - [ ] `$random`
       - [ ] `$dist_uniform`
@@ -432,6 +432,8 @@ vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same f
   These come from IEEE 754 directly. iverilog and VCS may differ on the exact value, so don't rely on a specific corner result.
 - `1'bx ? real_a : real_b` cannot reproduce the integer per-bit-merge rule (real has no per-bit identity). vcal returns the common branch value when both branches agree bit-for-bit on `f64::to_bits`, and `NaN` otherwise.
 - Real values render in fixed-point for magnitudes in `[1e-4, 1e10)` and scientific notation outside that window — purely a display choice, not specified by the LRM.
+- §17.7.1 doesn't address NaN / ±∞ in `$rtoi`. vcal returns 32 bits of `x` to surface "no defined integer image" rather than silently mapping to zero. Out-of-range finite values wrap mod 2³² (the same overflow rule the rest of the integer pipeline uses).
+- §17.7.1 doesn't carve out an x/z rule for `$bitstoreal`. vcal applies §3.5.3's "x/z → 0" rule to its 64-bit operand for consistency with the sibling integer-to-real conversions, so `$bitstoreal(64'bx)` decodes as `+0.0`.
 
 ### Conditional operator
 

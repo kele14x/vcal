@@ -54,6 +54,26 @@ pub(crate) enum Expr {
         signed: bool,
         arg: Box<Expr>,
     },
+    // LRM 17.7.1: real-conversion system functions. Each maps between the
+    // integer and real domains with a specific semantic — see
+    // RealConversionKind for the four variants.
+    RealConversion {
+        kind: RealConversionKind,
+        arg: Box<Expr>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RealConversionKind {
+    // `$rtoi(real)` — truncates toward zero, returns 32-bit signed integer.
+    RealToInteger,
+    // `$itor(int)` — converts integer to real per §3.5.3 (x/z → 0).
+    IntegerToReal,
+    // `$realtobits(real)` — bitcast to 64-bit unsigned vector (IEEE 754).
+    RealToBits,
+    // `$bitstoreal(int)` — reverse bitcast; takes a 64-bit value and
+    // reinterprets the bit pattern as an IEEE 754 double.
+    BitsToReal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,14 +458,23 @@ impl Parser {
         }
     }
 
-    // LRM 5.5: `$signed(expr)` / `$unsigned(expr)` — exactly one argument,
-    // parentheses required. Other system identifiers aren't legal in
-    // expression position yet, so we reject them with a clear message instead
-    // of leaving the generic "expected expression operand" path to fire.
+    // LRM 5.5 / 17.7.1: every supported system function in expression
+    // position takes exactly one parenthesised argument. Anything else
+    // starting with `$` is rejected with a clear message so the generic
+    // "expected expression operand" path doesn't fire for typos.
     fn parse_system_function_call(&mut self, name: &str) -> Result<Expr, String> {
-        let signed = match name {
-            "$signed" => true,
-            "$unsigned" => false,
+        enum SystemFn {
+            SignCast(bool),
+            RealConversion(RealConversionKind),
+        }
+
+        let kind = match name {
+            "$signed" => SystemFn::SignCast(true),
+            "$unsigned" => SystemFn::SignCast(false),
+            "$rtoi" => SystemFn::RealConversion(RealConversionKind::RealToInteger),
+            "$itor" => SystemFn::RealConversion(RealConversionKind::IntegerToReal),
+            "$realtobits" => SystemFn::RealConversion(RealConversionKind::RealToBits),
+            "$bitstoreal" => SystemFn::RealConversion(RealConversionKind::BitsToReal),
             _ => return Err(format!("unsupported system function: {name}")),
         };
 
@@ -461,9 +490,15 @@ impl Parser {
             _ => return Err(format!("expected `)` after {name} argument")),
         }
 
-        Ok(Expr::SignCast {
-            signed,
-            arg: Box::new(arg),
+        Ok(match kind {
+            SystemFn::SignCast(signed) => Expr::SignCast {
+                signed,
+                arg: Box::new(arg),
+            },
+            SystemFn::RealConversion(kind) => Expr::RealConversion {
+                kind,
+                arg: Box::new(arg),
+            },
         })
     }
 

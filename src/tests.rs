@@ -3133,3 +3133,323 @@ fn accepts_underscore_separators_inside_digit_run() {
         "16'hbeef"
     );
 }
+
+// LRM 17.7.1: $rtoi truncates toward zero (NOT round). The example values
+// 123.45 → 123 and -22.7 → -22 come straight from the LRM clause. Result is
+// 32-bit signed (Verilog's `integer` type), displayed in decimal.
+#[test]
+fn rtoi_truncates_toward_zero() {
+    assert_eq!(
+        evaluate_input("$rtoi(123.45)").expect("$rtoi positive").output,
+        "32'sd123"
+    );
+    assert_eq!(
+        evaluate_input("$rtoi(-22.7)").expect("$rtoi negative").output,
+        "-32'sd22"
+    );
+    // Truncation, not rounding: 0.9 → 0, -0.9 → 0.
+    assert_eq!(evaluate_input("$rtoi(0.9)").expect("0.9").output, "32'sd0");
+    assert_eq!(
+        evaluate_input("$rtoi(-0.9)").expect("-0.9").output,
+        "32'sd0"
+    );
+    assert_eq!(
+        evaluate_input("$rtoi(1.999)").expect("1.999").output,
+        "32'sd1"
+    );
+    assert_eq!(
+        evaluate_input("$rtoi(-1.999)").expect("-1.999").output,
+        "-32'sd1"
+    );
+}
+
+// LRM is silent on NaN / ±∞ in $rtoi. vcal returns 32 bits of x to surface
+// "no defined integer image" rather than silently mapping to zero.
+#[test]
+fn rtoi_nan_and_infinity_yield_x() {
+    assert_eq!(
+        evaluate_input("$rtoi(0.0 / 0.0)").expect("$rtoi NaN").output,
+        "32'sdx"
+    );
+    assert_eq!(
+        evaluate_input("$rtoi(1.0 / 0.0)")
+            .expect("$rtoi +inf")
+            .output,
+        "32'sdx"
+    );
+    assert_eq!(
+        evaluate_input("$rtoi(-1.0 / 0.0)")
+            .expect("$rtoi -inf")
+            .output,
+        "32'sdx"
+    );
+}
+
+// LRM §3.5.3 carries through $rtoi: an integer operand auto-promotes to
+// real (x/z bits → 0), then truncation gives the same magnitude. Lets users
+// write `$rtoi(integer_expr)` without an extra $itor wrapper.
+#[test]
+fn rtoi_accepts_integer_operand() {
+    assert_eq!(
+        evaluate_input("$rtoi(1.0 + 1)")
+            .expect("$rtoi mixed promotes to real then truncates")
+            .output,
+        "32'sd2"
+    );
+    // Pure integer argument: truncates to itself, just retyped to 32-bit
+    // signed integer.
+    assert_eq!(
+        evaluate_input("$rtoi(4'b01x0 + 1.0)")
+            .expect("$rtoi with x→0 promotion")
+            .output,
+        "32'sd5"
+    );
+}
+
+// LRM 17.7.1: $itor converts integer to real. §3.5.3 specifies the x/z → 0
+// rule for the underlying integer-to-real conversion, so $itor surfaces
+// known bits and ignores unknowns.
+#[test]
+fn itor_converts_integer_to_real() {
+    assert_eq!(
+        evaluate_input("$itor(5)").expect("$itor positive").output,
+        "5.0"
+    );
+    assert_eq!(
+        evaluate_input("$itor(-5)").expect("$itor negative").output,
+        "-5.0"
+    );
+    assert_eq!(evaluate_input("$itor(0)").expect("$itor zero").output, "0.0");
+    // x/z bits become 0 per §3.5.3, so 4'b01x0 → 0100 → 4 → 4.0.
+    assert_eq!(
+        evaluate_input("$itor(4'b01x0)")
+            .expect("$itor with x bits")
+            .output,
+        "4.0"
+    );
+    assert_eq!(
+        evaluate_input("$itor(1'bx)")
+            .expect("$itor pure x → 0")
+            .output,
+        "0.0"
+    );
+}
+
+// LRM §3.5.3 carries through to $itor with a real argument: the implicit
+// real→integer step rounds to the nearest integer with ties away from
+// zero, then the integer→real step is exact. So $itor differs from $rtoi
+// on non-integer reals — $rtoi truncates toward zero while $itor rounds.
+#[test]
+fn itor_real_argument_rounds_half_away_from_zero() {
+    // -2.6 rounds to -3, not -2: ties-away-from-zero takes the larger
+    // magnitude. Distinct from $rtoi(-2.6) which truncates to -2.
+    assert_eq!(
+        evaluate_input("$itor(-2.6)")
+            .expect("$itor with real rounds")
+            .output,
+        "-3.0"
+    );
+    // 2.6 → 3.0 (mirror of -2.6).
+    assert_eq!(
+        evaluate_input("$itor(2.6)").expect("$itor positive").output,
+        "3.0"
+    );
+    // Half-cases round away from zero per §3.5.3, not banker's rounding.
+    assert_eq!(
+        evaluate_input("$itor(2.5)").expect("$itor +0.5 tie").output,
+        "3.0"
+    );
+    assert_eq!(
+        evaluate_input("$itor(-2.5)").expect("$itor -0.5 tie").output,
+        "-3.0"
+    );
+    // Already-integer reals round to themselves.
+    assert_eq!(
+        evaluate_input("$itor(5.0)")
+            .expect("$itor integer-valued real")
+            .output,
+        "5.0"
+    );
+}
+
+// LRM 17.7.1: $realtobits exposes the IEEE 754 binary64 bit pattern as a
+// 64-bit unsigned vector. The reference values come from the standard
+// encodings — 1.0 = 0x3FF0...0, +0.0 = all zeros, -1.0 = 0xBFF0...0.
+#[test]
+fn realtobits_returns_ieee754_pattern() {
+    assert_eq!(
+        evaluate_input("$realtobits(1.0)").expect("1.0").output,
+        "64'h3ff0000000000000"
+    );
+    assert_eq!(
+        evaluate_input("$realtobits(0.0)").expect("0.0").output,
+        "64'h0000000000000000"
+    );
+    assert_eq!(
+        evaluate_input("$realtobits(-1.0)").expect("-1.0").output,
+        "64'hbff0000000000000"
+    );
+    assert_eq!(
+        evaluate_input("$realtobits(2.0)").expect("2.0").output,
+        "64'h4000000000000000"
+    );
+}
+
+// $realtobits accepts an integer operand, promoting via §3.5.3 first.
+// Useful so users can inspect the bit pattern of an integer-derived real
+// without an explicit $itor.
+#[test]
+fn realtobits_accepts_integer_operand() {
+    assert_eq!(
+        evaluate_input("$realtobits(1 + 0.0)")
+            .expect("integer auto-promotes")
+            .output,
+        "64'h3ff0000000000000"
+    );
+}
+
+// LRM 17.7.1: $bitstoreal is the inverse of $realtobits — same 64-bit
+// pattern, decoded as IEEE 754 binary64.
+#[test]
+fn bitstoreal_decodes_ieee754_pattern() {
+    assert_eq!(
+        evaluate_input("$bitstoreal(64'h3ff0000000000000)")
+            .expect("1.0 pattern")
+            .output,
+        "1.0"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal(64'h0000000000000000)")
+            .expect("zero pattern")
+            .output,
+        "0.0"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal(64'hbff0000000000000)")
+            .expect("-1.0 pattern")
+            .output,
+        "-1.0"
+    );
+}
+
+// $realtobits → $bitstoreal round-trips every finite real (and ±0.0)
+// because IEEE 754 binary64 encoding is one-to-one on those values.
+#[test]
+fn realtobits_bitstoreal_round_trip() {
+    assert_eq!(
+        evaluate_input("$bitstoreal($realtobits(3.14))")
+            .expect("round-trip pi")
+            .output,
+        "3.14"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal($realtobits(-2.5))")
+            .expect("round-trip -2.5")
+            .output,
+        "-2.5"
+    );
+}
+
+// $bitstoreal on a real argument has no defined bit-cast meaning (the
+// argument is already a real, not a 64-bit pattern). Reject explicitly.
+#[test]
+fn bitstoreal_rejects_real_argument() {
+    assert_eq!(
+        evaluate_input("$bitstoreal(1.0)").expect_err("$bitstoreal real"),
+        "$bitstoreal argument cannot be real"
+    );
+}
+
+// LRM 17.7.1: $bitstoreal expects a 64-bit pattern. Anything narrower
+// would silently zero-extend and anything wider would silently truncate;
+// both are likely user mistakes, so we reject them up front. The width
+// check uses the argument's self-determined width, so a 32-bit unsized
+// literal or a width-mixing expression is rejected even if its bit
+// pattern would otherwise round-trip.
+#[test]
+fn bitstoreal_rejects_non_64_bit_argument() {
+    assert_eq!(
+        evaluate_input("$bitstoreal(1)").expect_err("32-bit unsized"),
+        "$bitstoreal argument must be 64 bits wide, got 32"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal(1'b0)").expect_err("1-bit"),
+        "$bitstoreal argument must be 64 bits wide, got 1"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal(63'h0)").expect_err("63-bit"),
+        "$bitstoreal argument must be 64 bits wide, got 63"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal(65'h0)").expect_err("65-bit"),
+        "$bitstoreal argument must be 64 bits wide, got 65"
+    );
+}
+
+// Width is taken from the argument's self-determined meta, so an
+// expression that arithmetically produces a 64-bit value still needs
+// each operand to drive the unified width to 64. `64'h0 + 64'h0` is
+// 64-bit, so it's accepted; `64'h0 + 32'h0` would unify to 64 too
+// (max), so it's also accepted.
+#[test]
+fn bitstoreal_accepts_64_bit_expressions() {
+    assert_eq!(
+        evaluate_input("$bitstoreal(64'h3ff0000000000000 | 64'h0)")
+            .expect("bitwise expression sized 64")
+            .output,
+        "1.0"
+    );
+    assert_eq!(
+        evaluate_input("$bitstoreal($signed(64'h3ff0000000000000))")
+            .expect("signed cast preserves 64-bit width")
+            .output,
+        "1.0"
+    );
+}
+
+// LRM §3.5.3 carries through $bitstoreal: x/z bits in the operand convert
+// to 0 in the bit pattern, so e.g. an all-x 64-bit operand decodes as the
+// all-zeros pattern, which IEEE 754 reads as +0.0.
+#[test]
+fn bitstoreal_treats_xz_as_zero_bits() {
+    assert_eq!(
+        evaluate_input("$bitstoreal(64'bx)").expect("all-x → +0.0").output,
+        "0.0"
+    );
+}
+
+// Outer-context widening: $rtoi's 32-bit signed result and $realtobits's
+// 64-bit unsigned result extend per propagated context type at the leaf,
+// matching the §5.5.2 rule already used by $signed/$unsigned.
+#[test]
+fn real_conversions_widen_per_outer_context() {
+    // Signed outer context → sign-extend the 32-bit signed -1 to 64 bits.
+    assert_eq!(
+        evaluate_input("$rtoi(-1.0) + 64'sd0")
+            .expect("$rtoi widens")
+            .output,
+        "-64'sd1"
+    );
+    // Unsigned outer context wider than 64 bits → zero-extend the bit
+    // pattern (the high bits stay 0).
+    assert_eq!(
+        evaluate_input("$realtobits(1.0) + 65'h0")
+            .expect("$realtobits widens")
+            .output,
+        "65'h03ff0000000000000"
+    );
+}
+
+// Parentheses are required after each new $-function, mirroring
+// $signed/$unsigned diagnostics.
+#[test]
+fn rejects_real_conversion_missing_parenthesis() {
+    assert_eq!(
+        evaluate_input("$rtoi 1.0").expect_err("missing `(`"),
+        "expected `(` after $rtoi"
+    );
+    assert_eq!(
+        evaluate_input("$itor(1").expect_err("missing `)`"),
+        "expected `)` after $itor argument"
+    );
+}
