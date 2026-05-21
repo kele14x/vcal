@@ -1809,6 +1809,18 @@ fn widen_relational_result(result: IntegerValue, context: Option<ExprMeta>) -> I
     }
 }
 
+// Used for the RHS of integer `**`, where the exponent must keep
+// arbitrary precision rather than be clamped to the result width. Two
+// strategies:
+//   - Arithmetic operators (+, -, *, /, %, **) and unary +/- recurse in
+//     bigint, so the computation stays width-free.
+//   - Everything else has a width- or signedness-dependent result that
+//     can't be reconstructed from a raw bigint, so we route through the
+//     standard pipeline (which materialises width/signedness on the
+//     `IntegerValue`), then read the bigint out via `value_to_math_bigint`.
+// `value_to_math_bigint` also rejects x/z bits — at the math-bigint layer
+// we have no way to represent unknown bits, so any unknown surfaces a
+// clean "expression contains unknown bits" error.
 fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
     match expr {
         Expr::Literal(value) => {
@@ -1824,112 +1836,43 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
         // clear error rather than fabricating an integer.
         Expr::RealLiteral(_) => Err("real value cannot be used as an integer here".to_string()),
         Expr::Grouped(expr) => evaluate_expr_as_math_bigint(expr),
-        Expr::Unary { op, expr } => {
-            if matches!(op, UnaryOp::LogicalNot) || is_reduction_op(*op) {
-                // Both produce a 1-bit unsigned result via the same
-                // early-return shape, so a single bigint conversion works.
-                let value = evaluate_unary_expr(*op, expr, None)?;
-                if value.has_unknown_bits() {
-                    return Err("expression contains unknown bits".to_string());
-                }
-                return Ok(value.as_bigint(false));
+        // Unary +/- recurse so the inner exponent computation stays in
+        // arbitrary precision. Every other unary op has a width-dependent
+        // result — bitwise NOT preserves the operand's width, logical NOT
+        // and reductions yield 1-bit unsigned — so route them through
+        // evaluate_unary_expr and read the materialised value out.
+        Expr::Unary { op, expr } => match op {
+            UnaryOp::Plus => evaluate_expr_as_math_bigint(expr),
+            UnaryOp::Minus => Ok(-evaluate_expr_as_math_bigint(expr)?),
+            UnaryOp::LogicalNot
+            | UnaryOp::BitwiseNot
+            | UnaryOp::ReductionAnd
+            | UnaryOp::ReductionNand
+            | UnaryOp::ReductionOr
+            | UnaryOp::ReductionNor
+            | UnaryOp::ReductionXor
+            | UnaryOp::ReductionXnor => {
+                value_to_math_bigint(evaluate_unary_expr(*op, expr, None)?)
             }
-            if matches!(op, UnaryOp::BitwiseNot) {
-                // Bitwise NOT depends on operand width, so go through
-                // evaluate_unary_expr rather than negating in bigint.
-                let value = evaluate_unary_expr(*op, expr, None)?;
-                if value.has_unknown_bits() {
-                    return Err("expression contains unknown bits".to_string());
-                }
-                return Ok(value.as_bigint(value.signed));
-            }
-            let value = evaluate_expr_as_math_bigint(expr)?;
-            Ok(match op {
-                UnaryOp::Plus => value,
-                UnaryOp::Minus => -value,
-                UnaryOp::LogicalNot => unreachable!("handled above"),
-                UnaryOp::BitwiseNot => unreachable!("handled above"),
-                UnaryOp::ReductionAnd
-                | UnaryOp::ReductionNand
-                | UnaryOp::ReductionOr
-                | UnaryOp::ReductionNor
-                | UnaryOp::ReductionXor
-                | UnaryOp::ReductionXnor => unreachable!("handled above"),
-            })
-        }
+        },
         Expr::Binary { op, lhs, rhs } => {
-            if matches!(
+            // Non-arithmetic binaries (relational, equality, logical,
+            // bitwise, shift) all have results we can't reconstruct in
+            // bigint alone: bitwise and shift depend on the unified
+            // operand width, the rest are 1-bit unsigned by construction.
+            // evaluate_binary_expr itself dispatches to the
+            // relational/equality/logical/shift helpers, so a single call
+            // covers all five cases.
+            if !matches!(
                 op,
-                BinaryOp::LessThan
-                    | BinaryOp::GreaterThan
-                    | BinaryOp::LessThanOrEqual
-                    | BinaryOp::GreaterThanOrEqual
+                BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulus
+                    | BinaryOp::Power
             ) {
-                let lhs_meta = infer_expr_meta(lhs)?;
-                let rhs_meta = infer_expr_meta(rhs)?;
-                let value = evaluate_relational_expr(*op, lhs, rhs, lhs_meta, rhs_meta, None)?;
-                if value.has_unknown_bits() {
-                    return Err("expression contains unknown bits".to_string());
-                }
-                return Ok(value.as_bigint(false));
-            }
-
-            if matches!(
-                op,
-                BinaryOp::Equal
-                    | BinaryOp::NotEqual
-                    | BinaryOp::CaseEqual
-                    | BinaryOp::CaseNotEqual
-            ) {
-                let lhs_meta = infer_expr_meta(lhs)?;
-                let rhs_meta = infer_expr_meta(rhs)?;
-                let value = evaluate_equality_expr(*op, lhs, rhs, lhs_meta, rhs_meta, None)?;
-                if value.has_unknown_bits() {
-                    return Err("expression contains unknown bits".to_string());
-                }
-                return Ok(value.as_bigint(false));
-            }
-
-            if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
-                let value = evaluate_logical_expr(*op, lhs, rhs, None)?;
-                if value.has_unknown_bits() {
-                    return Err("expression contains unknown bits".to_string());
-                }
-                return Ok(value.as_bigint(false));
-            }
-
-            if matches!(
-                op,
-                BinaryOp::BitwiseAnd
-                    | BinaryOp::BitwiseOr
-                    | BinaryOp::BitwiseXor
-                    | BinaryOp::BitwiseXnor
-            ) {
-                // Bitwise binaries depend on the unified operand width, so
-                // evaluate them through the normal pipeline rather than
-                // applying bigint operators directly.
-                let value = evaluate_binary_expr(*op, lhs, rhs, None)?;
-                if value.has_unknown_bits() {
-                    return Err("expression contains unknown bits".to_string());
-                }
-                return Ok(value.as_bigint(value.signed));
-            }
-
-            if matches!(
-                op,
-                BinaryOp::LogicalShiftLeft
-                    | BinaryOp::LogicalShiftRight
-                    | BinaryOp::ArithmeticShiftLeft
-                    | BinaryOp::ArithmeticShiftRight
-            ) {
-                // Same reasoning as bitwise: shifts depend on the LHS width
-                // and signedness, so route through the standard pipeline
-                // rather than reaching into bigint shift operators directly.
-                let value = evaluate_binary_expr(*op, lhs, rhs, None)?;
-                if value.has_unknown_bits() {
-                    return Err("expression contains unknown bits".to_string());
-                }
-                return Ok(value.as_bigint(value.signed));
+                return value_to_math_bigint(evaluate_binary_expr(*op, lhs, rhs, None)?);
             }
 
             let lhs_value = evaluate_expr_as_math_bigint(lhs)?;
@@ -1954,81 +1897,44 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                     }
                 }
                 BinaryOp::Power => evaluate_power(lhs_value, rhs_value),
-                BinaryOp::LessThan
-                | BinaryOp::GreaterThan
-                | BinaryOp::LessThanOrEqual
-                | BinaryOp::GreaterThanOrEqual
-                | BinaryOp::Equal
-                | BinaryOp::NotEqual
-                | BinaryOp::CaseEqual
-                | BinaryOp::CaseNotEqual
-                | BinaryOp::LogicalAnd
-                | BinaryOp::LogicalOr
-                | BinaryOp::BitwiseAnd
-                | BinaryOp::BitwiseOr
-                | BinaryOp::BitwiseXor
-                | BinaryOp::BitwiseXnor
-                | BinaryOp::LogicalShiftLeft
-                | BinaryOp::LogicalShiftRight
-                | BinaryOp::ArithmeticShiftLeft
-                | BinaryOp::ArithmeticShiftRight => unreachable!("handled above"),
+                _ => unreachable!("non-arithmetic ops handled by the early return above"),
             }
         }
-        // The result depends on width-aware extension of then/else and on
-        // a per-bit merge under an x/z cond, so route through the standard
-        // pipeline rather than reaching into bigint directly.
-        Expr::Conditional { .. } => {
-            let value = evaluate_expr_in_context(expr, None)?;
-            if value.has_unknown_bits() {
-                return Err("expression contains unknown bits".to_string());
-            }
-            Ok(value.as_bigint(value.signed))
-        }
-        // Concatenation/replication results are bit-pattern values — read
-        // them as unsigned integers (LRM 5.1.14: "The result of a
-        // concatenation is treated as an unsigned vector").
-        Expr::Concatenation { .. } | Expr::Replication { .. } => {
-            let value = evaluate_expr_in_context(expr, None)?;
-            if value.has_unknown_bits() {
-                return Err("expression contains unknown bits".to_string());
-            }
-            Ok(value.as_bigint(false))
-        }
-        // Route sign casts through the standard pipeline so the result's
-        // signedness flag is set correctly before we read its bigint value.
-        Expr::SignCast { .. } => {
-            let value = evaluate_expr_in_context(expr, None)?;
-            if value.has_unknown_bits() {
-                return Err("expression contains unknown bits".to_string());
-            }
-            Ok(value.as_bigint(value.signed))
-        }
-        // $rtoi / $realtobits are integer-result; route through the standard
-        // pipeline so width/signedness are pinned (32-bit signed / 64-bit
-        // unsigned) before we read the bigint. $itor / $bitstoreal would
-        // bubble up an "expression contains unknown bits"-style error here
-        // since they're real-result and not legal as a power exponent etc.,
-        // but the pipeline already rejects real values via its own path.
-        Expr::RealConversion { .. } => {
-            let value = evaluate_expr_in_context(expr, None)?;
-            if value.has_unknown_bits() {
-                return Err("expression contains unknown bits".to_string());
-            }
-            Ok(value.as_bigint(value.signed))
-        }
-        // $clog2 is integer-result (route through the integer pipeline so
-        // its 32-bit signed result is materialized before the bigint read).
-        // Real-result math functions reaching here would have been rejected
-        // upstream, but the integer pipeline's own real-rejection covers them.
-        Expr::MathFunction { .. } => {
-            let value = evaluate_expr_in_context(expr, None)?;
-            if value.has_unknown_bits() {
-                return Err("expression contains unknown bits".to_string());
-            }
-            Ok(value.as_bigint(value.signed))
+        // Conditional, concatenation/replication, sign casts, real
+        // conversions, and math functions all have width- and
+        // signedness-dependent results that can't be reconstructed from a
+        // raw bigint: the conditional merges per bit under an x/z cond,
+        // concat/replication is fixed unsigned width (LRM 5.1.14: "the
+        // result of a concatenation is treated as an unsigned vector"),
+        // sign casts lock in signedness, and $rtoi / $realtobits / $clog2
+        // have pinned widths (32 signed / 64 unsigned / 32 signed). Route
+        // through the standard pipeline so those properties are
+        // materialised before the bigint read.
+        Expr::Conditional { .. }
+        | Expr::Concatenation { .. }
+        | Expr::Replication { .. }
+        | Expr::SignCast { .. }
+        | Expr::RealConversion { .. }
+        | Expr::MathFunction { .. } => {
+            value_to_math_bigint(evaluate_expr_in_context(expr, None)?)
         }
         Expr::SystemTask { name } => Err(task_in_expression_error(name)),
     }
+}
+
+// Reject x/z (math-bigint has no representation for unknown bits) and
+// convert the materialised integer to BigInt using the value's own
+// signedness flag. Note: concat/replication and the 1-bit
+// relational/equality/logical/reduction results all carry signed = false
+// by construction, so `value.signed` produces the same bigint as an
+// explicit `false` would; passing the flag through keeps the rule
+// uniform for the callers that do preserve signedness (bitwise, shift,
+// sign casts, $rtoi, etc.).
+fn value_to_math_bigint(value: IntegerValue) -> Result<BigInt, String> {
+    if value.has_unknown_bits() {
+        return Err("expression contains unknown bits".to_string());
+    }
+    Ok(value.as_bigint(value.signed))
 }
 
 fn evaluate_power(base: BigInt, exponent: BigInt) -> Result<BigInt, String> {
