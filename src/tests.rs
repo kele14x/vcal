@@ -563,6 +563,69 @@ fn runs_repl_until_exit_command() {
 }
 
 #[test]
+fn repl_emits_error_lines_and_continues_to_next_prompt() {
+    // On evaluation failure the REPL prints an empty `Out[N]: ` followed
+    // by a separate `Error: <message>` line, then advances the index and
+    // prompts for the next input — it does not abort or skip the index.
+    // Sequence: bad input → error, then valid input → result, then exit.
+    let mut input = Cursor::new("1 +\n42\n$finish\n");
+    let mut output = Vec::new();
+
+    run_repl(&mut input, &mut output).expect("REPL should run");
+
+    let output = String::from_utf8(output).expect("output should be valid UTF-8");
+    assert_eq!(
+        output,
+        "In[0]: Out[0]: \n\
+         Error: unexpected end of expression\n\
+         In[1]: Out[1]: 32'sd42\n\
+         In[2]: Out[2]: \n",
+    );
+}
+
+#[test]
+fn strips_multiple_trailing_semicolons() {
+    // `strip_statement_terminators` loops, removing trailing `;` until
+    // none remain. `1 + 1;;` strips to `1 + 1`.
+    let result = evaluate_input("1 + 1;;").expect("eval");
+    assert_eq!(result.output, "32'sd2");
+}
+
+#[test]
+fn strips_trailing_semicolons_with_intervening_whitespace() {
+    // Whitespace between (and after) the `;` separators is folded by the
+    // trim_end() inside the loop, so `1 + 1 ; ; ;` and `1 + 1;` evaluate
+    // to the same thing.
+    let result = evaluate_input("1 + 1 ; ; ;").expect("eval");
+    assert_eq!(result.output, "32'sd2");
+}
+
+#[test]
+fn rejects_input_that_is_only_semicolons() {
+    // After stripping every trailing `;`, the input is empty — there is
+    // no expression to parse, so the driver surfaces "empty input"
+    // rather than falling into the tokenizer's "empty expression" path.
+    let err = evaluate_input(";;;").expect_err("only semicolons");
+    assert_eq!(err, "empty input");
+}
+
+#[test]
+fn rejects_empty_input() {
+    // Same shape as `;;;`: a blank line trims to empty and short-circuits
+    // before the parser runs.
+    let err = evaluate_input("").expect_err("empty input");
+    assert_eq!(err, "empty input");
+}
+
+#[test]
+fn rejects_whitespace_only_input() {
+    // `.trim()` runs first, so a whitespace-only line takes the same
+    // empty-input path as `""`.
+    let err = evaluate_input("   \t  ").expect_err("whitespace only");
+    assert_eq!(err, "empty input");
+}
+
+#[test]
 fn binary_arithmetic_preserves_shared_operand_base() {
     let binary_add = evaluate_input("4'b0111 + 4'b1001").expect("binary add should evaluate");
     let hex_add = evaluate_input("8'h0a + 8'h05").expect("hex add should evaluate");
@@ -2508,6 +2571,25 @@ fn concatenation_rejects_conditional_with_unsized_branch() {
     // branch makes the whole conditional indefinite.
     let err = evaluate_input("{1'b1 ? 1 : 4'd2, 4'd2}").expect_err("indefinite");
     assert_eq!(err, "concatenation operand has indefinite width");
+}
+
+#[test]
+fn concatenation_rejects_power_with_unsized_lhs() {
+    // `**` takes its result width from the LHS only (LRM 5.1.5, same
+    // shape as shifts), so an unsized LHS makes the whole expression
+    // indefinite even when the RHS is sized.
+    let err = evaluate_input("{2 ** 4'd3, 4'd2}").expect_err("indefinite");
+    assert_eq!(err, "concatenation operand has indefinite width");
+}
+
+#[test]
+fn concatenation_accepts_power_with_sized_lhs() {
+    // A sized LHS pins the operand's width even when the RHS is
+    // unsized — `**` is LHS-determined, so `4'd2 ** 3` is 4 bits wide.
+    // 2 ** 3 = 8 → 4'd8 = 0b1000; concatenated with 4'd2 = 0b0010 gives
+    // 8'b10000010 = 8'd130.
+    let result = evaluate_input("{4'd2 ** 3, 4'd2}").expect("eval");
+    assert_eq!(result.output, "8'd130");
 }
 
 #[test]
