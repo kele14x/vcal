@@ -132,32 +132,49 @@ pub(crate) enum MathFunctionKind {
     Hypot,
 }
 
+// Single source of truth for the math system function name ↔ kind mapping.
+// Both the parser (name → kind, in parse_system_function_call) and
+// `MathFunctionKind::name()` (kind → name, used in error messages) drive
+// off this slice, so a new function only needs adding here. Lookups are
+// O(n) linear scans — fine for n = 22 and called at most once per parsed
+// function call, and `name()` is only used to format error messages.
+const MATH_FUNCTIONS: &[(&str, MathFunctionKind)] = &[
+    ("$clog2", MathFunctionKind::Clog2),
+    ("$ln", MathFunctionKind::Ln),
+    ("$log10", MathFunctionKind::Log10),
+    ("$exp", MathFunctionKind::Exp),
+    ("$sqrt", MathFunctionKind::Sqrt),
+    ("$floor", MathFunctionKind::Floor),
+    ("$ceil", MathFunctionKind::Ceil),
+    ("$sin", MathFunctionKind::Sin),
+    ("$cos", MathFunctionKind::Cos),
+    ("$tan", MathFunctionKind::Tan),
+    ("$asin", MathFunctionKind::Asin),
+    ("$acos", MathFunctionKind::Acos),
+    ("$atan", MathFunctionKind::Atan),
+    ("$sinh", MathFunctionKind::Sinh),
+    ("$cosh", MathFunctionKind::Cosh),
+    ("$tanh", MathFunctionKind::Tanh),
+    ("$asinh", MathFunctionKind::Asinh),
+    ("$acosh", MathFunctionKind::Acosh),
+    ("$atanh", MathFunctionKind::Atanh),
+    ("$pow", MathFunctionKind::Pow),
+    ("$atan2", MathFunctionKind::Atan2),
+    ("$hypot", MathFunctionKind::Hypot),
+];
+
 impl MathFunctionKind {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        MATH_FUNCTIONS
+            .iter()
+            .find_map(|(n, k)| (*n == name).then_some(*k))
+    }
+
     pub(crate) fn name(self) -> &'static str {
-        match self {
-            MathFunctionKind::Clog2 => "$clog2",
-            MathFunctionKind::Ln => "$ln",
-            MathFunctionKind::Log10 => "$log10",
-            MathFunctionKind::Exp => "$exp",
-            MathFunctionKind::Sqrt => "$sqrt",
-            MathFunctionKind::Floor => "$floor",
-            MathFunctionKind::Ceil => "$ceil",
-            MathFunctionKind::Sin => "$sin",
-            MathFunctionKind::Cos => "$cos",
-            MathFunctionKind::Tan => "$tan",
-            MathFunctionKind::Asin => "$asin",
-            MathFunctionKind::Acos => "$acos",
-            MathFunctionKind::Atan => "$atan",
-            MathFunctionKind::Sinh => "$sinh",
-            MathFunctionKind::Cosh => "$cosh",
-            MathFunctionKind::Tanh => "$tanh",
-            MathFunctionKind::Asinh => "$asinh",
-            MathFunctionKind::Acosh => "$acosh",
-            MathFunctionKind::Atanh => "$atanh",
-            MathFunctionKind::Pow => "$pow",
-            MathFunctionKind::Atan2 => "$atan2",
-            MathFunctionKind::Hypot => "$hypot",
-        }
+        MATH_FUNCTIONS
+            .iter()
+            .find_map(|(n, k)| (*k == self).then_some(*n))
+            .expect("every MathFunctionKind variant is in MATH_FUNCTIONS")
     }
 
     pub(crate) fn arity(self) -> usize {
@@ -574,6 +591,10 @@ impl Parser {
             MathFunction(MathFunctionKind),
         }
 
+        // $signed/$unsigned and the four real-conversion casts are listed
+        // explicitly here; everything else falls through to the
+        // MATH_FUNCTIONS table so a new math function only needs adding
+        // there. `from_name` is the inverse of `MathFunctionKind::name()`.
         let kind = match name {
             "$signed" => SystemFn::SignCast(true),
             "$unsigned" => SystemFn::SignCast(false),
@@ -581,29 +602,10 @@ impl Parser {
             "$itor" => SystemFn::RealConversion(RealConversionKind::IntegerToReal),
             "$realtobits" => SystemFn::RealConversion(RealConversionKind::RealToBits),
             "$bitstoreal" => SystemFn::RealConversion(RealConversionKind::BitsToReal),
-            "$clog2" => SystemFn::MathFunction(MathFunctionKind::Clog2),
-            "$ln" => SystemFn::MathFunction(MathFunctionKind::Ln),
-            "$log10" => SystemFn::MathFunction(MathFunctionKind::Log10),
-            "$exp" => SystemFn::MathFunction(MathFunctionKind::Exp),
-            "$sqrt" => SystemFn::MathFunction(MathFunctionKind::Sqrt),
-            "$floor" => SystemFn::MathFunction(MathFunctionKind::Floor),
-            "$ceil" => SystemFn::MathFunction(MathFunctionKind::Ceil),
-            "$sin" => SystemFn::MathFunction(MathFunctionKind::Sin),
-            "$cos" => SystemFn::MathFunction(MathFunctionKind::Cos),
-            "$tan" => SystemFn::MathFunction(MathFunctionKind::Tan),
-            "$asin" => SystemFn::MathFunction(MathFunctionKind::Asin),
-            "$acos" => SystemFn::MathFunction(MathFunctionKind::Acos),
-            "$atan" => SystemFn::MathFunction(MathFunctionKind::Atan),
-            "$sinh" => SystemFn::MathFunction(MathFunctionKind::Sinh),
-            "$cosh" => SystemFn::MathFunction(MathFunctionKind::Cosh),
-            "$tanh" => SystemFn::MathFunction(MathFunctionKind::Tanh),
-            "$asinh" => SystemFn::MathFunction(MathFunctionKind::Asinh),
-            "$acosh" => SystemFn::MathFunction(MathFunctionKind::Acosh),
-            "$atanh" => SystemFn::MathFunction(MathFunctionKind::Atanh),
-            "$pow" => SystemFn::MathFunction(MathFunctionKind::Pow),
-            "$atan2" => SystemFn::MathFunction(MathFunctionKind::Atan2),
-            "$hypot" => SystemFn::MathFunction(MathFunctionKind::Hypot),
-            _ => return Err(format!("unsupported system function: {name}")),
+            _ => match MathFunctionKind::from_name(name) {
+                Some(math_kind) => SystemFn::MathFunction(math_kind),
+                None => return Err(format!("unsupported system function: {name}")),
+            },
         };
 
         match self.next() {

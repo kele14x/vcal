@@ -1952,7 +1952,12 @@ fn evaluate_power(base: BigInt, exponent: BigInt) -> Result<BigInt, String> {
         }
 
         if base == BigInt::from(-1) {
-            let is_odd = (&(-exponent.clone()) & BigInt::one()) == BigInt::one();
+            // Parity is sign-invariant under num-bigint's two's-complement
+            // BitAnd (e.g. -3 & 1 == 3 & 1 == 1), so we read the low bit
+            // of the exponent directly instead of allocating its absolute
+            // value first. Consumes `exponent`, which is fine — we return
+            // immediately on every branch below.
+            let is_odd = (exponent & BigInt::one()) == BigInt::one();
             return Ok(if is_odd {
                 BigInt::from(-1)
             } else {
