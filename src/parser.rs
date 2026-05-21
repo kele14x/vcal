@@ -70,6 +70,22 @@ pub(crate) enum Expr {
         kind: MathFunctionKind,
         args: Vec<Expr>,
     },
+    // LRM 17.4: simulation control system tasks (`$finish`, `$stop`).
+    // These are statements, not expressions — they have no return value.
+    // Parsed here so the parser handles `$finish`/`$stop` identifier-matching
+    // uniformly with system functions; the lib-level driver checks for a bare
+    // SystemTask at the top of the AST and exits, while the integer/real
+    // evaluators reject any nested occurrence with the task-in-expression
+    // error.
+    //
+    // LRM allows an optional `(n)` argument controlling exit-message
+    // verbosity (n ∈ {0,1,2}). vcal does not print exit diagnostics, so the
+    // argument is meaningless: the parser accepts any number of arguments
+    // (including none) and discards them. Arguments are parsed for
+    // syntactic validity only; their values are never evaluated.
+    SystemTask {
+        name: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -543,6 +559,15 @@ impl Parser {
     // starting with `$` is rejected with a clear message so the generic
     // "expected expression operand" path doesn't fire for typos.
     fn parse_system_function_call(&mut self, name: &str) -> Result<Expr, String> {
+        // LRM 17.4 simulation control tasks: `$finish` / `$stop` are
+        // statements, not expressions. Parse them as `Expr::SystemTask`
+        // here so identifier-matching is uniform with system functions; the
+        // top-level driver in lib.rs distinguishes "task at top of AST"
+        // (exit) from "task nested in expression" (rejected by evaluator).
+        if matches!(name, "$finish" | "$stop") {
+            return self.parse_system_task_call(name);
+        }
+
         enum SystemFn {
             SignCast(bool),
             RealConversion(RealConversionKind),
@@ -628,6 +653,44 @@ impl Parser {
                 arg: Box::new(arg),
             },
             SystemFn::MathFunction(_) => unreachable!("MathFunction handled above"),
+        })
+    }
+
+    // LRM 17.4: `$finish[(n)]` / `$stop[(n)]`. Per the LRM the argument
+    // controls exit-message verbosity (n ∈ {0,1,2}); vcal prints no exit
+    // diagnostic, so the argument is meaningless. The parser is therefore
+    // lenient: any number of comma-separated arguments is accepted (the LRM
+    // 0-or-1 arity check would only teach users a rule vcal itself does not
+    // enforce). Each argument is parsed for syntactic validity so genuine
+    // typos like `$finish(1 +)` still surface as a parse error, but the
+    // resulting expression values are discarded — they are never evaluated.
+    fn parse_system_task_call(&mut self, name: &str) -> Result<Expr, String> {
+        if !matches!(self.peek(), Some(Token::LParen)) {
+            return Ok(Expr::SystemTask {
+                name: name.to_string(),
+            });
+        }
+        self.index += 1; // consume `(`
+        if matches!(self.peek(), Some(Token::RParen)) {
+            self.index += 1;
+            return Ok(Expr::SystemTask {
+                name: name.to_string(),
+            });
+        }
+        loop {
+            let _ = self.parse_expression()?;
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.index += 1;
+                continue;
+            }
+            break;
+        }
+        match self.next() {
+            Some(Token::RParen) => {}
+            _ => return Err(format!("expected `)` after {name} arguments")),
+        }
+        Ok(Expr::SystemTask {
+            name: name.to_string(),
         })
     }
 

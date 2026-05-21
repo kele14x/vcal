@@ -34,6 +34,16 @@ pub(crate) fn evaluate_expr(expr: &Expr) -> Result<Value, String> {
 // equality, bitwise, reductions, shifts, concatenation, replication,
 // $signed / $unsigned) are reported as integer-typed; their evaluators
 // reject real operands explicitly so the diagnostic names the operator.
+// LRM 17.4: simulation control tasks have no return value, so they can
+// never appear inside an expression. The parser produces an `Expr::SystemTask`
+// for `$finish` / `$stop`; the lib-level driver recognises a bare task at the
+// top of the AST and exits, but every nested occurrence hits one of the
+// evaluator paths below and surfaces this message. Phrased to make clear it
+// is the function-call usage that is wrong, not the task itself.
+fn task_in_expression_error(name: &str) -> String {
+    format!("{name}() is a system task, it cannot be called as a function.")
+}
+
 fn expression_is_real(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) => false,
@@ -92,6 +102,10 @@ fn expression_is_real(expr: &Expr) -> bool {
         ),
         // LRM 17.11: every math function except $clog2 returns real.
         Expr::MathFunction { kind, .. } => kind.is_real_result(),
+        // System tasks have no type — they are not values. Reporting
+        // "not real" routes the rejection through the integer pipeline,
+        // which surfaces the task-in-expression diagnostic.
+        Expr::SystemTask { .. } => false,
     }
 }
 
@@ -278,6 +292,7 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
             }
             evaluate_real_math_function(*kind, args)
         }
+        Expr::SystemTask { name } => Err(task_in_expression_error(name)),
     }
 }
 
@@ -406,6 +421,7 @@ fn evaluate_expr_in_context(
         Expr::SignCast { signed, arg } => evaluate_sign_cast_expr(*signed, arg, context),
         Expr::RealConversion { kind, arg } => evaluate_real_conversion_expr(*kind, arg, context),
         Expr::MathFunction { kind, args } => evaluate_math_function_expr(*kind, args, context),
+        Expr::SystemTask { name } => Err(task_in_expression_error(name)),
     }
 }
 
@@ -544,6 +560,7 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
                 })
             }
         }
+        Expr::SystemTask { name } => Err(task_in_expression_error(name)),
     }
 }
 
@@ -1440,6 +1457,11 @@ fn is_indefinite_width(expr: &Expr) -> bool {
         // $clog2 is fixed 32-bit; real-result math functions never reach
         // width-sensitive paths the way real conversions don't.
         Expr::MathFunction { .. } => false,
+        // Reporting "definite width" lets the surrounding evaluator path
+        // surface the precise task-in-expression error rather than the
+        // generic "indefinite width" diagnostic from the concatenation
+        // pre-check.
+        Expr::SystemTask { .. } => false,
     }
 }
 
@@ -2005,6 +2027,7 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
             }
             Ok(value.as_bigint(value.signed))
         }
+        Expr::SystemTask { name } => Err(task_in_expression_error(name)),
     }
 }
 

@@ -110,11 +110,10 @@ fn parse_line(input: &str) -> Result<ParsedLine, String> {
         return Err("empty input".to_string());
     }
 
-    if let Some(command) = parse_system_task(input)? {
-        return Ok(command);
-    }
-
     let expression = parser::parse_expression(input)?;
+    if is_top_level_system_task(&expression) {
+        return Ok(ParsedLine::Exit);
+    }
     eval::evaluate_expr(&expression).map(ParsedLine::Value)
 }
 
@@ -128,20 +127,14 @@ fn strip_statement_terminators(input: &str) -> &str {
     trimmed
 }
 
-fn parse_system_task(input: &str) -> Result<Option<ParsedLine>, String> {
-    for name in ["$finish", "$stop"] {
-        if let Some(rest) = input.strip_prefix(name) {
-            let rest = rest.trim();
-            if rest.is_empty() || rest == "()" {
-                return Ok(Some(ParsedLine::Exit));
-            }
-
-            return Err(format!("unsupported system task syntax: {input}"));
-        }
+// LRM 17.4: `$finish` / `$stop` are statements that exit. They are valid
+// only at the top of the input — parentheses are tolerated (`($finish)`)
+// since `Grouped` carries no semantics here, but any other AST shape means
+// the task is nested in an expression and the evaluator will reject it.
+fn is_top_level_system_task(expr: &parser::Expr) -> bool {
+    match expr {
+        parser::Expr::Grouped(inner) => is_top_level_system_task(inner),
+        parser::Expr::SystemTask { .. } => true,
+        _ => false,
     }
-
-    // Anything else starting with `$` is either a system function like
-    // `$signed`/`$unsigned` (handled by the expression parser) or an unknown
-    // identifier the parser will reject with its own diagnostic.
-    Ok(None)
 }
