@@ -16,22 +16,33 @@ pub struct Evaluation {
     pub should_exit: bool,
 }
 
-enum ParsedLine {
-    Value(Value),
-    Exit,
-}
-
 pub fn evaluate_input(input: &str) -> Result<Evaluation, String> {
-    match parse_line(input)? {
-        ParsedLine::Value(value) => Ok(Evaluation {
-            output: value.canonical(),
-            should_exit: false,
-        }),
-        ParsedLine::Exit => Ok(Evaluation {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(Evaluation {
             output: String::new(),
-            should_exit: true,
-        }),
+            should_exit: false,
+        });
     }
+
+    let expressions = parser::parse_expressions(input)?;
+
+    let mut outputs = Vec::new();
+    for expr in &expressions {
+        if is_top_level_system_task(expr) {
+            return Ok(Evaluation {
+                output: outputs.join("\n"),
+                should_exit: true,
+            });
+        }
+        let value = eval::evaluate_expr(expr)?;
+        outputs.push(value.canonical());
+    }
+
+    Ok(Evaluation {
+        output: outputs.join("\n"),
+        should_exit: false,
+    })
 }
 
 pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
@@ -103,29 +114,6 @@ pub fn run_interactive() -> io::Result<()> {
     Ok(())
 }
 
-fn parse_line(input: &str) -> Result<ParsedLine, String> {
-    let input = strip_statement_terminators(input);
-
-    if input.is_empty() {
-        return Err("empty input".to_string());
-    }
-
-    let expression = parser::parse_expression(input)?;
-    if is_top_level_system_task(&expression) {
-        return Ok(ParsedLine::Exit);
-    }
-    eval::evaluate_expr(&expression).map(ParsedLine::Value)
-}
-
-fn strip_statement_terminators(input: &str) -> &str {
-    let mut trimmed = input.trim();
-
-    while let Some(stripped) = trimmed.strip_suffix(';') {
-        trimmed = stripped.trim_end();
-    }
-
-    trimmed
-}
 
 // LRM 17.4: `$finish` / `$stop` are statements that exit. They are valid
 // only at the top of the input — parentheses are tolerated (`($finish)`)

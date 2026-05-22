@@ -48,6 +48,7 @@ pub(crate) enum Token {
     LBrace,
     RBrace,
     Comma,
+    Semicolon,
 }
 
 pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
@@ -188,6 +189,7 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             '{' => tokens.push(Token::LBrace),
             '}' => tokens.push(Token::RBrace),
             ',' => tokens.push(Token::Comma),
+            ';' => tokens.push(Token::Semicolon),
             '\'' => {
                 tokens.push(Token::IntegerLiteral(read_based_literal_after_apostrophe(
                     &mut chars,
@@ -524,6 +526,7 @@ fn is_expression_delimiter(ch: char) -> bool {
             | '{'
             | '}'
             | ','
+            | ';'
             | '$'
     )
 }

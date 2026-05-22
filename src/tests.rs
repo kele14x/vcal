@@ -601,28 +601,21 @@ fn strips_trailing_semicolons_with_intervening_whitespace() {
 }
 
 #[test]
-fn rejects_input_that_is_only_semicolons() {
-    // After stripping every trailing `;`, the input is empty — there is
-    // no expression to parse, so the driver surfaces "empty input"
-    // rather than falling into the tokenizer's "empty expression" path.
-    let err = evaluate_input(";;;").expect_err("only semicolons");
-    assert_eq!(err, "empty input");
+fn only_semicolons_produces_empty_output() {
+    let result = evaluate_input(";;;").expect("eval");
+    assert_eq!(result.output, "");
 }
 
 #[test]
-fn rejects_empty_input() {
-    // Same shape as `;;;`: a blank line trims to empty and short-circuits
-    // before the parser runs.
-    let err = evaluate_input("").expect_err("empty input");
-    assert_eq!(err, "empty input");
+fn empty_input_produces_empty_output() {
+    let result = evaluate_input("").expect("eval");
+    assert_eq!(result.output, "");
 }
 
 #[test]
-fn rejects_whitespace_only_input() {
-    // `.trim()` runs first, so a whitespace-only line takes the same
-    // empty-input path as `""`.
-    let err = evaluate_input("   \t  ").expect_err("whitespace only");
-    assert_eq!(err, "empty input");
+fn whitespace_only_input_produces_empty_output() {
+    let result = evaluate_input("   \t  ").expect("eval");
+    assert_eq!(result.output, "");
 }
 
 #[test]

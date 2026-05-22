@@ -236,6 +236,7 @@ struct Parser {
     index: usize,
 }
 
+#[cfg(test)]
 pub(crate) fn parse_expression(input: &str) -> Result<Expr, String> {
     let tokens = tokenize(input)?;
     if tokens.is_empty() {
@@ -250,6 +251,34 @@ pub(crate) fn parse_expression(input: &str) -> Result<Expr, String> {
     }
 
     Ok(expression)
+}
+
+pub(crate) fn parse_expressions(input: &str) -> Result<Vec<Expr>, String> {
+    let tokens = tokenize(input)?;
+
+    let segments: Vec<&[Token]> = tokens
+        .split(|t| matches!(t, Token::Semicolon))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut exprs = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let mut parser = Parser {
+            tokens: segment.to_vec(),
+            index: 0,
+        };
+        let expr = parser.parse_expression()?;
+        if parser.peek().is_some() {
+            return Err("unexpected token after end of expression".to_string());
+        }
+        exprs.push(expr);
+    }
+
+    Ok(exprs)
 }
 
 impl Parser {
@@ -564,7 +593,8 @@ impl Parser {
             | Some(Token::LogicalShiftLeft) | Some(Token::LogicalShiftRight)
             | Some(Token::ArithmeticShiftLeft) | Some(Token::ArithmeticShiftRight)
             | Some(Token::Question) | Some(Token::Colon)
-            | Some(Token::RBrace) | Some(Token::Comma) => {
+            | Some(Token::RBrace) | Some(Token::Comma)
+            | Some(Token::Semicolon) => {
                 Err("expected expression operand".to_string())
             }
             None => Err("unexpected end of expression".to_string()),
