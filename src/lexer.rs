@@ -386,7 +386,10 @@ where
 
         let mut saw_digit = false;
         while let Some((_, next_ch)) = chars.peek().copied() {
-            if is_expression_delimiter(next_ch) {
+            // `?` is a valid based-literal digit (alias for `z`, LRM 3.5),
+            // so it must not terminate the post-apostrophe digit run even
+            // though it is an expression delimiter elsewhere.
+            if next_ch != '?' && is_expression_delimiter(next_ch) {
                 break;
             }
 
@@ -442,7 +445,7 @@ where
 
     let mut saw_digit = false;
     while let Some((_, next_ch)) = chars.peek().copied() {
-        if is_expression_delimiter(next_ch) {
+        if next_ch != '?' && is_expression_delimiter(next_ch) {
             break;
         }
 
@@ -501,11 +504,6 @@ where
 }
 
 fn is_expression_delimiter(ch: char) -> bool {
-    // Note: `?` is intentionally NOT a delimiter even though it tokenises
-    // as the conditional operator's `?` — inside a based literal it is the
-    // alias for `z` (LRM 3.5), and `read_integer_literal`'s pre-apostrophe
-    // loop already exits on any non-digit, so `1?2` still tokenises as
-    // `1`, `?`, `2`.
     matches!(
         ch,
         '(' | ')'
@@ -522,6 +520,7 @@ fn is_expression_delimiter(ch: char) -> bool {
             | '|'
             | '^'
             | '~'
+            | '?'
             | ':'
             | '{'
             | '}'
