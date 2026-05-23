@@ -582,21 +582,11 @@ impl Parser {
             }
             Some(Token::LBrace) => self.parse_brace_primary(),
             Some(Token::RParen) => Err("unexpected closing parenthesis".to_string()),
-            Some(Token::Plus) | Some(Token::Minus) | Some(Token::Star) | Some(Token::Slash)
-            | Some(Token::Percent) | Some(Token::Power) | Some(Token::Less)
-            | Some(Token::Greater) | Some(Token::LessEqual) | Some(Token::GreaterEqual)
-            | Some(Token::EqualEqual) | Some(Token::NotEqual) | Some(Token::CaseEqual)
-            | Some(Token::CaseNotEqual) | Some(Token::Bang) | Some(Token::LogicalAnd)
-            | Some(Token::LogicalOr) | Some(Token::Tilde) | Some(Token::BitwiseAnd)
-            | Some(Token::BitwiseOr) | Some(Token::BitwiseXor) | Some(Token::BitwiseXnor)
-            | Some(Token::BitwiseNand) | Some(Token::BitwiseNor)
-            | Some(Token::LogicalShiftLeft) | Some(Token::LogicalShiftRight)
-            | Some(Token::ArithmeticShiftLeft) | Some(Token::ArithmeticShiftRight)
-            | Some(Token::Question) | Some(Token::Colon)
-            | Some(Token::RBrace) | Some(Token::Comma)
-            | Some(Token::Semicolon) => {
-                Err("expected expression operand".to_string())
-            }
+            // Any remaining token here is operator-like or a delimiter — none
+            // can start a primary expression. The integer/real/`$id`/`(`/`{`
+            // arms above already cover every valid primary opener, so we don't
+            // need to enumerate the operator tokens individually.
+            Some(_) => Err("expected expression operand".to_string()),
             None => Err("unexpected end of expression".to_string()),
         }
     }

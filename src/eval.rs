@@ -721,19 +721,11 @@ fn evaluate_unary_expr(
         ));
     }
 
-    let value = operand.as_bigint(effective_meta.signed);
-    let result = match op {
-        UnaryOp::Minus => -value,
-        UnaryOp::Plus => unreachable!("handled before arithmetic evaluation"),
-        UnaryOp::LogicalNot => unreachable!("handled by early-return path"),
-        UnaryOp::BitwiseNot => unreachable!("handled by early-return path"),
-        UnaryOp::ReductionAnd
-        | UnaryOp::ReductionNand
-        | UnaryOp::ReductionOr
-        | UnaryOp::ReductionNor
-        | UnaryOp::ReductionXor
-        | UnaryOp::ReductionXnor => unreachable!("handled by early-return path"),
-    };
+    // Only UnaryOp::Minus reaches here: Plus is returned above, LogicalNot,
+    // BitwiseNot, and the six reductions are all early-returned from their
+    // own paths.
+    debug_assert!(op == UnaryOp::Minus);
+    let result = -operand.as_bigint(effective_meta.signed);
 
     Ok(IntegerValue::from_bigint(
         result,
@@ -1624,6 +1616,17 @@ fn extend_to_outer_context(value: IntegerValue, context: Option<ExprMeta>) -> In
     }
 }
 
+// Outer-context widening for cast / conversion results ($signed, $unsigned,
+// $rtoi, $realtobits, $clog2). Differs from `extend_to_outer_context` in that
+// extension follows the *propagated* context's signedness (§5.5.2) rather than
+// forcing zero-extension — the cast's own type already lives in the result.
+fn extend_cast_to_outer_context(value: IntegerValue, context: Option<ExprMeta>) -> IntegerValue {
+    match context {
+        Some(ctx) if ctx.width > value.width => value.resized_to_context(ctx.width, ctx.signed),
+        _ => value,
+    }
+}
+
 // LRM 5.5: `$signed(e)` / `$unsigned(e)` evaluates `e` as a self-determined
 // expression and returns a value with the same size and bit pattern but with
 // the type set by the cast. The cast's type only feeds back into LRM 5.5.1's
@@ -1654,12 +1657,7 @@ fn evaluate_sign_cast_expr(
         arg_value.base,
         arg_value.bits,
     );
-    match context {
-        Some(ctx) if ctx.width > cast_value.width => {
-            Ok(cast_value.resized_to_context(ctx.width, ctx.signed))
-        }
-        _ => Ok(cast_value),
-    }
+    Ok(extend_cast_to_outer_context(cast_value, context))
 }
 
 // LRM 17.8: dispatch the integer-result real conversions ($rtoi and
@@ -1696,12 +1694,7 @@ fn evaluate_real_conversion_expr(
         }
     };
 
-    match context {
-        Some(ctx) if ctx.width > result.width => {
-            Ok(result.resized_to_context(ctx.width, ctx.signed))
-        }
-        _ => Ok(result),
-    }
+    Ok(extend_cast_to_outer_context(result, context))
 }
 
 fn real_to_integer_value(value: f64) -> IntegerValue {
@@ -1728,12 +1721,7 @@ fn evaluate_math_function_expr(
         _ => unreachable!("real-result math functions handled by evaluate_expr_as_real"),
     };
 
-    match context {
-        Some(ctx) if ctx.width > result.width => {
-            Ok(result.resized_to_context(ctx.width, ctx.signed))
-        }
-        _ => Ok(result),
-    }
+    Ok(extend_cast_to_outer_context(result, context))
 }
 
 // LRM 17.11: $clog2 returns the ceiling of log base 2 of the unsigned

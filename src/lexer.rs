@@ -365,53 +365,7 @@ where
         *chars = cursor;
         chars.next();
         literal.push('\'');
-
-        let (_, base_ch) = chars
-            .next()
-            .ok_or_else(|| "missing base after apostrophe".to_string())?;
-        if base_ch.is_whitespace() {
-            return Err("missing base after apostrophe".to_string());
-        }
-        literal.push(base_ch);
-
-        if matches!(base_ch, 's' | 'S') {
-            let (_, signed_base_ch) = chars
-                .next()
-                .ok_or_else(|| "missing base after signed marker".to_string())?;
-            if signed_base_ch.is_whitespace() {
-                return Err("missing base after signed marker".to_string());
-            }
-            literal.push(signed_base_ch);
-        }
-
-        let mut saw_digit = false;
-        while let Some((_, next_ch)) = chars.peek().copied() {
-            // `?` is a valid based-literal digit (alias for `z`, LRM 3.5),
-            // so it must not terminate the post-apostrophe digit run even
-            // though it is an expression delimiter elsewhere.
-            if next_ch != '?' && is_expression_delimiter(next_ch) {
-                break;
-            }
-
-            // Whitespace before the first digit is OK (e.g. `8'd 6`); once
-            // we've started reading digits it terminates the literal so a
-            // following `?` (or any other char) tokenises separately.
-            if next_ch.is_whitespace() {
-                if saw_digit {
-                    break;
-                }
-                chars.next();
-                continue;
-            }
-
-            chars.next();
-            literal.push(next_ch);
-            saw_digit = true;
-        }
-
-        if !saw_digit {
-            return Err("missing digits in integer literal".to_string());
-        }
+        read_base_marker_and_digits(&mut literal, chars)?;
     }
 
     Ok(literal)
@@ -424,7 +378,21 @@ where
     I: Iterator<Item = (usize, char)> + Clone,
 {
     let mut literal = String::from("'");
+    read_base_marker_and_digits(&mut literal, chars)?;
+    Ok(literal)
+}
 
+// Shared tail for both `<size>'<base><digits>` and bare `'<base><digits>`
+// based-literal forms. Caller has already consumed the apostrophe and pushed
+// it onto `literal`; this reads the base char (with an optional `s`/`S`
+// signed marker) and then the digit run.
+fn read_base_marker_and_digits<I>(
+    literal: &mut String,
+    chars: &mut std::iter::Peekable<I>,
+) -> Result<(), String>
+where
+    I: Iterator<Item = (usize, char)>,
+{
     let (_, base_ch) = chars
         .next()
         .ok_or_else(|| "missing base after apostrophe".to_string())?;
@@ -445,10 +413,16 @@ where
 
     let mut saw_digit = false;
     while let Some((_, next_ch)) = chars.peek().copied() {
+        // `?` is a valid based-literal digit (alias for `z`, LRM 3.5), so
+        // it must not terminate the post-apostrophe digit run even though
+        // it is an expression delimiter elsewhere.
         if next_ch != '?' && is_expression_delimiter(next_ch) {
             break;
         }
 
+        // Whitespace before the first digit is OK (e.g. `8'd 6`); once
+        // we've started reading digits it terminates the literal so a
+        // following `?` (or any other char) tokenises separately.
         if next_ch.is_whitespace() {
             if saw_digit {
                 break;
@@ -466,7 +440,7 @@ where
         return Err("missing digits in integer literal".to_string());
     }
 
-    Ok(literal)
+    Ok(())
 }
 
 fn skip_whitespace<I>(chars: &mut std::iter::Peekable<I>)

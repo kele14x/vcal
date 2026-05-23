@@ -417,14 +417,17 @@ pub(crate) fn signed_decimal_bit_len(value: &BigUint) -> usize {
 }
 
 pub(crate) fn biguint_to_bits_with_width(value: &BigUint, width: usize) -> Vec<LogicBit> {
-    let one = BigUint::one();
-
+    // Walk u32 limbs once and read each output bit by index/limb — O(width),
+    // versus the natural `(value >> shift) & 1` which re-shifts the entire
+    // BigUint per bit and degrades to O(width²) on wide operands.
+    let digits = value.to_u32_digits();
     (0..width)
-        .map(|shift| {
-            if ((value >> shift) & &one).is_zero() {
-                LogicBit::Zero
-            } else {
+        .map(|index| {
+            let limb = digits.get(index / 32).copied().unwrap_or(0);
+            if (limb >> (index % 32)) & 1 == 1 {
                 LogicBit::One
+            } else {
+                LogicBit::Zero
             }
         })
         .collect()
@@ -440,12 +443,16 @@ pub(crate) fn bigint_to_bits_with_width(value: &BigInt, width: usize) -> Vec<Log
 }
 
 pub(crate) fn bits_to_biguint(bits: &[LogicBit]) -> BigUint {
-    bits.iter()
-        .enumerate()
-        .fold(BigUint::zero(), |acc, (index, bit)| match bit {
-            LogicBit::One => acc | (BigUint::one() << index),
-            LogicBit::Zero | LogicBit::X | LogicBit::Z => acc,
-        })
+    // Pack the bit vector into u32 limbs once and hand them to BigUint, rather
+    // than the natural `acc | (one << index)` fold which reallocates and shifts
+    // the entire BigUint per bit and degrades to O(width²) on wide operands.
+    let mut digits = vec![0u32; bits.len().div_ceil(32)];
+    for (index, bit) in bits.iter().enumerate() {
+        if *bit == LogicBit::One {
+            digits[index / 32] |= 1u32 << (index % 32);
+        }
+    }
+    BigUint::new(digits)
 }
 
 pub(crate) fn bits_to_signed_bigint(bits: &[LogicBit]) -> BigInt {
