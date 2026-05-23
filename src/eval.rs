@@ -984,15 +984,10 @@ fn evaluate_shift_expr(
     lhs_meta: ExprMeta,
     context: Option<ExprMeta>,
 ) -> Result<IntegerValue, String> {
-    let meta = ExprMeta {
-        width: lhs_meta.width,
-        signed: lhs_meta.signed,
-        base: lhs_meta.base,
-    };
     let effective_meta = ExprMeta {
-        width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
-        signed: context.map_or(meta.signed, |ctx| ctx.signed),
-        base: meta.base,
+        width: context.map_or(lhs_meta.width, |ctx| usize::max(ctx.width, lhs_meta.width)),
+        signed: context.map_or(lhs_meta.signed, |ctx| ctx.signed),
+        base: lhs_meta.base,
     };
 
     let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta))?;
@@ -1004,7 +999,7 @@ fn evaluate_shift_expr(
         return Ok(IntegerValue::all_x(
             effective_meta.width,
             effective_meta.signed,
-            meta.base,
+            lhs_meta.base,
         ));
     }
 
@@ -1041,7 +1036,7 @@ fn evaluate_shift_expr(
     Ok(IntegerValue::computed(
         effective_meta.width,
         effective_meta.signed,
-        meta.base,
+        lhs_meta.base,
         result_bits,
     ))
 }
@@ -1353,23 +1348,21 @@ fn evaluate_conditional_expr(
         base: meta.base,
     };
 
-    // Cond may itself be real even when both branches are integer
-    // (e.g. `1.0 ? 1 : 2`); reduce it through `logical_value_of_expr`
-    // which dispatches between the real and integer reductions.
     let cond_logical = logical_value_of_expr(cond)?;
 
-    let then_value = evaluate_expr_in_context(then_expr, Some(effective_meta))?;
-    let else_value = evaluate_expr_in_context(else_expr, Some(effective_meta))?;
-
     let bits = match cond_logical {
-        LogicBit::One => then_value.bits,
-        LogicBit::Zero => else_value.bits,
-        LogicBit::X | LogicBit::Z => then_value
-            .bits
-            .iter()
-            .zip(else_value.bits.iter())
-            .map(|(t, e)| if t == e { *t } else { LogicBit::X })
-            .collect(),
+        LogicBit::One => evaluate_expr_in_context(then_expr, Some(effective_meta))?.bits,
+        LogicBit::Zero => evaluate_expr_in_context(else_expr, Some(effective_meta))?.bits,
+        LogicBit::X | LogicBit::Z => {
+            let then_value = evaluate_expr_in_context(then_expr, Some(effective_meta))?;
+            let else_value = evaluate_expr_in_context(else_expr, Some(effective_meta))?;
+            then_value
+                .bits
+                .iter()
+                .zip(else_value.bits.iter())
+                .map(|(t, e)| if t == e { *t } else { LogicBit::X })
+                .collect()
+        }
     };
 
     Ok(IntegerValue::computed(
@@ -1965,11 +1958,11 @@ fn evaluate_power(base: BigInt, exponent: BigInt) -> Result<BigInt, String> {
     let mut remaining = exponent;
 
     while !remaining.is_zero() {
-        if (&remaining & BigUint::one()) == BigUint::one() {
+        if remaining.bit(0) {
             result *= &factor;
         }
 
-        remaining >>= 1;
+        remaining >>= 1u32;
         if !remaining.is_zero() {
             factor = &factor * &factor;
         }

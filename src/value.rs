@@ -308,19 +308,10 @@ impl IntegerValue {
     }
 
     fn context_extension_bit(&self, context_signed: bool) -> LogicBit {
-        // LRM §5.5.4 for sized operands: signed propagated context sign-extends
-        // (propagating x/z if the MSB is x/z), unsigned propagated context
-        // zero-extends. Unsized literals follow Table 5-22 footnote a instead;
-        // see `extend_unsized_to`.
         if !context_signed {
             return LogicBit::Zero;
         }
-        match self.bits.last().copied().unwrap_or(LogicBit::Zero) {
-            LogicBit::X => LogicBit::X,
-            LogicBit::Z => LogicBit::Z,
-            LogicBit::One => LogicBit::One,
-            LogicBit::Zero => LogicBit::Zero,
-        }
+        self.bits.last().copied().unwrap_or(LogicBit::Zero)
     }
 
     pub(crate) fn as_bigint(&self, signed: bool) -> BigInt {
@@ -434,12 +425,34 @@ pub(crate) fn biguint_to_bits_with_width(value: &BigUint, width: usize) -> Vec<L
 }
 
 pub(crate) fn bigint_to_bits_with_width(value: &BigInt, width: usize) -> Vec<LogicBit> {
-    let modulus = BigInt::one() << width;
-    let normalized = ((value % &modulus) + &modulus) % &modulus;
-    let unsigned = normalized
-        .to_biguint()
-        .expect("normalized modulo value should be non-negative");
-    biguint_to_bits_with_width(&unsigned, width)
+    let (sign, magnitude) = value.to_u32_digits();
+    if sign != Sign::Minus {
+        return biguint_to_bits_with_width(&BigUint::new(magnitude), width);
+    }
+    // Two's complement for negative values: invert all bits and add 1,
+    // operating on the raw u32 limbs in O(width) rather than the O(width²)
+    // BigInt modulus that was here before.
+    let mut bits = Vec::with_capacity(width);
+    let mut carry = 1u32;
+    for i in 0..width {
+        let limb_idx = i / 32;
+        let bit_idx = i % 32;
+        let raw_bit = if limb_idx < magnitude.len() {
+            (magnitude[limb_idx] >> bit_idx) & 1
+        } else {
+            0
+        };
+        // Invert the magnitude bit, then add carry for two's complement.
+        let inverted = raw_bit ^ 1;
+        let sum = inverted + carry;
+        carry = sum >> 1;
+        bits.push(if sum & 1 == 1 {
+            LogicBit::One
+        } else {
+            LogicBit::Zero
+        });
+    }
+    bits
 }
 
 pub(crate) fn bits_to_biguint(bits: &[LogicBit]) -> BigUint {

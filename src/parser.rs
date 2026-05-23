@@ -231,8 +231,8 @@ pub(crate) enum BinaryOp {
     ArithmeticShiftRight,
 }
 
-struct Parser {
-    tokens: Vec<Token>,
+struct Parser<'a> {
+    tokens: &'a [Token],
     index: usize,
 }
 
@@ -243,7 +243,7 @@ pub(crate) fn parse_expression(input: &str) -> Result<Expr, String> {
         return Err("empty expression".to_string());
     }
 
-    let mut parser = Parser { tokens, index: 0 };
+    let mut parser = Parser { tokens: &tokens, index: 0 };
     let expression = parser.parse_expression()?;
 
     if parser.peek().is_some() {
@@ -268,7 +268,7 @@ pub(crate) fn parse_expressions(input: &str) -> Result<Vec<Expr>, String> {
     let mut exprs = Vec::with_capacity(segments.len());
     for segment in segments {
         let mut parser = Parser {
-            tokens: segment.to_vec(),
+            tokens: segment,
             index: 0,
         };
         let expr = parser.parse_expression()?;
@@ -281,7 +281,7 @@ pub(crate) fn parse_expressions(input: &str) -> Result<Vec<Expr>, String> {
     Ok(exprs)
 }
 
-impl Parser {
+impl<'a> Parser<'a> {
     fn parse_expression(&mut self) -> Result<Expr, String> {
         self.parse_conditional()
     }
@@ -569,10 +569,14 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
-        match self.next() {
-            Some(Token::IntegerLiteral(text)) => parse_integer(&text).map(Expr::Literal),
-            Some(Token::RealLiteral(text)) => parse_real(&text).map(Expr::RealLiteral),
-            Some(Token::SystemIdentifier(name)) => self.parse_system_function_call(&name),
+        let token = self.next();
+        match token {
+            Some(Token::IntegerLiteral(text)) => parse_integer(text).map(Expr::Literal),
+            Some(Token::RealLiteral(text)) => parse_real(text).map(Expr::RealLiteral),
+            Some(Token::SystemIdentifier(name)) => {
+                let name = name.clone();
+                self.parse_system_function_call(&name)
+            }
             Some(Token::LParen) => {
                 let expr = self.parse_expression()?;
                 match self.next() {
@@ -582,10 +586,6 @@ impl Parser {
             }
             Some(Token::LBrace) => self.parse_brace_primary(),
             Some(Token::RParen) => Err("unexpected closing parenthesis".to_string()),
-            // Any remaining token here is operator-like or a delimiter — none
-            // can start a primary expression. The integer/real/`$id`/`(`/`{`
-            // arms above already cover every valid primary opener, so we don't
-            // need to enumerate the operator tokens individually.
             Some(_) => Err("expected expression operand".to_string()),
             None => Err("unexpected end of expression".to_string()),
         }
@@ -766,8 +766,8 @@ impl Parser {
         self.tokens.get(self.index)
     }
 
-    fn next(&mut self) -> Option<Token> {
-        let token = self.tokens.get(self.index).cloned();
+    fn next(&mut self) -> Option<&Token> {
+        let token = self.tokens.get(self.index);
         if token.is_some() {
             self.index += 1;
         }
@@ -908,7 +908,7 @@ fn parse_based_radix(
     let mut bits = Vec::with_capacity(digits.len() * base.group_size());
 
     for digit in digits.chars().rev() {
-        bits.extend(digit_to_bits(digit, base)?);
+        push_digit_bits(digit, base, &mut bits)?;
     }
 
     let unsized_literal = width_hint.is_none();
@@ -982,44 +982,43 @@ fn ensure_no_leading_underscore(input: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn digit_to_bits(digit: char, base: Base) -> Result<Vec<LogicBit>, String> {
+fn push_digit_bits(digit: char, base: Base, out: &mut Vec<LogicBit>) -> Result<(), String> {
     let digit = digit.to_ascii_lowercase();
 
     match base {
         Base::Binary => match digit {
-            '0' => Ok(vec![LogicBit::Zero]),
-            '1' => Ok(vec![LogicBit::One]),
-            'x' => Ok(vec![LogicBit::X]),
-            'z' | '?' => Ok(vec![LogicBit::Z]),
-            _ => Err(format!("invalid binary digit: {digit}")),
+            '0' => out.push(LogicBit::Zero),
+            '1' => out.push(LogicBit::One),
+            'x' => out.push(LogicBit::X),
+            'z' | '?' => out.push(LogicBit::Z),
+            _ => return Err(format!("invalid binary digit: {digit}")),
         },
         Base::Octal => match digit {
-            'x' => Ok(vec![LogicBit::X; 3]),
-            'z' | '?' => Ok(vec![LogicBit::Z; 3]),
-            '0'..='7' => Ok(integer_bits((digit as u8) - b'0', 3)),
-            _ => Err(format!("invalid octal digit: {digit}")),
+            'x' => out.extend_from_slice(&[LogicBit::X; 3]),
+            'z' | '?' => out.extend_from_slice(&[LogicBit::Z; 3]),
+            '0'..='7' => push_integer_bits((digit as u8) - b'0', 3, out),
+            _ => return Err(format!("invalid octal digit: {digit}")),
         },
         Base::Hex => match digit {
-            'x' => Ok(vec![LogicBit::X; 4]),
-            'z' | '?' => Ok(vec![LogicBit::Z; 4]),
-            '0'..='9' => Ok(integer_bits((digit as u8) - b'0', 4)),
-            'a'..='f' => Ok(integer_bits((digit as u8) - b'a' + 10, 4)),
-            _ => Err(format!("invalid hex digit: {digit}")),
+            'x' => out.extend_from_slice(&[LogicBit::X; 4]),
+            'z' | '?' => out.extend_from_slice(&[LogicBit::Z; 4]),
+            '0'..='9' => push_integer_bits((digit as u8) - b'0', 4, out),
+            'a'..='f' => push_integer_bits((digit as u8) - b'a' + 10, 4, out),
+            _ => return Err(format!("invalid hex digit: {digit}")),
         },
-        Base::Decimal => Err("decimal digits are parsed separately".to_string()),
+        Base::Decimal => return Err("decimal digits are parsed separately".to_string()),
     }
+    Ok(())
 }
 
-fn integer_bits(value: u8, width: usize) -> Vec<LogicBit> {
-    (0..width)
-        .map(|shift| {
-            if value & (1 << shift) == 0 {
-                LogicBit::Zero
-            } else {
-                LogicBit::One
-            }
-        })
-        .collect()
+fn push_integer_bits(value: u8, width: usize, out: &mut Vec<LogicBit>) {
+    for shift in 0..width {
+        out.push(if value & (1 << shift) == 0 {
+            LogicBit::Zero
+        } else {
+            LogicBit::One
+        });
+    }
 }
 
 fn extension_bit(digit: char) -> LogicBit {
