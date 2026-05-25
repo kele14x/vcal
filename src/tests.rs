@@ -3463,6 +3463,37 @@ fn itor_nan_and_infinity_collapse_to_zero() {
     );
 }
 
+// $itor on an integer-typed operand must surface ±∞ when the magnitude
+// exceeds f64 range — that's what `BigInt::to_f64` produces. The earlier
+// implementation routed every $itor through real→int→real, which
+// collapsed those infinities back to 0.0 (since ±∞ has no integer image)
+// and silently discarded the value.
+#[test]
+fn itor_oversized_integer_saturates_to_infinity() {
+    let huge_pos = format!("$itor(1{})", "0".repeat(309));
+    assert_eq!(
+        evaluate_input(&huge_pos)
+            .expect("$itor 10**309")
+            .output,
+        "inf"
+    );
+    let huge_neg = format!("$itor(-1{})", "0".repeat(309));
+    assert_eq!(
+        evaluate_input(&huge_neg)
+            .expect("$itor -10**309")
+            .output,
+        "-inf"
+    );
+    // 10**308 is still within f64 range — the boundary stays representable.
+    let in_range = format!("$itor(1{})", "0".repeat(308));
+    assert_eq!(
+        evaluate_input(&in_range)
+            .expect("$itor 10**308")
+            .output,
+        "1.0e+308"
+    );
+}
+
 // LRM 17.8: $realtobits exposes the IEEE 754 binary64 bit pattern as a
 // 64-bit unsigned vector. The reference values come from the standard
 // encodings — 1.0 = 0x3FF0...0, +0.0 = all zeros, -1.0 = 0xBFF0...0.

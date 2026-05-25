@@ -236,23 +236,31 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
         }
         Expr::RealConversion { kind, arg } => match kind {
             RealConversionKind::IntegerToReal => {
-                // LRM 17.8 + §3.5.3: argument is logically integer, so a
-                // real operand goes through implicit real→integer→real. The
-                // implicit real→integer step rounds to the nearest integer
-                // with ties away from zero (§3.5.3), so e.g. $itor(-2.6) is
-                // -3.0, not -2.0 (which is what $rtoi's truncation gives).
-                // For an integer-typed operand, evaluate_expr_as_real returns
-                // an already-integer-valued f64 (with x/z → 0 per §3.5.3),
-                // and the round step is a no-op on it.
+                // LRM 17.8 + §3.5.3: a real operand goes through implicit
+                // real→integer→real. The implicit real→integer step rounds
+                // to nearest with ties away from zero (§3.5.3), so e.g.
+                // $itor(-2.6) is -3.0, not -2.0 (which is what $rtoi's
+                // truncation gives). NaN / ±∞ have no integer image, so
+                // `real_to_integer_bigint` returns `None` — matching the
+                // rule $rtoi already documents. §3.5.3's int→real then maps
+                // every x bit to 0, so the chain collapses to 0.0, keeping
+                // $itor self-consistent with $rtoi.
                 //
-                // NaN / ±∞ have no integer image, so `real_to_integer_bigint`
-                // returns `None` — matching the rule $rtoi already documents.
-                // §3.5.3's int→real then maps every x bit to 0, so the chain
-                // collapses to 0.0, keeping $itor self-consistent with $rtoi.
-                let real_val = evaluate_expr_as_real(arg)?;
-                match real_to_integer_bigint(real_val) {
-                    Some(bigint) => Ok(bigint.to_f64().expect("BigInt::to_f64 is total")),
-                    None => Ok(0.0),
+                // An integer-typed operand must skip that round-trip: when
+                // the magnitude exceeds f64 range, `integer_value_to_f64`
+                // saturates to ±∞ (BigInt::to_f64's documented behavior),
+                // and routing that ±∞ back through real→integer would
+                // collapse it to 0.0 — destroying the value the conversion
+                // was supposed to surface.
+                if expression_is_real(arg) {
+                    let real_val = evaluate_expr_as_real(arg)?;
+                    match real_to_integer_bigint(real_val) {
+                        Some(bigint) => Ok(bigint.to_f64().expect("BigInt::to_f64 is total")),
+                        None => Ok(0.0),
+                    }
+                } else {
+                    let int_val = evaluate_expr_in_context(arg, None)?;
+                    Ok(integer_value_to_f64(&int_val))
                 }
             }
             RealConversionKind::BitsToReal => {
