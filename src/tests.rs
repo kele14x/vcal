@@ -2799,6 +2799,102 @@ fn rejects_sign_cast_missing_parenthesis() {
     assert_eq!(missing_close, "expected `)` after $signed argument");
 }
 
+// vcal-specific display-base casts: `$bin` / `$oct` / `$dec` / `$hex` change
+// only the `Base` field — width, signedness, and bits pass through unchanged.
+
+#[test]
+fn base_casts_change_display_base_in_each_direction() {
+    assert_eq!(evaluate_input("$bin(4'hf)").expect("bin").output, "4'b1111");
+    assert_eq!(
+        evaluate_input("$hex(4'b1010)").expect("hex").output,
+        "4'ha"
+    );
+    assert_eq!(
+        evaluate_input("$oct(8'b11110000)").expect("oct").output,
+        "8'o360"
+    );
+    assert_eq!(
+        evaluate_input("$dec(4'b1010)").expect("dec").output,
+        "4'd10"
+    );
+}
+
+#[test]
+fn base_cast_preserves_width_and_signedness() {
+    // Signed input survives the cast: the binary form keeps the `s` flag.
+    let signed_bin = evaluate_input("$bin(-4'sd1)").expect("signed bin");
+    assert_eq!(signed_bin.output, "4'sb1111");
+
+    // Negative signed-decimal rendering still applies after the cast — the
+    // cast preserves signedness, so the dedicated signed-decimal branch fires.
+    let signed_dec = evaluate_input("$dec(4'sb1111)").expect("signed dec");
+    assert_eq!(signed_dec.output, "-4'sd1");
+
+    // Unsigned input stays unsigned.
+    let unsigned_hex = evaluate_input("$hex(4'b1010)").expect("unsigned hex");
+    assert_eq!(unsigned_hex.output, "4'ha");
+}
+
+#[test]
+fn base_cast_propagates_outer_context_width() {
+    // `8'h1` is 8 bits; `+ 16'b0` widens the propagated context to 16 bits.
+    // The cast result extends per the outer context (zero-extend, since the
+    // outer is unsigned), and the leftmost-base rule keeps binary display.
+    let widened = evaluate_input("$bin(8'h1) + 16'b0").expect("widened");
+    assert_eq!(widened.output, "16'b0000000000000001");
+}
+
+#[test]
+fn base_casts_chain_and_are_idempotent() {
+    assert_eq!(
+        evaluate_input("$hex($bin(4'b1111))").expect("chain").output,
+        "4'hf"
+    );
+    assert_eq!(
+        evaluate_input("$bin($hex(4'd5))").expect("chain").output,
+        "4'b0101"
+    );
+}
+
+#[test]
+fn base_cast_passes_unknown_bits_through() {
+    let bin_x = evaluate_input("$bin(4'hX)").expect("x bits");
+    let hex_z = evaluate_input("$hex(4'b10z1)").expect("z bits");
+
+    assert_eq!(bin_x.output, "4'bxxxx");
+    assert_eq!(hex_z.output, "4'hz");
+}
+
+#[test]
+fn base_cast_locks_in_width_so_concatenation_accepts_unsized_arg() {
+    // `1` is an unsized literal — bare `{1, 4'b0}` would be rejected as
+    // indefinite width. Wrapping it in `$bin` locks in the 32-bit width and
+    // makes the concatenation legal.
+    let concat = evaluate_input("{$bin(1), 4'b0}").expect("concat");
+    assert_eq!(
+        concat.output,
+        "36'b000000000000000000000000000000010000"
+    );
+}
+
+#[test]
+fn rejects_base_cast_on_real() {
+    let err = evaluate_input("$bin(1.5)").expect_err("real arg");
+    assert_eq!(err, "$bin argument cannot be real");
+
+    let err = evaluate_input("$hex(2.0)").expect_err("real arg");
+    assert_eq!(err, "$hex argument cannot be real");
+}
+
+#[test]
+fn rejects_base_cast_missing_parenthesis() {
+    let missing_open = evaluate_input("$bin 1").expect_err("missing `(` should error");
+    let missing_close = evaluate_input("$bin(1").expect_err("missing `)` should error");
+
+    assert_eq!(missing_open, "expected `(` after $bin");
+    assert_eq!(missing_close, "expected `)` after $bin argument");
+}
+
 // LRM §3.5.2 examples — accepted real-number forms.
 #[test]
 fn parses_real_decimal_forms() {

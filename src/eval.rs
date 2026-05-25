@@ -91,7 +91,10 @@ fn expression_is_real(expr: &Expr) -> bool {
             else_expr,
             ..
         } => expression_is_real(then_expr) || expression_is_real(else_expr),
-        Expr::Concatenation { .. } | Expr::Replication { .. } | Expr::SignCast { .. } => false,
+        Expr::Concatenation { .. }
+        | Expr::Replication { .. }
+        | Expr::SignCast { .. }
+        | Expr::BaseCast { .. } => false,
         // LRM 17.8: $itor and $bitstoreal yield real values; $rtoi and
         // $realtobits yield integers (32-bit signed and 64-bit unsigned
         // respectively), so only the first two participate in real-result
@@ -233,6 +236,9 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
         }
         Expr::SignCast { .. } => {
             unreachable!("$signed/$unsigned never has real result type")
+        }
+        Expr::BaseCast { .. } => {
+            unreachable!("$bin/$oct/$dec/$hex never has real result type")
         }
         Expr::RealConversion { kind, arg } => match kind {
             RealConversionKind::IntegerToReal => {
@@ -427,6 +433,7 @@ fn evaluate_expr_in_context(
         Expr::Concatenation { items } => evaluate_concatenation_expr(items, context),
         Expr::Replication { count, items } => evaluate_replication_expr(count, items, context),
         Expr::SignCast { signed, arg } => evaluate_sign_cast_expr(*signed, arg, context),
+        Expr::BaseCast { base, arg } => evaluate_base_cast_expr(*base, arg, context),
         Expr::RealConversion { kind, arg } => evaluate_real_conversion_expr(*kind, arg, context),
         Expr::MathFunction { kind, args } => evaluate_math_function_expr(*kind, args, context),
         Expr::SystemTask { name } => Err(task_in_expression_error(name)),
@@ -533,6 +540,18 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
                 width: arg_meta.width,
                 signed: *signed,
                 base: arg_meta.base,
+            })
+        }
+        // vcal-specific display-base cast: width and signedness come from the
+        // argument; only the inferred base flips to the cast's target so the
+        // leftmost-base propagation rule sees the cast's base, not the
+        // argument's.
+        Expr::BaseCast { base, arg } => {
+            let arg_meta = infer_expr_meta(arg)?;
+            Ok(ExprMeta {
+                width: arg_meta.width,
+                signed: arg_meta.signed,
+                base: *base,
             })
         }
         // LRM 17.8: $rtoi yields a 32-bit signed integer; $realtobits
@@ -1444,6 +1463,9 @@ fn is_indefinite_width(expr: &Expr) -> bool {
         // `$signed`/`$unsigned` lock in the argument's evaluated width, so
         // the cast result is always sized regardless of the argument shape.
         Expr::SignCast { .. } => false,
+        // `$bin`/`$oct`/`$dec`/`$hex` lock in width the same way — they only
+        // change the display base, never the bit count.
+        Expr::BaseCast { .. } => false,
         // $rtoi / $realtobits have fixed result widths (32 / 64); the
         // real-result conversions never reach width-sensitive paths.
         Expr::RealConversion { .. } => false,
@@ -1659,6 +1681,43 @@ fn evaluate_sign_cast_expr(
         arg_value.bits,
     );
     Ok(extend_cast_to_outer_context(cast_value, context))
+}
+
+// vcal-specific display-base cast (`$bin` / `$oct` / `$dec` / `$hex`).
+// Mirrors `evaluate_sign_cast_expr`: argument is evaluated self-determined,
+// width/signedness/bits pass through unchanged, only the `Base` field is
+// overridden. Outer-context width still flows back through the cast result
+// per §5.5.2 via `extend_cast_to_outer_context` — the same shape the sign
+// casts use, so chained casts and arithmetic on the cast result behave
+// consistently. Real arguments are rejected (a real has no display base).
+fn evaluate_base_cast_expr(
+    base: Base,
+    arg: &Expr,
+    context: Option<ExprMeta>,
+) -> Result<IntegerValue, String> {
+    if expression_is_real(arg) {
+        return Err(format!(
+            "{} argument cannot be real",
+            base_cast_name(base)
+        ));
+    }
+    let arg_value = evaluate_expr_in_context(arg, None)?;
+    let cast_value = IntegerValue::computed(
+        arg_value.width,
+        arg_value.signed,
+        base,
+        arg_value.bits,
+    );
+    Ok(extend_cast_to_outer_context(cast_value, context))
+}
+
+fn base_cast_name(base: Base) -> &'static str {
+    match base {
+        Base::Binary => "$bin",
+        Base::Octal => "$oct",
+        Base::Decimal => "$dec",
+        Base::Hex => "$hex",
+    }
 }
 
 // LRM 17.8: dispatch the integer-result real conversions ($rtoi and
@@ -1903,6 +1962,7 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
         | Expr::Concatenation { .. }
         | Expr::Replication { .. }
         | Expr::SignCast { .. }
+        | Expr::BaseCast { .. }
         | Expr::RealConversion { .. }
         | Expr::MathFunction { .. } => {
             value_to_math_bigint(evaluate_expr_in_context(expr, None)?)

@@ -54,6 +54,15 @@ pub(crate) enum Expr {
         signed: bool,
         arg: Box<Expr>,
     },
+    // vcal-specific (non-LRM) display-base cast: `$bin(e)`, `$oct(e)`,
+    // `$dec(e)`, `$hex(e)`. The argument is evaluated as a self-determined
+    // expression; the result has the same width, signedness, and bits but
+    // with the display base set to `base`. Outer-context width still flows
+    // back through it (handled in eval), mirroring `SignCast`.
+    BaseCast {
+        base: Base,
+        arg: Box<Expr>,
+    },
     // LRM 17.8: real-conversion system functions. Each maps between the
     // integer and real domains with a specific semantic — see
     // RealConversionKind for the four variants.
@@ -607,17 +616,22 @@ impl<'a> Parser<'a> {
 
         enum SystemFn {
             SignCast(bool),
+            BaseCast(Base),
             RealConversion(RealConversionKind),
             MathFunction(MathFunctionKind),
         }
 
-        // $signed/$unsigned and the four real-conversion casts are listed
-        // explicitly here; everything else falls through to the
-        // MATH_FUNCTIONS table so a new math function only needs adding
+        // $signed/$unsigned, the four base casts, and the four real-conversion
+        // casts are listed explicitly here; everything else falls through to
+        // the MATH_FUNCTIONS table so a new math function only needs adding
         // there. `from_name` is the inverse of `MathFunctionKind::name()`.
         let kind = match name {
             "$signed" => SystemFn::SignCast(true),
             "$unsigned" => SystemFn::SignCast(false),
+            "$bin" => SystemFn::BaseCast(Base::Binary),
+            "$oct" => SystemFn::BaseCast(Base::Octal),
+            "$dec" => SystemFn::BaseCast(Base::Decimal),
+            "$hex" => SystemFn::BaseCast(Base::Hex),
             "$rtoi" => SystemFn::RealConversion(RealConversionKind::RealToInteger),
             "$itor" => SystemFn::RealConversion(RealConversionKind::IntegerToReal),
             "$realtobits" => SystemFn::RealConversion(RealConversionKind::RealToBits),
@@ -668,6 +682,10 @@ impl<'a> Parser<'a> {
         Ok(match kind {
             SystemFn::SignCast(signed) => Expr::SignCast {
                 signed,
+                arg: Box::new(arg),
+            },
+            SystemFn::BaseCast(base) => Expr::BaseCast {
+                base,
                 arg: Box::new(arg),
             },
             SystemFn::RealConversion(kind) => Expr::RealConversion {

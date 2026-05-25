@@ -128,6 +128,11 @@ This is final support target matrix, not means currently supported or implemente
     - [ ] Sign-cast functions
       - [x] `$signed`
       - [x] `$unsigned`
+    - [ ] Display-base cast functions
+      - [x] `$bin`
+      - [x] `$oct`
+      - [x] `$dec`
+      - [x] `$hex`
     - [ ] Conversion functions
       - [x] `$rtoi`
       - [x] `$itor`
@@ -441,3 +446,11 @@ vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same f
 ### Conditional operator
 
 vcal deliberately diverges from LRM Table 5-21 on the ambiguous-cond merge. The strict table reduces *every* combination other than `(0,0)` and `(1,1)` to `x` — including `(x,x)` and `(z,z)`. iverilog (and most other simulators) instead use the value-preserving rule above, on the principle that if both branches put the same `x` (or `z`) at the same position regardless of cond, the result is necessarily that bit and reducing it to `x` would discard information. So `1'bx ? 4'b01xz : 4'b01xz` is `4'b01xz` here (and in iverilog), not the `4'b01xx` the LRM table prescribes. vcal follows iverilog as the practical reference.
+
+### Display-base cast functions
+
+vcal adds four non-standard system functions — `$bin`, `$oct`, `$dec`, `$hex` — that change only the display base of an integer expression. The argument is evaluated as a self-determined expression; the result has the same width, signedness, and bits, with `Base` overridden to the cast's target. Outer-context width still flows back through the cast per §5.5.2 (same shape as `$signed` / `$unsigned`). Real arguments are rejected — reals have no display base.
+
+These exist so users do not need tricks like `1'b0 + 1` to render `1` in binary; `$bin(1)` does the job directly.
+
+Because the argument is evaluated self-determined, the cast acts as a context barrier — outer-context width does *not* flow into the argument. So `$hex(4'hf + 4'hf) + 8'h0` is `8'h0e` (the inner `+` overflows at 4 bits, then extends), while the un-cast `(4'hf + 4'hf) + 8'h0` is `8'h1e` (the outer 8-bit context widens the inner `+` before computing). This matches the §5.5 self-determined-argument rule already used by `$signed` / `$unsigned` and is not specific to the display-base casts.

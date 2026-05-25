@@ -33,6 +33,7 @@ What works:
   - Concatenation `{a, b, ...}` and replication `{N{...}}`
 - System functions:
   - Sign casts (LRM 5.5): `$signed`, `$unsigned`
+  - Display-base casts (vcal-specific): `$bin`, `$oct`, `$dec`, `$hex`
   - Real conversions (LRM 17.7.1): `$rtoi`, `$itor`, `$realtobits`, `$bitstoreal`
   - Math (LRM 17.11): `$clog2`; `$ln`, `$log10`, `$exp`, `$sqrt`, `$pow`, `$floor`, `$ceil`, `$sin`, `$cos`, `$tan`, `$asin`, `$acos`, `$atan`, `$atan2`, `$hypot`, `$sinh`, `$cosh`, `$tanh`, `$asinh`, `$acosh`, `$atanh`
 
