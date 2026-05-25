@@ -4366,6 +4366,13 @@ fn reg_decl_rejects_x_range_endpoint() {
 }
 
 #[test]
+fn reg_decl_rejects_range_width_that_overflows_usize() {
+    let input = format!("reg [{}:0] a", usize::MAX);
+    let err = evaluate_input(&input).expect_err("overflowing width should be rejected");
+    assert_eq!(err, "reg range width too large");
+}
+
+#[test]
 fn session_state_persists_across_eval_calls() {
     // The plan's "declare in one call, assign in another, read in a third"
     // scenario: each step is a separate `eval` so the session state is the

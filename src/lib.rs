@@ -150,7 +150,8 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
 // integer expression, evaluated in the current session so a prior reg can
 // be referenced (and immediately rejected because its bits are x). Negative
 // or x/z half values are rejected up-front; the width is |msb - lsb| + 1,
-// matching LRM 4.8's reversed-range tolerance.
+// matching LRM 4.8's reversed-range tolerance. If that width would exceed
+// addressable `usize`, surface a normal error instead of overflowing.
 fn compute_decl_width(
     msb_expr: &Expr,
     lsb_expr: &Expr,
@@ -159,7 +160,8 @@ fn compute_decl_width(
     let msb = evaluate_range_endpoint(msb_expr, session, "msb")?;
     let lsb = evaluate_range_endpoint(lsb_expr, session, "lsb")?;
     let diff = if msb >= lsb { msb - lsb } else { lsb - msb };
-    Ok(diff + 1)
+    diff.checked_add(1)
+        .ok_or_else(|| "reg range width too large".to_string())
 }
 
 fn evaluate_range_endpoint(
