@@ -31,7 +31,7 @@ This is final support target matrix, not means currently supported or implemente
   - [x] 4.1 Value set
   - [x] 4.2 Nets and variables
     - [x] 4.2.1 Net declarations
-    - [ ] 4.2.2 Variable declarations
+    - [x] 4.2.2 Variable declarations (reg only; integer/real/time deferred)
   - [x] 4.3 Vectors
   - [ ] 4.4 Strengths
   - [ ] 4.5 Implicit declarations
@@ -216,7 +216,7 @@ This is final support target matrix, not means currently supported or implemente
       - [ ] A.2.1.3 Type declarations
         - [ ] integer_declaration ::= integer list_of_variable_identifiers ;
         - [ ] real_declaration ::= real list_of_real_identifiers ;
-        - [ ] reg_declaration ::= reg [ signed ] [ range ] list_of_variable_identifiers ;
+        - [x] reg_declaration ::= reg [ signed ] [ range ] list_of_variable_identifiers ;
         - [ ] time_declaration ::= time list_of_variable_identifiers ;
     - [ ] A.2.2 Declaration data types
       - [ ] A.2.2.1 Net and variable types
@@ -226,16 +226,16 @@ This is final support target matrix, not means currently supported or implemente
                               | variable_identifier = constant_expression
     - [ ] A.2.3 Declaration lists
       - [ ] list_of_real_identifiers ::= real_type { , real_type }
-      - [ ] list_of_variable_identifiers ::= variable_type { , variable_type }
+      - [x] list_of_variable_identifiers ::= variable_type { , variable_type }
     - [ ] A.2.5 Declaration ranges
       - [ ] dimension ::= [ dimension_constant_expression : dimension_constant_expression ]
-      - [ ] range ::= [ msb_constant_expression : lsb_constant_expression ]
+      - [x] range ::= [ msb_constant_expression : lsb_constant_expression ]
   - [ ] A.6 Behavioral statements
-    - [ ] A.6.2 Procedural blocks and assignments
-      - [ ] blocking_assignment ::= variable_lvalue = expression
+    - [x] A.6.2 Procedural blocks and assignments
+      - [x] blocking_assignment ::= variable_lvalue = expression
       - [ ] variable_assignment ::= variable_lvalue = expression
-    - [ ] A.6.4 Statements
-      - [ ] statement ::= blocking_assignment ;
+    - [x] A.6.4 Statements
+      - [x] statement ::= blocking_assignment ;
   - [ ] A.8 Expression
     - [ ] A.8.1 Concatenations
       - [ ] concatenation ::= { expression { , expression } }
@@ -331,22 +331,22 @@ This is final support target matrix, not means currently supported or implemente
   - A.9 General
     - A.9.3 Identifiers
       - [ ] escaped_identifier ::= \ { Any_ASCII_character_except_white_space } white_space
-      - [ ] identifier ::= simple_identifier
+      - [x] identifier ::= simple_identifier
                          | escaped_identifier
       - [ ] real_identifier ::= identifier
-      - [ ] simple_identifier ::= [ a-zA-Z_ ] { [ a-zA-Z0-9_$ ] }
-      - [ ] system_function_identifier ::= $[ a-zA-Z0-9_$ ]{ [ a-zA-Z0-9_$ ] }
-      - [ ] system_task_identifier ::= $[ a-zA-Z0-9_$ ]{ [ a-zA-Z0-9_$ ] }
-      - [ ] variable_identifier ::= identifier
+      - [x] simple_identifier ::= [ a-zA-Z_ ] { [ a-zA-Z0-9_$ ] }
+      - [x] system_function_identifier ::= $[ a-zA-Z0-9_$ ]{ [ a-zA-Z0-9_$ ] }
+      - [x] system_task_identifier ::= $[ a-zA-Z0-9_$ ]{ [ a-zA-Z0-9_$ ] }
+      - [x] variable_identifier ::= identifier
     - [ ] A.9.4 White space
       - [ ] white_space ::= space | tab | newline | eof
 
 - [ ] Supported Keyword
   - [ ] integer
   - [ ] real
-  - [ ] reg
+  - [x] reg
   - [ ] integer
-  - [ ] signed
+  - [x] signed
 
 ## Main Gap
 
@@ -403,11 +403,56 @@ The base of an arithmetic result is inferred from its operands so the output kee
 The declarations and assignments persist across REPL session. For example:
 
 ```plain
-In[0]: integer a = 3
-Out[0]: 3
-In[1]: a + 2
-Out[1]: 5
+In[0]: reg [7:0] a
+Out[0]:
+In[1]: a = 4'hF + 4'hF
+Out[1]: 8'b00011110
+In[2]: a + 4'b1
+Out[2]: 8'b00011111
 ```
+
+### Reg variables and blocking assignment
+
+The only variable type vcal currently declares is `reg` (LRM A.2.1.3):
+
+```text
+reg [signed] [range] name { , name }
+```
+
+- The display base for a reg is binary, so a reg renders as
+  `<width>'b<digits>` (signed: `<width>'sb<digits>`). `reg [7:0] a` reads
+  back as `8'bxxxxxxxx` before any assignment.
+- An unsized decl is 1 bit (`reg a` → `1'bx`).
+- Range halves are constant integer expressions evaluated in the current
+  session at decl time; they must be non-negative and free of x/z bits.
+  A reversed range (`reg [0:7] a`) yields the same width as its normal
+  form per LRM 4.8.
+- Multiple names can share one decl: `reg [3:0] a, b, c`.
+- Redeclaring an existing identifier in the same session replaces the
+  prior binding — the REPL is single-scope and a redecl is the user's way
+  of resetting a reg's metadata, so the new decl wipes the old width,
+  signedness, base, and bit pattern. The freshly redeclared reg starts at
+  all `x` like any other new reg.
+- A fresh reg is initialized to all `x`. The decl statement emits an empty
+  `Out[n]:` line — the same convention `$finish` / `$stop` use for
+  non-value statements.
+
+Blocking assignment `name = expression` is a top-level statement, not an
+expression (LRM A.6.2), so it does not nest inside larger expressions.
+The LHS reg's width, signedness, and base flow into the RHS via the
+standard §5.6 context rules, then the resulting bits replace the reg's
+bits while the reg's declared metadata is preserved. A real-typed RHS
+goes through an implicit real→integer conversion per LRM §3.5.3 (round
+to nearest, ties away from zero — the same rule `$itor`'s internal
+real→int step uses); NaN / ±∞ have no integer image and surface as the
+lvalue filled with x bits at its declared width. `Out[n]:` prints the
+reg's new canonical form in its own display base.
+
+An identifier reference resolves to the reg's current bits and then
+participates in the surrounding expression like any other primary — its
+`(width, signed, base)` propagates per §5.5 (so e.g. an 8-bit binary reg
+on the left of `+` makes the result render in binary). Referencing an
+undeclared name is an error.
 
 ## Non-standard Behavior
 

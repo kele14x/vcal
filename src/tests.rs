@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use crate::lexer::{Token, tokenize};
 use crate::parser::{BinaryOp, Expr, UnaryOp, parse_expression, parse_integer};
-use crate::{evaluate_input, run_repl};
+use crate::{Session, evaluate_input, run_repl};
 
 #[test]
 fn evaluates_unsized_decimal() {
@@ -1663,8 +1663,8 @@ fn reduction_nand_nor_rejected_as_binary() {
     let nand = evaluate_input("4'd1 ~& 4'd1").expect_err("binary ~& rejected");
     let nor = evaluate_input("4'd0 ~| 4'd0").expect_err("binary ~| rejected");
 
-    assert_eq!(nand, "unexpected token after end of expression");
-    assert_eq!(nor, "unexpected token after end of expression");
+    assert_eq!(nand, "unexpected token after end of statement");
+    assert_eq!(nor, "unexpected token after end of statement");
 }
 
 #[test]
@@ -3340,18 +3340,12 @@ fn real_format_window_boundaries() {
 // LRM A.8.7: every digit-run grammar (unsigned_number,
 // non_zero_unsigned_number, *_value) starts with a digit (or x/z for the
 // based forms), never with an underscore. Before the fix, strip_underscores
-// ran before validation, so `_1` silently parsed as `1`, `_8'd5` as size 8,
-// `8'b_101` as binary 101, and `'d_x` as a decimal x-literal.
+// ran before validation, so `8'b_101` silently parsed as binary 101 and
+// `'d_x` as a decimal x-literal. (The unsized-decimal and size cases —
+// `_1`, `_8'd5` — now lex as identifiers under LRM 3.7.1 and surface
+// through the identifier / parser paths instead.)
 #[test]
 fn rejects_leading_underscore_in_number_literals() {
-    assert_eq!(
-        evaluate_input("_1").expect_err("unsized decimal"),
-        "number cannot start with underscore: _1"
-    );
-    assert_eq!(
-        evaluate_input("_8'd5").expect_err("size"),
-        "number cannot start with underscore: _8"
-    );
     assert_eq!(
         evaluate_input("8'b_101").expect_err("binary value"),
         "number cannot start with underscore: _101"
@@ -4163,4 +4157,224 @@ fn math_function_parser_errors() {
         evaluate_input("$clog2(1, 2)").expect_err("$clog2 2 args"),
         "$clog2 expects 1 argument, got 2"
     );
+}
+
+// `reg` declarations and blocking assignment — the smallest end-to-end
+// variable type. These tests cover decl forms (with / without range, signed,
+// reversed range, multi-name), default x-initialization, width/sign behavior
+// of blocking assignment, the binary display base for regs, error surfaces
+// for undeclared / redeclared identifiers and real RHS, and Session state
+// persistence across multiple `eval` calls.
+
+#[test]
+fn reg_decl_without_range_is_one_bit_unsigned() {
+    let mut session = Session::new();
+    assert!(session.eval("reg a").expect("decl").output.is_empty());
+    assert_eq!(session.eval("a").expect("read").output, "1'bx");
+}
+
+#[test]
+fn reg_decl_with_range_initializes_to_x() {
+    let mut session = Session::new();
+    assert!(session.eval("reg [7:0] a").expect("decl").output.is_empty());
+    assert_eq!(session.eval("a").expect("read").output, "8'bxxxxxxxx");
+}
+
+#[test]
+fn reg_signed_decl_renders_with_signed_marker() {
+    let mut session = Session::new();
+    assert!(
+        session
+            .eval("reg signed [7:0] a")
+            .expect("decl")
+            .output
+            .is_empty()
+    );
+    assert_eq!(session.eval("a").expect("read").output, "8'sbxxxxxxxx");
+}
+
+#[test]
+fn reg_decl_with_multiple_names_in_one_statement() {
+    let mut session = Session::new();
+    assert!(
+        session
+            .eval("reg [3:0] a, b, c")
+            .expect("decl")
+            .output
+            .is_empty()
+    );
+    assert_eq!(session.eval("a").expect("read a").output, "4'bxxxx");
+    assert_eq!(session.eval("b").expect("read b").output, "4'bxxxx");
+    assert_eq!(session.eval("c").expect("read c").output, "4'bxxxx");
+}
+
+#[test]
+fn reg_decl_with_reversed_range_yields_same_width() {
+    // LRM 4.8: a reversed `[lsb:msb]` is tolerated; width is |msb - lsb| + 1.
+    let mut session = Session::new();
+    session.eval("reg [0:7] a").expect("decl");
+    assert_eq!(session.eval("a").expect("read").output, "8'bxxxxxxxx");
+}
+
+#[test]
+fn reg_decl_with_constant_expression_range() {
+    let mut session = Session::new();
+    session.eval("reg [3+1:0] a").expect("decl");
+    assert_eq!(session.eval("a").expect("read").output, "5'bxxxxx");
+}
+
+#[test]
+fn reg_decl_produces_empty_out_line() {
+    // Mirrors the `$finish`/`$stop` empty-Out convention for non-value
+    // statements.
+    let evaluation = evaluate_input("reg [7:0] a").expect("decl");
+    assert_eq!(evaluation.output, "");
+    assert!(!evaluation.should_exit);
+}
+
+#[test]
+fn assignment_truncates_wider_rhs_to_reg_width() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a").expect("decl");
+    assert_eq!(session.eval("a = 8'hff").expect("assign").output, "4'b1111");
+}
+
+#[test]
+fn assignment_sign_extends_narrower_rhs_into_signed_reg() {
+    let mut session = Session::new();
+    session.eval("reg signed [7:0] a").expect("decl");
+    // Binary base is the reg's default display, so the sign-extended bits
+    // print in their per-position form rather than as signed decimal.
+    assert_eq!(
+        session.eval("a = 4'shf").expect("assign").output,
+        "8'sb11111111"
+    );
+}
+
+#[test]
+fn assignment_preserves_x_and_z_bits() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a").expect("decl");
+    assert_eq!(
+        session.eval("a = 4'b10xz").expect("assign").output,
+        "4'b10xz"
+    );
+}
+
+#[test]
+fn reg_value_participates_in_later_expression_with_its_own_base() {
+    // After storing 4'h0a into an 8-bit binary-base reg, `a + 4'b1` is
+    // evaluated with `a`'s metadata propagated (binary base wins from the
+    // leftmost operand, width = 8).
+    let mut session = Session::new();
+    session.eval("reg [7:0] a").expect("decl");
+    session.eval("a = 4'h0a").expect("assign");
+    assert_eq!(
+        session.eval("a + 4'b1").expect("expr").output,
+        "8'b00001011"
+    );
+}
+
+#[test]
+fn assignment_of_real_value_implicitly_converts_per_lrm_3_5_3() {
+    // LRM §3.5.3: implicit real→integer conversion rounds to nearest with
+    // ties away from zero — same rule `$itor`'s internal real→int step
+    // uses. So `1.5` rounds to 2, not truncates to 1.
+    let mut session = Session::new();
+    session.eval("reg [7:0] a").expect("decl");
+    assert_eq!(
+        session.eval("a = 1.5").expect("real RHS rounds").output,
+        "8'b00000010"
+    );
+    assert_eq!(
+        session.eval("a = -2.5").expect("ties away from zero").output,
+        "8'b11111101"
+    );
+    assert_eq!(
+        session.eval("a = 3.4").expect("rounds toward 3").output,
+        "8'b00000011"
+    );
+}
+
+#[test]
+fn assignment_of_nan_or_infinity_real_fills_lvalue_with_x_bits() {
+    // NaN / ±∞ have no integer image (`$rtoi` returns 32 bits of x for
+    // these). For an assignment lvalue we surface that "no defined
+    // integer" by filling the reg's declared width with x.
+    let mut session = Session::new();
+    session.eval("reg [3:0] a").expect("decl");
+    assert_eq!(
+        session.eval("a = 0.0/0.0").expect("NaN").output,
+        "4'bxxxx"
+    );
+    assert_eq!(
+        session.eval("a = 1.0/0.0").expect("+inf").output,
+        "4'bxxxx"
+    );
+}
+
+#[test]
+fn reading_undeclared_identifier_is_an_error() {
+    let mut session = Session::new();
+    let err = session
+        .eval("b + 1")
+        .expect_err("undeclared identifier should be rejected");
+    assert_eq!(err, "undeclared identifier: b");
+}
+
+#[test]
+fn assigning_to_undeclared_identifier_is_an_error() {
+    let mut session = Session::new();
+    let err = session
+        .eval("b = 1")
+        .expect_err("assignment to undeclared should be rejected");
+    assert_eq!(err, "undeclared identifier: b");
+}
+
+#[test]
+fn redeclaration_replaces_the_previous_binding() {
+    // The REPL is single-scope and a redecl is the user's way of resetting
+    // a reg's metadata. The new decl wipes width / signed / base / value;
+    // the new reg starts at all-x just like a fresh one.
+    let mut session = Session::new();
+    session.eval("reg [7:0] a").expect("first decl");
+    session.eval("a = 8'h2a").expect("populate");
+    assert_eq!(session.eval("a").expect("read").output, "8'b00101010");
+    session.eval("reg [3:0] a").expect("redecl narrower");
+    assert_eq!(
+        session.eval("a").expect("read after redecl").output,
+        "4'bxxxx"
+    );
+}
+
+#[test]
+fn reg_decl_rejects_negative_range_endpoint() {
+    let err = evaluate_input("reg [-1:0] a").expect_err("negative range should be rejected");
+    assert!(
+        err.contains("range") && err.contains("non-negative"),
+        "error should mention range and non-negative, got: {err}"
+    );
+}
+
+#[test]
+fn reg_decl_rejects_x_range_endpoint() {
+    let err = evaluate_input("reg ['bx:0] a").expect_err("x range should be rejected");
+    assert!(
+        err.contains("range") && err.contains("unknown"),
+        "error should mention range and unknown bits, got: {err}"
+    );
+}
+
+#[test]
+fn session_state_persists_across_eval_calls() {
+    // The plan's "declare in one call, assign in another, read in a third"
+    // scenario: each step is a separate `eval` so the session state is the
+    // only thing carrying `a` between them.
+    let mut session = Session::new();
+    session.eval("reg [7:0] a").expect("decl");
+    assert_eq!(
+        session.eval("a = 4'hF + 4'hF").expect("assign").output,
+        "8'b00011110"
+    );
+    assert_eq!(session.eval("a").expect("read").output, "8'b00011110");
 }

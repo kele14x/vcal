@@ -95,6 +95,36 @@ pub(crate) enum Expr {
     SystemTask {
         name: String,
     },
+    // LRM A.8.3: a simple identifier as a `primary` — a reference to a
+    // previously-declared `reg` (the only variable type vcal currently
+    // supports). The evaluator looks it up in the active `Session`; an
+    // unknown name surfaces as "undeclared identifier: <name>".
+    Identifier(String),
+}
+
+// Top-level inputs. A REPL line / piped script segment between semicolons is
+// one `Stmt`. Expressions still drive the evaluator, but declarations and
+// blocking assignments mutate the session rather than producing a value.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Stmt {
+    Expr(Expr),
+    // LRM A.2.1.3: `reg [signed] [range] list_of_variable_identifiers ;`
+    // (no init form — that grammar belongs to `integer`/`real`). `range` is
+    // `Some((msb_expr, lsb_expr))` and constant-evaluated at apply time.
+    Decl {
+        signed: bool,
+        range: Option<(Expr, Expr)>,
+        names: Vec<String>,
+    },
+    // LRM A.6.2 `blocking_assignment`. Only the variable-name LHS form is
+    // supported; bit-/part-select LHSs are out of scope for this round.
+    Assign {
+        name: String,
+        rhs: Expr,
+    },
+    // LRM 17.4: `$finish` / `$stop` hoisted to the statement level so the
+    // driver can exit without going through the expression evaluator.
+    Task(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,7 +292,7 @@ pub(crate) fn parse_expression(input: &str) -> Result<Expr, String> {
     Ok(expression)
 }
 
-pub(crate) fn parse_expressions(input: &str) -> Result<Vec<Expr>, String> {
+pub(crate) fn parse_statements(input: &str) -> Result<Vec<Stmt>, String> {
     let tokens = tokenize(input)?;
 
     let segments: Vec<&[Token]> = tokens
@@ -274,25 +304,112 @@ pub(crate) fn parse_expressions(input: &str) -> Result<Vec<Expr>, String> {
         return Ok(Vec::new());
     }
 
-    let mut exprs = Vec::with_capacity(segments.len());
+    let mut stmts = Vec::with_capacity(segments.len());
     for segment in segments {
         let mut parser = Parser {
             tokens: segment,
             index: 0,
         };
-        let expr = parser.parse_expression()?;
+        let stmt = parser.parse_statement()?;
         if parser.peek().is_some() {
-            return Err("unexpected token after end of expression".to_string());
+            return Err("unexpected token after end of statement".to_string());
         }
-        exprs.push(expr);
+        stmts.push(stmt);
     }
 
-    Ok(exprs)
+    Ok(stmts)
 }
 
 impl<'a> Parser<'a> {
     fn parse_expression(&mut self) -> Result<Expr, String> {
         self.parse_conditional()
+    }
+
+    // Statement-level dispatch (LRM A.2.1.3 reg decl / A.6.2 blocking
+    // assignment / expression as a calculator line). Keyword recognition is
+    // string-based on `Token::Identifier`; with only two keywords (`reg`,
+    // `signed`) a dedicated `Token::Keyword` would be premature.
+    fn parse_statement(&mut self) -> Result<Stmt, String> {
+        if matches!(self.peek(), Some(Token::Identifier(name)) if name == "reg") {
+            self.index += 1;
+            return self.parse_decl();
+        }
+
+        // Blocking assignment: bare identifier followed by `=`. Anything
+        // more elaborate (bit-select LHS etc.) falls through to the
+        // expression path and surfaces a parse error there.
+        if let (Some(Token::Identifier(_)), Some(Token::Assign)) =
+            (self.tokens.get(self.index), self.tokens.get(self.index + 1))
+        {
+            let name = match self.next() {
+                Some(Token::Identifier(n)) => n.clone(),
+                _ => unreachable!("guarded above"),
+            };
+            self.index += 1; // consume `=`
+            let rhs = self.parse_expression()?;
+            return Ok(Stmt::Assign { name, rhs });
+        }
+
+        let expr = self.parse_expression()?;
+        // Hoist a top-level system task (or one wrapped in redundant
+        // parentheses) so the driver can exit without invoking the
+        // expression evaluator's task-in-expression rejection.
+        if let Some(name) = top_level_task_name(&expr) {
+            return Ok(Stmt::Task(name));
+        }
+        Ok(Stmt::Expr(expr))
+    }
+
+    fn parse_decl(&mut self) -> Result<Stmt, String> {
+        let signed = if matches!(self.peek(), Some(Token::Identifier(n)) if n == "signed") {
+            self.index += 1;
+            true
+        } else {
+            false
+        };
+
+        let range = if matches!(self.peek(), Some(Token::LBracket)) {
+            self.index += 1;
+            let msb = self.parse_expression()?;
+            match self.next() {
+                Some(Token::Colon) => {}
+                _ => return Err("expected `:` in reg range".to_string()),
+            }
+            let lsb = self.parse_expression()?;
+            match self.next() {
+                Some(Token::RBracket) => {}
+                _ => return Err("expected `]` after reg range".to_string()),
+            }
+            Some((msb, lsb))
+        } else {
+            None
+        };
+
+        let mut names = Vec::new();
+        loop {
+            let name = match self.next() {
+                Some(Token::Identifier(n)) => n.clone(),
+                _ => return Err("expected identifier in reg declaration".to_string()),
+            };
+            if matches!(name.as_str(), "reg" | "signed") {
+                return Err(format!("`{name}` cannot be used as a reg name"));
+            }
+            if names.iter().any(|existing: &String| existing == &name) {
+                return Err(format!("duplicate name in reg declaration: {name}"));
+            }
+            names.push(name);
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.index += 1;
+                continue;
+            }
+            break;
+        }
+
+        Ok(Stmt::Decl {
+            signed,
+            range,
+            names,
+        })
     }
 
     // LRM Table 5-4: `?:` sits below `||`, above the lowest level.
@@ -586,6 +703,7 @@ impl<'a> Parser<'a> {
                 let name = name.clone();
                 self.parse_system_function_call(&name)
             }
+            Some(Token::Identifier(name)) => Ok(Expr::Identifier(name.clone())),
             Some(Token::LParen) => {
                 let expr = self.parse_expression()?;
                 match self.next() {
@@ -790,6 +908,19 @@ impl<'a> Parser<'a> {
             self.index += 1;
         }
         token
+    }
+}
+
+// LRM 17.4: `$finish` / `$stop` are statements that exit. The parser
+// produces `Expr::SystemTask` for them so identifier dispatch is uniform;
+// this helper hoists a top-level task (optionally wrapped in redundant
+// parentheses) up to the `Stmt::Task` layer so the driver can exit before
+// the expression evaluator's task-in-expression rule fires.
+fn top_level_task_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Grouped(inner) => top_level_task_name(inner),
+        Expr::SystemTask { name } => Some(name.clone()),
+        _ => None,
     }
 }
 

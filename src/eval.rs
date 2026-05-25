@@ -1,6 +1,7 @@
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
 
+use crate::Session;
 use crate::parser::{BinaryOp, Expr, MathFunctionKind, RealConversionKind, UnaryOp};
 use crate::value::{
     Base, IntegerValue, LogicBit, Value, bits_to_biguint, bitwise_and_bits, bitwise_not_bit,
@@ -17,13 +18,60 @@ struct ExprMeta {
     base: Base,
 }
 
-pub(crate) fn evaluate_expr(expr: &Expr) -> Result<Value, String> {
+pub(crate) fn evaluate_expr(expr: &Expr, session: &Session) -> Result<Value, String> {
     if expression_is_real(expr) {
-        evaluate_expr_as_real(expr).map(Value::Real)
+        evaluate_expr_as_real(expr, session).map(Value::Real)
     } else {
-        evaluate_expr_in_context(expr, None).map(Value::Integer)
+        evaluate_expr_in_context(expr, None, session).map(Value::Integer)
     }
 }
+
+// Entrypoint for the blocking-assignment driver in lib.rs. Builds the
+// LRM 5.6 context-determined operand context from the reg's declared
+// (width, signed, base) and runs the RHS through the standard integer
+// pipeline, so a wider/narrower RHS extends or truncates exactly the way
+// a literal does in an arithmetic context. The reg's base flows in for
+// the leftmost-base inference rule; the caller still re-stamps the
+// reg's stored base on the result.
+//
+// A real RHS is implicitly converted per LRM §3.5.3: round to nearest
+// with ties away from zero (the same rule `$itor`'s internal real→int
+// step uses). NaN / ±∞ have no integer image, so the lvalue is filled
+// with x bits at its declared width — matching how `$rtoi` surfaces
+// "no defined integer" rather than silently mapping to zero.
+pub(crate) fn evaluate_assignment_rhs(
+    rhs: &Expr,
+    width: usize,
+    signed: bool,
+    base: Base,
+    session: &Session,
+) -> Result<IntegerValue, String> {
+    if expression_is_real(rhs) {
+        let real_val = evaluate_expr_as_real(rhs, session)?;
+        return Ok(match real_to_integer_bigint(real_val) {
+            Some(bigint) => IntegerValue::from_bigint(bigint, width, signed, base),
+            None => IntegerValue::all_x(width, signed, base),
+        });
+    }
+    let context = ExprMeta {
+        width,
+        signed,
+        base,
+    };
+    evaluate_expr_in_context(rhs, Some(context), session)
+}
+
+// Self-determined evaluation of an integer-typed constant expression
+// (used by the reg-declaration range halves). Mirrors the `None` context
+// path the evaluator takes for the top-level expression in a calculator
+// line.
+pub(crate) fn evaluate_constant_expr(
+    expr: &Expr,
+    session: &Session,
+) -> Result<IntegerValue, String> {
+    evaluate_expr_in_context(expr, None, session)
+}
+
 
 // LRM §5.1.1 / Table 5-2 / §5.1.5: an expression's *result* type is real
 // only for arithmetic ops with at least one real operand and for
@@ -44,7 +92,7 @@ fn task_in_expression_error(name: &str) -> String {
     format!("{name}() is a system task, it cannot be called as a function.")
 }
 
-fn expression_is_real(expr: &Expr) -> bool {
+pub(crate) fn expression_is_real(expr: &Expr) -> bool {
     match expr {
         Expr::Literal(_) => false,
         Expr::RealLiteral(_) => true,
@@ -109,6 +157,10 @@ fn expression_is_real(expr: &Expr) -> bool {
         // "not real" routes the rejection through the integer pipeline,
         // which surfaces the task-in-expression diagnostic.
         Expr::SystemTask { .. } => false,
+        // Reg variables are integer-only — the only declarable type so
+        // far. The Session lookup happens later in the integer pipeline;
+        // here we only need the result-type, and that's always integer.
+        Expr::Identifier(_) => false,
     }
 }
 
@@ -163,17 +215,19 @@ fn logical_value_of_real(value: f64) -> LogicBit {
 // here because their ancestor was real-typed by `expression_is_real`,
 // meaning a real operand reached them; the integer pipeline rejects
 // the same operators when the operand is *directly* real.
-fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
+fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> {
     if !expression_is_real(expr) {
-        return Ok(integer_value_to_f64(&evaluate_expr_in_context(expr, None)?));
+        return Ok(integer_value_to_f64(&evaluate_expr_in_context(
+            expr, None, session,
+        )?));
     }
 
     match expr {
         Expr::Literal(_) => unreachable!("integer literal handled by integer fast-path"),
         Expr::RealLiteral(value) => Ok(*value),
-        Expr::Grouped(inner) => evaluate_expr_as_real(inner),
+        Expr::Grouped(inner) => evaluate_expr_as_real(inner, session),
         Expr::Unary { op, expr } => {
-            let value = evaluate_expr_as_real(expr)?;
+            let value = evaluate_expr_as_real(expr, session)?;
             match op {
                 UnaryOp::Plus => Ok(value),
                 UnaryOp::Minus => Ok(-value),
@@ -184,8 +238,8 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
             }
         }
         Expr::Binary { op, lhs, rhs } => {
-            let lhs_val = evaluate_expr_as_real(lhs)?;
-            let rhs_val = evaluate_expr_as_real(rhs)?;
+            let lhs_val = evaluate_expr_as_real(lhs, session)?;
+            let rhs_val = evaluate_expr_as_real(rhs, session)?;
             match op {
                 BinaryOp::Add => Ok(lhs_val + rhs_val),
                 BinaryOp::Subtract => Ok(lhs_val - rhs_val),
@@ -210,10 +264,10 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
             then_expr,
             else_expr,
         } => {
-            let cond_logical = logical_value_of_expr(cond)?;
+            let cond_logical = logical_value_of_expr(cond, session)?;
             match cond_logical {
-                LogicBit::One => evaluate_expr_as_real(then_expr),
-                LogicBit::Zero => evaluate_expr_as_real(else_expr),
+                LogicBit::One => evaluate_expr_as_real(then_expr, session),
+                LogicBit::Zero => evaluate_expr_as_real(else_expr, session),
                 LogicBit::X | LogicBit::Z => {
                     // Real has no per-bit identity to merge; if both
                     // branches numerically agree (including NaN-bit
@@ -221,8 +275,8 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
                     // surface NaN. Mirrors the agree/disagree split the
                     // integer path uses, with the practical caveat that
                     // disagreement in real always collapses to NaN.
-                    let then_val = evaluate_expr_as_real(then_expr)?;
-                    let else_val = evaluate_expr_as_real(else_expr)?;
+                    let then_val = evaluate_expr_as_real(then_expr, session)?;
+                    let else_val = evaluate_expr_as_real(else_expr, session)?;
                     if then_val.to_bits() == else_val.to_bits() {
                         Ok(then_val)
                     } else {
@@ -259,13 +313,13 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
                 // collapse it to 0.0 — destroying the value the conversion
                 // was supposed to surface.
                 if expression_is_real(arg) {
-                    let real_val = evaluate_expr_as_real(arg)?;
+                    let real_val = evaluate_expr_as_real(arg, session)?;
                     match real_to_integer_bigint(real_val) {
                         Some(bigint) => Ok(bigint.to_f64().expect("BigInt::to_f64 is total")),
                         None => Ok(0.0),
                     }
                 } else {
-                    let int_val = evaluate_expr_in_context(arg, None)?;
+                    let int_val = evaluate_expr_in_context(arg, None, session)?;
                     Ok(integer_value_to_f64(&int_val))
                 }
             }
@@ -279,14 +333,14 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
                 if expression_is_real(arg) {
                     return Err("$bitstoreal argument cannot be real".to_string());
                 }
-                let arg_meta = infer_expr_meta(arg)?;
+                let arg_meta = infer_expr_meta(arg, session)?;
                 if arg_meta.width != 64 {
                     return Err(format!(
                         "$bitstoreal argument must be 64 bits wide, got {}",
                         arg_meta.width
                     ));
                 }
-                let int_val = evaluate_expr_in_context(arg, None)?;
+                let int_val = evaluate_expr_in_context(arg, None, session)?;
                 Ok(bits_value_to_real(&int_val))
             }
             RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {
@@ -304,15 +358,24 @@ fn evaluate_expr_as_real(expr: &Expr) -> Result<f64, String> {
             if !kind.is_real_result() {
                 unreachable!("integer-result math functions handled by integer pipeline");
             }
-            evaluate_real_math_function(*kind, args)
+            evaluate_real_math_function(*kind, args, session)
         }
         Expr::SystemTask { name } => Err(task_in_expression_error(name)),
+        // A reg is integer-only, so the integer fast-path at the top of
+        // this function would have routed any identifier through
+        // `evaluate_expr_in_context`. Reaching this branch means the
+        // dispatch missed an integer leaf in a real-result expression.
+        Expr::Identifier(_) => unreachable!("identifier always has integer result type"),
     }
 }
 
-fn evaluate_real_math_function(kind: MathFunctionKind, args: &[Expr]) -> Result<f64, String> {
+fn evaluate_real_math_function(
+    kind: MathFunctionKind,
+    args: &[Expr],
+    session: &Session,
+) -> Result<f64, String> {
     if kind.arity() == 1 {
-        let x = evaluate_expr_as_real(&args[0])?;
+        let x = evaluate_expr_as_real(&args[0], session)?;
         return Ok(match kind {
             MathFunctionKind::Ln => x.ln(),
             MathFunctionKind::Log10 => x.log10(),
@@ -339,8 +402,8 @@ fn evaluate_real_math_function(kind: MathFunctionKind, args: &[Expr]) -> Result<
         });
     }
 
-    let x = evaluate_expr_as_real(&args[0])?;
-    let y = evaluate_expr_as_real(&args[1])?;
+    let x = evaluate_expr_as_real(&args[0], session)?;
+    let y = evaluate_expr_as_real(&args[1], session)?;
     Ok(match kind {
         // LRM 17.11 + README "Real numbers": $pow shares f64::powf with
         // the `**` operator on reals, so corner-case results
@@ -355,11 +418,11 @@ fn evaluate_real_math_function(kind: MathFunctionKind, args: &[Expr]) -> Result<
 // Reduce an arbitrary expression — integer- or real-typed — to its 1-bit
 // logical value. Used by ?: cond on both pipelines and by &&/|| operands
 // when at least one operand is real.
-fn logical_value_of_expr(expr: &Expr) -> Result<LogicBit, String> {
+fn logical_value_of_expr(expr: &Expr, session: &Session) -> Result<LogicBit, String> {
     if expression_is_real(expr) {
-        Ok(logical_value_of_real(evaluate_expr_as_real(expr)?))
+        Ok(logical_value_of_real(evaluate_expr_as_real(expr, session)?))
     } else {
-        Ok(logical_value(&evaluate_expr_in_context(expr, None)?))
+        Ok(logical_value(&evaluate_expr_in_context(expr, None, session)?))
     }
 }
 
@@ -410,6 +473,7 @@ fn binary_op_name(op: BinaryOp) -> &'static str {
 fn evaluate_expr_in_context(
     expr: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     match expr {
         Expr::Literal(value) => Ok(match context {
@@ -422,25 +486,44 @@ fn evaluate_expr_in_context(
         Expr::RealLiteral(_) => {
             Err("real value cannot be used as an integer expression here".to_string())
         }
-        Expr::Grouped(expr) => evaluate_expr_in_context(expr, context),
-        Expr::Unary { op, expr } => evaluate_unary_expr(*op, expr, context),
-        Expr::Binary { op, lhs, rhs } => evaluate_binary_expr(*op, lhs, rhs, context),
+        Expr::Grouped(expr) => evaluate_expr_in_context(expr, context, session),
+        Expr::Unary { op, expr } => evaluate_unary_expr(*op, expr, context, session),
+        Expr::Binary { op, lhs, rhs } => evaluate_binary_expr(*op, lhs, rhs, context, session),
         Expr::Conditional {
             cond,
             then_expr,
             else_expr,
-        } => evaluate_conditional_expr(cond, then_expr, else_expr, context),
-        Expr::Concatenation { items } => evaluate_concatenation_expr(items, context),
-        Expr::Replication { count, items } => evaluate_replication_expr(count, items, context),
-        Expr::SignCast { signed, arg } => evaluate_sign_cast_expr(*signed, arg, context),
-        Expr::BaseCast { base, arg } => evaluate_base_cast_expr(*base, arg, context),
-        Expr::RealConversion { kind, arg } => evaluate_real_conversion_expr(*kind, arg, context),
-        Expr::MathFunction { kind, args } => evaluate_math_function_expr(*kind, args, context),
+        } => evaluate_conditional_expr(cond, then_expr, else_expr, context, session),
+        Expr::Concatenation { items } => evaluate_concatenation_expr(items, context, session),
+        Expr::Replication { count, items } => {
+            evaluate_replication_expr(count, items, context, session)
+        }
+        Expr::SignCast { signed, arg } => evaluate_sign_cast_expr(*signed, arg, context, session),
+        Expr::BaseCast { base, arg } => evaluate_base_cast_expr(*base, arg, context, session),
+        Expr::RealConversion { kind, arg } => {
+            evaluate_real_conversion_expr(*kind, arg, context, session)
+        }
+        Expr::MathFunction { kind, args } => {
+            evaluate_math_function_expr(*kind, args, context, session)
+        }
         Expr::SystemTask { name } => Err(task_in_expression_error(name)),
+        // LRM A.8.3: a primary identifier resolves to its declared reg's
+        // current value, then follows the same context-extension path a
+        // literal does. An unknown name is the user's first sign that they
+        // forgot a `reg` decl, so the error is plain.
+        Expr::Identifier(name) => {
+            let value = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            Ok(match context {
+                Some(context) => value.resized_to_context(context.width, context.signed),
+                None => value.clone(),
+            })
+        }
     }
 }
 
-fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
+fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
     match expr {
         Expr::Literal(value) => Ok(ExprMeta {
             width: value.width,
@@ -453,9 +536,9 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
         Expr::RealLiteral(_) => {
             Err("real value has no integer width or signedness".to_string())
         }
-        Expr::Grouped(expr) => infer_expr_meta(expr),
+        Expr::Grouped(expr) => infer_expr_meta(expr, session),
         Expr::Unary { op, expr } => match op {
-            UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitwiseNot => infer_expr_meta(expr),
+            UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitwiseNot => infer_expr_meta(expr, session),
             UnaryOp::LogicalNot
             | UnaryOp::ReductionAnd
             | UnaryOp::ReductionNand
@@ -469,8 +552,8 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
             }),
         },
         Expr::Binary { op, lhs, rhs } => {
-            let lhs_meta = infer_expr_meta(lhs)?;
-            let rhs_meta = infer_expr_meta(rhs)?;
+            let lhs_meta = infer_expr_meta(lhs, session)?;
+            let rhs_meta = infer_expr_meta(rhs, session)?;
             Ok(combine_binary_meta(*op, lhs_meta, rhs_meta))
         }
         // LRM 5.1.13: cond is self-determined and contributes nothing to
@@ -481,8 +564,8 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
             then_expr,
             else_expr,
         } => {
-            let then_meta = infer_expr_meta(then_expr)?;
-            let else_meta = infer_expr_meta(else_expr)?;
+            let then_meta = infer_expr_meta(then_expr, session)?;
+            let else_meta = infer_expr_meta(else_expr, session)?;
             Ok(ExprMeta {
                 width: usize::max(then_meta.width, else_meta.width),
                 signed: then_meta.signed && else_meta.signed,
@@ -495,7 +578,7 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
             let mut total_width = 0usize;
             let mut leftmost_base = Base::Binary;
             for (idx, item) in items.iter().enumerate() {
-                let item_meta = infer_expr_meta(item)?;
+                let item_meta = infer_expr_meta(item, session)?;
                 total_width = total_width.saturating_add(item_meta.width);
                 if idx == 0 {
                     leftmost_base = item_meta.base;
@@ -514,11 +597,11 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
         // by `evaluate_replication_expr` (top-level) or
         // `collect_concatenation_bits` (the surrounding-list check).
         Expr::Replication { count, items } => {
-            let count = evaluate_replication_count_allow_zero(count)?;
+            let count = evaluate_replication_count_allow_zero(count, session)?;
             let mut inner_width = 0usize;
             let mut leftmost_base = Base::Binary;
             for (idx, item) in items.iter().enumerate() {
-                let item_meta = infer_expr_meta(item)?;
+                let item_meta = infer_expr_meta(item, session)?;
                 inner_width = inner_width.saturating_add(item_meta.width);
                 if idx == 0 {
                     leftmost_base = item_meta.base;
@@ -535,7 +618,7 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
         // the cast, but the cast's meta is what context-propagation sees from
         // outside, so it must reflect the cast's signedness.
         Expr::SignCast { signed, arg } => {
-            let arg_meta = infer_expr_meta(arg)?;
+            let arg_meta = infer_expr_meta(arg, session)?;
             Ok(ExprMeta {
                 width: arg_meta.width,
                 signed: *signed,
@@ -547,7 +630,7 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
         // leftmost-base propagation rule sees the cast's base, not the
         // argument's.
         Expr::BaseCast { base, arg } => {
-            let arg_meta = infer_expr_meta(arg)?;
+            let arg_meta = infer_expr_meta(arg, session)?;
             Ok(ExprMeta {
                 width: arg_meta.width,
                 signed: arg_meta.signed,
@@ -588,6 +671,18 @@ fn infer_expr_meta(expr: &Expr) -> Result<ExprMeta, String> {
             }
         }
         Expr::SystemTask { name } => Err(task_in_expression_error(name)),
+        // A reg's meta is exactly the IntegerValue's stored (width, signed,
+        // base) — same shape `Expr::Literal` produces from its value.
+        Expr::Identifier(name) => {
+            let value = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            Ok(ExprMeta {
+                width: value.width,
+                signed: value.signed,
+                base: value.base,
+            })
+        }
     }
 }
 
@@ -643,6 +738,7 @@ fn evaluate_unary_expr(
     op: UnaryOp,
     expr: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     // LRM Table 5-3: bitwise ~ and reductions are illegal on reals.
     // LRM Table 5-2: !, unary +, and unary - are legal on reals; +/- are
@@ -654,7 +750,7 @@ fn evaluate_unary_expr(
     if expression_is_real(expr) {
         match op {
             UnaryOp::LogicalNot => {
-                let value = evaluate_expr_as_real(expr)?;
+                let value = evaluate_expr_as_real(expr, session)?;
                 let bit = match logical_value_of_real(value) {
                     LogicBit::One => LogicBit::Zero,
                     LogicBit::Zero => LogicBit::One,
@@ -687,7 +783,7 @@ fn evaluate_unary_expr(
         // LRM 5.4: logical operands are self-determined — evaluate without
         // pushing a context down, reduce to the operand's logical value, then
         // apply the !-truth table from §5.1.9.
-        let operand = evaluate_expr_in_context(expr, None)?;
+        let operand = evaluate_expr_in_context(expr, None, session)?;
         let bit = match logical_value(&operand) {
             LogicBit::One => LogicBit::Zero,
             LogicBit::Zero => LogicBit::One,
@@ -703,7 +799,7 @@ fn evaluate_unary_expr(
         // LRM 5.1.11: reduction operands are self-determined (LRM Table 5-22)
         // and the result is always 1-bit unsigned. Same outer-context
         // widening shape as `!`/`&&`/`||`/relational/equality.
-        let operand = evaluate_expr_in_context(expr, None)?;
+        let operand = evaluate_expr_in_context(expr, None, session)?;
         let bit = reduce_bits(op, &operand.bits);
         return Ok(widen_relational_result(
             comparison_result_value(bit),
@@ -711,7 +807,7 @@ fn evaluate_unary_expr(
         ));
     }
 
-    let meta = infer_expr_meta(expr)?;
+    let meta = infer_expr_meta(expr, session)?;
     // LRM 5.5.2: unary +/-/~ is context-determined — propagated size AND
     // signedness must reach the inner primary. Falling back to the operand's
     // own signedness here would sign-extend a signed leaf even when the
@@ -722,7 +818,7 @@ fn evaluate_unary_expr(
         signed: context.map_or(meta.signed, |ctx| ctx.signed),
         base: meta.base,
     };
-    let operand = evaluate_expr_in_context(expr, Some(effective_meta))?;
+    let operand = evaluate_expr_in_context(expr, Some(effective_meta), session)?;
 
     if op == UnaryOp::Plus {
         return Ok(operand);
@@ -767,6 +863,7 @@ fn evaluate_binary_expr(
     lhs: &Expr,
     rhs: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     // LRM Table 5-3: %, ===, !==, bitwise, and shift are all illegal on
     // reals. Arithmetic with a real operand is real-typed and handled by
@@ -802,19 +899,19 @@ fn evaluate_binary_expr(
             | BinaryOp::GreaterThan
             | BinaryOp::LessThanOrEqual
             | BinaryOp::GreaterThanOrEqual => {
-                return evaluate_real_relational_expr(op, lhs, rhs, context);
+                return evaluate_real_relational_expr(op, lhs, rhs, context, session);
             }
             BinaryOp::Equal | BinaryOp::NotEqual => {
-                return evaluate_real_equality_expr(op, lhs, rhs, context);
+                return evaluate_real_equality_expr(op, lhs, rhs, context, session);
             }
             BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
-                return evaluate_real_logical_expr(op, lhs, rhs, context);
+                return evaluate_real_logical_expr(op, lhs, rhs, context, session);
             }
         }
     }
 
-    let lhs_meta = infer_expr_meta(lhs)?;
-    let rhs_meta = infer_expr_meta(rhs)?;
+    let lhs_meta = infer_expr_meta(lhs, session)?;
+    let rhs_meta = infer_expr_meta(rhs, session)?;
 
     if matches!(
         op,
@@ -823,18 +920,18 @@ fn evaluate_binary_expr(
             | BinaryOp::LessThanOrEqual
             | BinaryOp::GreaterThanOrEqual
     ) {
-        return evaluate_relational_expr(op, lhs, rhs, lhs_meta, rhs_meta, context);
+        return evaluate_relational_expr(op, lhs, rhs, lhs_meta, rhs_meta, context, session);
     }
 
     if matches!(
         op,
         BinaryOp::Equal | BinaryOp::NotEqual | BinaryOp::CaseEqual | BinaryOp::CaseNotEqual
     ) {
-        return evaluate_equality_expr(op, lhs, rhs, lhs_meta, rhs_meta, context);
+        return evaluate_equality_expr(op, lhs, rhs, lhs_meta, rhs_meta, context, session);
     }
 
     if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
-        return evaluate_logical_expr(op, lhs, rhs, context);
+        return evaluate_logical_expr(op, lhs, rhs, context, session);
     }
 
     if matches!(
@@ -844,7 +941,7 @@ fn evaluate_binary_expr(
             | BinaryOp::ArithmeticShiftLeft
             | BinaryOp::ArithmeticShiftRight
     ) {
-        return evaluate_shift_expr(op, lhs, rhs, lhs_meta, context);
+        return evaluate_shift_expr(op, lhs, rhs, lhs_meta, context, session);
     }
 
     let meta = combine_binary_meta(op, lhs_meta, rhs_meta);
@@ -860,8 +957,8 @@ fn evaluate_binary_expr(
         | BinaryOp::Multiply
         | BinaryOp::Divide
         | BinaryOp::Modulus => {
-            let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta))?;
-            let rhs_value = evaluate_expr_in_context(rhs, Some(effective_meta))?;
+            let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta), session)?;
+            let rhs_value = evaluate_expr_in_context(rhs, Some(effective_meta), session)?;
 
             if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
                 return Ok(IntegerValue::all_x(
@@ -913,8 +1010,8 @@ fn evaluate_binary_expr(
                 signed: lhs_meta.signed,
                 base: lhs_meta.base,
             };
-            let lhs_value = evaluate_expr_in_context(lhs, Some(lhs_context))?;
-            let rhs_value = evaluate_expr_in_context(rhs, Some(rhs_meta))?;
+            let lhs_value = evaluate_expr_in_context(lhs, Some(lhs_context), session)?;
+            let rhs_value = evaluate_expr_in_context(rhs, Some(rhs_meta), session)?;
 
             if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
                 return Ok(IntegerValue::all_x(
@@ -925,7 +1022,7 @@ fn evaluate_binary_expr(
             }
 
             let base_value = lhs_value.as_bigint(lhs_meta.signed);
-            let exponent_value = evaluate_expr_as_math_bigint(rhs)?;
+            let exponent_value = evaluate_expr_as_math_bigint(rhs, session)?;
             let result = match evaluate_power(base_value, exponent_value) {
                 Ok(result) => result,
                 Err(_) => {
@@ -947,8 +1044,8 @@ fn evaluate_binary_expr(
         BinaryOp::BitwiseAnd | BinaryOp::BitwiseOr | BinaryOp::BitwiseXor | BinaryOp::BitwiseXnor => {
             // Both operands inherit the unified width/sign context, so each
             // side's leaf primary extends consistently before we zip bits.
-            let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta))?;
-            let rhs_value = evaluate_expr_in_context(rhs, Some(effective_meta))?;
+            let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta), session)?;
+            let rhs_value = evaluate_expr_in_context(rhs, Some(effective_meta), session)?;
 
             let combine = match op {
                 BinaryOp::BitwiseAnd => bitwise_and_bits,
@@ -1010,6 +1107,7 @@ fn evaluate_shift_expr(
     rhs: &Expr,
     lhs_meta: ExprMeta,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     let effective_meta = ExprMeta {
         width: context.map_or(lhs_meta.width, |ctx| usize::max(ctx.width, lhs_meta.width)),
@@ -1017,10 +1115,10 @@ fn evaluate_shift_expr(
         base: lhs_meta.base,
     };
 
-    let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta))?;
+    let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta), session)?;
     // RHS is self-determined: do NOT push effective_meta; let it evaluate at
     // its own width, then reinterpret its bits as unsigned for the count.
-    let rhs_value = evaluate_expr_in_context(rhs, None)?;
+    let rhs_value = evaluate_expr_in_context(rhs, None, session)?;
 
     if rhs_value.has_unknown_bits() {
         return Ok(IntegerValue::all_x(
@@ -1100,6 +1198,7 @@ fn unify_comparison_operands(
     rhs: &Expr,
     lhs_meta: ExprMeta,
     rhs_meta: ExprMeta,
+    session: &Session,
 ) -> Result<(IntegerValue, IntegerValue, bool), String> {
     let operand_width = usize::max(lhs_meta.width, rhs_meta.width);
     let comparison_signed = lhs_meta.signed && rhs_meta.signed;
@@ -1115,8 +1214,8 @@ fn unify_comparison_operands(
         base: rhs_meta.base,
     };
 
-    let lhs_value = evaluate_expr_in_context(lhs, Some(lhs_context))?;
-    let rhs_value = evaluate_expr_in_context(rhs, Some(rhs_context))?;
+    let lhs_value = evaluate_expr_in_context(lhs, Some(lhs_context), session)?;
+    let rhs_value = evaluate_expr_in_context(rhs, Some(rhs_context), session)?;
 
     Ok((lhs_value, rhs_value, comparison_signed))
 }
@@ -1144,11 +1243,12 @@ fn evaluate_logical_expr(
     lhs: &Expr,
     rhs: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     // LRM 5.4: each operand is self-determined, so we evaluate them in
     // isolation rather than unifying widths the way relational/equality do.
-    let lhs_logical = logical_value(&evaluate_expr_in_context(lhs, None)?);
-    let rhs_logical = logical_value(&evaluate_expr_in_context(rhs, None)?);
+    let lhs_logical = logical_value(&evaluate_expr_in_context(lhs, None, session)?);
+    let rhs_logical = logical_value(&evaluate_expr_in_context(rhs, None, session)?);
 
     // LRM 5.1.9 Table 5-7: a definite false defeats x in &&, a definite true
     // defeats x in ||.
@@ -1178,9 +1278,10 @@ fn evaluate_real_relational_expr(
     lhs: &Expr,
     rhs: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
-    let lhs_val = evaluate_expr_as_real(lhs)?;
-    let rhs_val = evaluate_expr_as_real(rhs)?;
+    let lhs_val = evaluate_expr_as_real(lhs, session)?;
+    let rhs_val = evaluate_expr_as_real(rhs, session)?;
     let result = match op {
         BinaryOp::LessThan => lhs_val < rhs_val,
         BinaryOp::GreaterThan => lhs_val > rhs_val,
@@ -1201,9 +1302,10 @@ fn evaluate_real_equality_expr(
     lhs: &Expr,
     rhs: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
-    let lhs_val = evaluate_expr_as_real(lhs)?;
-    let rhs_val = evaluate_expr_as_real(rhs)?;
+    let lhs_val = evaluate_expr_as_real(lhs, session)?;
+    let rhs_val = evaluate_expr_as_real(rhs, session)?;
     let result = match op {
         BinaryOp::Equal => lhs_val == rhs_val,
         BinaryOp::NotEqual => lhs_val != rhs_val,
@@ -1222,9 +1324,10 @@ fn evaluate_real_logical_expr(
     lhs: &Expr,
     rhs: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
-    let lhs_logical = logical_value_of_expr(lhs)?;
-    let rhs_logical = logical_value_of_expr(rhs)?;
+    let lhs_logical = logical_value_of_expr(lhs, session)?;
+    let rhs_logical = logical_value_of_expr(rhs, session)?;
     let bit = match op {
         BinaryOp::LogicalAnd => match (lhs_logical, rhs_logical) {
             (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
@@ -1248,9 +1351,10 @@ fn evaluate_relational_expr(
     lhs_meta: ExprMeta,
     rhs_meta: ExprMeta,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     let (lhs_value, rhs_value, comparison_signed) =
-        unify_comparison_operands(lhs, rhs, lhs_meta, rhs_meta)?;
+        unify_comparison_operands(lhs, rhs, lhs_meta, rhs_meta, session)?;
 
     if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
         return Ok(widen_relational_result(
@@ -1285,12 +1389,13 @@ fn evaluate_equality_expr(
     lhs_meta: ExprMeta,
     rhs_meta: ExprMeta,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     // Bit-level comparison; the unified signedness only matters for operand
     // extension (already done inside `unify_comparison_operands`), not for the
     // comparison itself.
     let (lhs_value, rhs_value, _comparison_signed) =
-        unify_comparison_operands(lhs, rhs, lhs_meta, rhs_meta)?;
+        unify_comparison_operands(lhs, rhs, lhs_meta, rhs_meta, session)?;
 
     let bit = match op {
         // LRM 5.1.8: ==/!= are 1-bit x only when the relation is *ambiguous*.
@@ -1358,12 +1463,13 @@ fn evaluate_conditional_expr(
     then_expr: &Expr,
     else_expr: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     if expression_is_real(then_expr) || expression_is_real(else_expr) {
         unreachable!("real-typed conditional should be handled by the real path")
     }
-    let then_meta = infer_expr_meta(then_expr)?;
-    let else_meta = infer_expr_meta(else_expr)?;
+    let then_meta = infer_expr_meta(then_expr, session)?;
+    let else_meta = infer_expr_meta(else_expr, session)?;
     let meta = ExprMeta {
         width: usize::max(then_meta.width, else_meta.width),
         signed: then_meta.signed && else_meta.signed,
@@ -1375,14 +1481,14 @@ fn evaluate_conditional_expr(
         base: meta.base,
     };
 
-    let cond_logical = logical_value_of_expr(cond)?;
+    let cond_logical = logical_value_of_expr(cond, session)?;
 
     let bits = match cond_logical {
-        LogicBit::One => evaluate_expr_in_context(then_expr, Some(effective_meta))?.bits,
-        LogicBit::Zero => evaluate_expr_in_context(else_expr, Some(effective_meta))?.bits,
+        LogicBit::One => evaluate_expr_in_context(then_expr, Some(effective_meta), session)?.bits,
+        LogicBit::Zero => evaluate_expr_in_context(else_expr, Some(effective_meta), session)?.bits,
         LogicBit::X | LogicBit::Z => {
-            let then_value = evaluate_expr_in_context(then_expr, Some(effective_meta))?;
-            let else_value = evaluate_expr_in_context(else_expr, Some(effective_meta))?;
+            let then_value = evaluate_expr_in_context(then_expr, Some(effective_meta), session)?;
+            let else_value = evaluate_expr_in_context(else_expr, Some(effective_meta), session)?;
             then_value
                 .bits
                 .iter()
@@ -1477,6 +1583,11 @@ fn is_indefinite_width(expr: &Expr) -> bool {
         // generic "indefinite width" diagnostic from the concatenation
         // pre-check.
         Expr::SystemTask { .. } => false,
+        // A reg always has an explicit declared width, so an identifier is
+        // never indefinite. The session lookup happens later in the
+        // evaluator pipeline; the structural check here only needs the
+        // type-shape answer.
+        Expr::Identifier(_) => false,
     }
 }
 
@@ -1488,8 +1599,11 @@ fn is_indefinite_width(expr: &Expr) -> bool {
 // other operands sum to positive width) is enforced separately in
 // `evaluate_replication_count` (top-level) and `collect_concatenation_bits`
 // (the surrounding-list check).
-fn evaluate_replication_count_allow_zero(count_expr: &Expr) -> Result<usize, String> {
-    let value = evaluate_expr_in_context(count_expr, None)?;
+fn evaluate_replication_count_allow_zero(
+    count_expr: &Expr,
+    session: &Session,
+) -> Result<usize, String> {
+    let value = evaluate_expr_in_context(count_expr, None, session)?;
     if value.has_unknown_bits() {
         return Err("replication count contains unknown bits".to_string());
     }
@@ -1506,8 +1620,8 @@ fn evaluate_replication_count_allow_zero(count_expr: &Expr) -> Result<usize, Str
 // expression, or whose only consumers are non-concatenation operators) needs
 // a positive count, since it would otherwise produce a zero-width
 // `IntegerValue` in a position where vcal can't represent it.
-fn evaluate_replication_count(count_expr: &Expr) -> Result<usize, String> {
-    let count = evaluate_replication_count_allow_zero(count_expr)?;
+fn evaluate_replication_count(count_expr: &Expr, session: &Session) -> Result<usize, String> {
+    let count = evaluate_replication_count_allow_zero(count_expr, session)?;
     if count == 0 {
         return Err("replication count must be positive in this context".to_string());
     }
@@ -1533,6 +1647,7 @@ fn unwrap_grouped(expr: &Expr) -> &Expr {
 fn evaluate_concatenation_expr(
     items: &[Expr],
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     // LRM Table 5-3: concatenation is illegal on reals. Detect it here
     // before `collect_concatenation_bits` would surface the less-helpful
@@ -1542,8 +1657,8 @@ fn evaluate_concatenation_expr(
             return Err("concatenation operand cannot be real".to_string());
         }
     }
-    let bits = collect_concatenation_bits(items)?;
-    let leftmost_base = infer_expr_meta(&items[0])?.base;
+    let bits = collect_concatenation_bits(items, session)?;
+    let leftmost_base = infer_expr_meta(&items[0], session)?.base;
     let natural_width = bits.len();
     let result = IntegerValue::computed(natural_width, false, leftmost_base, bits);
     Ok(extend_to_outer_context(result, context))
@@ -1553,6 +1668,7 @@ fn evaluate_replication_expr(
     count_expr: &Expr,
     items: &[Expr],
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     if expression_is_real(count_expr) {
         return Err("replication count cannot be real".to_string());
@@ -1562,9 +1678,9 @@ fn evaluate_replication_expr(
             return Err("replication operand cannot be real".to_string());
         }
     }
-    let count = evaluate_replication_count(count_expr)?;
-    let inner_bits = collect_concatenation_bits(items)?;
-    let leftmost_base = infer_expr_meta(&items[0])?.base;
+    let count = evaluate_replication_count(count_expr, session)?;
+    let inner_bits = collect_concatenation_bits(items, session)?;
+    let leftmost_base = infer_expr_meta(&items[0], session)?.base;
 
     let mut bits = Vec::with_capacity(inner_bits.len().saturating_mul(count));
     for _ in 0..count {
@@ -1585,7 +1701,7 @@ fn evaluate_replication_expr(
 // a zero count, then verify the joined width is non-zero. This rejects
 // `{ {0{1'b1}} }` and `{N{ {0{1'b1}} }}` (no positive-size sibling) while
 // accepting `{ {0{1'b1}}, 1'b1 }` and `{N{ {0{1'b1}}, 1'b1 }}`.
-fn collect_concatenation_bits(items: &[Expr]) -> Result<Vec<LogicBit>, String> {
+fn collect_concatenation_bits(items: &[Expr], session: &Session) -> Result<Vec<LogicBit>, String> {
     if items.is_empty() {
         return Err("concatenation requires at least one operand".to_string());
     }
@@ -1598,7 +1714,7 @@ fn collect_concatenation_bits(items: &[Expr]) -> Result<Vec<LogicBit>, String> {
     // are LSB-first, so we feed bits starting from the rightmost item.
     let mut bits = Vec::new();
     for item in items.iter().rev() {
-        bits.extend(evaluate_concatenation_item_bits(item)?);
+        bits.extend(evaluate_concatenation_item_bits(item, session)?);
     }
     if bits.is_empty() {
         // Every operand collapsed to zero width — the concatenation has no
@@ -1610,20 +1726,23 @@ fn collect_concatenation_bits(items: &[Expr]) -> Result<Vec<LogicBit>, String> {
     Ok(bits)
 }
 
-fn evaluate_concatenation_item_bits(item: &Expr) -> Result<Vec<LogicBit>, String> {
+fn evaluate_concatenation_item_bits(
+    item: &Expr,
+    session: &Session,
+) -> Result<Vec<LogicBit>, String> {
     if let Expr::Replication { count, items } = unwrap_grouped(item) {
-        let count = evaluate_replication_count_allow_zero(count)?;
+        let count = evaluate_replication_count_allow_zero(count, session)?;
         if count == 0 {
             return Ok(Vec::new());
         }
-        let inner_bits = collect_concatenation_bits(items)?;
+        let inner_bits = collect_concatenation_bits(items, session)?;
         let mut bits = Vec::with_capacity(inner_bits.len().saturating_mul(count));
         for _ in 0..count {
             bits.extend(inner_bits.iter().copied());
         }
         return Ok(bits);
     }
-    let value = evaluate_expr_in_context(item, None)?;
+    let value = evaluate_expr_in_context(item, None, session)?;
     Ok(value.bits)
 }
 
@@ -1663,6 +1782,7 @@ fn evaluate_sign_cast_expr(
     signed: bool,
     arg: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     // $signed/$unsigned are integer-only — applying them to a real value
     // has no meaning under §5.5 (signedness is a property of the integer
@@ -1673,7 +1793,7 @@ fn evaluate_sign_cast_expr(
             if signed { "$signed" } else { "$unsigned" }
         ));
     }
-    let arg_value = evaluate_expr_in_context(arg, None)?;
+    let arg_value = evaluate_expr_in_context(arg, None, session)?;
     let cast_value = IntegerValue::computed(
         arg_value.width,
         signed,
@@ -1694,6 +1814,7 @@ fn evaluate_base_cast_expr(
     base: Base,
     arg: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     if expression_is_real(arg) {
         return Err(format!(
@@ -1701,7 +1822,7 @@ fn evaluate_base_cast_expr(
             base_cast_name(base)
         ));
     }
-    let arg_value = evaluate_expr_in_context(arg, None)?;
+    let arg_value = evaluate_expr_in_context(arg, None, session)?;
     let cast_value = IntegerValue::computed(
         arg_value.width,
         arg_value.signed,
@@ -1729,6 +1850,7 @@ fn evaluate_real_conversion_expr(
     kind: RealConversionKind,
     arg: &Expr,
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     let result = match kind {
         RealConversionKind::RealToInteger => {
@@ -1738,14 +1860,14 @@ fn evaluate_real_conversion_expr(
             // we return 32 bits of x to surface "no defined integer";
             // out-of-range finite values wrap mod 2^32, consistent with the
             // rest of the integer pipeline's overflow handling.
-            let real_val = evaluate_expr_as_real(arg)?;
+            let real_val = evaluate_expr_as_real(arg, session)?;
             real_to_integer_value(real_val)
         }
         RealConversionKind::RealToBits => {
             // LRM 17.8: bitcast a real to its 64-bit IEEE 754
             // representation. Display the result in hex since the value is a
             // bit pattern, not a magnitude.
-            let real_val = evaluate_expr_as_real(arg)?;
+            let real_val = evaluate_expr_as_real(arg, session)?;
             let bits = real_val.to_bits();
             IntegerValue::from_bigint(BigInt::from(bits), 64, false, Base::Hex)
         }
@@ -1775,9 +1897,10 @@ fn evaluate_math_function_expr(
     kind: MathFunctionKind,
     args: &[Expr],
     context: Option<ExprMeta>,
+    session: &Session,
 ) -> Result<IntegerValue, String> {
     let result = match kind {
-        MathFunctionKind::Clog2 => evaluate_clog2(&args[0])?,
+        MathFunctionKind::Clog2 => evaluate_clog2(&args[0], session)?,
         _ => unreachable!("real-result math functions handled by evaluate_expr_as_real"),
     };
 
@@ -1798,9 +1921,9 @@ fn evaluate_math_function_expr(
 //     defined image" rather than silently mapping x/z → 0, matching the
 //     $rtoi NaN/±∞ rule. The width used for the unsigned interpretation
 //     is the operand's natural width, so $clog2(64'hFFFF…F) is 64.
-fn evaluate_clog2(arg: &Expr) -> Result<IntegerValue, String> {
+fn evaluate_clog2(arg: &Expr, session: &Session) -> Result<IntegerValue, String> {
     if expression_is_real(arg) {
-        let real_val = evaluate_expr_as_real(arg)?;
+        let real_val = evaluate_expr_as_real(arg, session)?;
         let Some(bigint) = real_to_integer_bigint(real_val) else {
             return Ok(IntegerValue::all_x(32, true, Base::Decimal));
         };
@@ -1812,7 +1935,7 @@ fn evaluate_clog2(arg: &Expr) -> Result<IntegerValue, String> {
         return Ok(clog2_result_value(unsigned));
     }
 
-    let value = evaluate_expr_in_context(arg, None)?;
+    let value = evaluate_expr_in_context(arg, None, session)?;
     if value.has_unknown_bits() {
         return Ok(IntegerValue::all_x(32, true, Base::Decimal));
     }
@@ -1869,7 +1992,7 @@ fn widen_relational_result(result: IntegerValue, context: Option<ExprMeta>) -> I
 // `value_to_math_bigint` also rejects x/z bits — at the math-bigint layer
 // we have no way to represent unknown bits, so any unknown surfaces a
 // clean "expression contains unknown bits" error.
-fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
+fn evaluate_expr_as_math_bigint(expr: &Expr, session: &Session) -> Result<BigInt, String> {
     match expr {
         Expr::Literal(value) => {
             if value.has_unknown_bits() {
@@ -1883,15 +2006,15 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
         // which expression_is_real would have caught earlier. Surface a
         // clear error rather than fabricating an integer.
         Expr::RealLiteral(_) => Err("real value cannot be used as an integer here".to_string()),
-        Expr::Grouped(expr) => evaluate_expr_as_math_bigint(expr),
+        Expr::Grouped(expr) => evaluate_expr_as_math_bigint(expr, session),
         // Unary +/- recurse so the inner exponent computation stays in
         // arbitrary precision. Every other unary op has a width-dependent
         // result — bitwise NOT preserves the operand's width, logical NOT
         // and reductions yield 1-bit unsigned — so route them through
         // evaluate_unary_expr and read the materialised value out.
         Expr::Unary { op, expr } => match op {
-            UnaryOp::Plus => evaluate_expr_as_math_bigint(expr),
-            UnaryOp::Minus => Ok(-evaluate_expr_as_math_bigint(expr)?),
+            UnaryOp::Plus => evaluate_expr_as_math_bigint(expr, session),
+            UnaryOp::Minus => Ok(-evaluate_expr_as_math_bigint(expr, session)?),
             UnaryOp::LogicalNot
             | UnaryOp::BitwiseNot
             | UnaryOp::ReductionAnd
@@ -1900,7 +2023,7 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
             | UnaryOp::ReductionNor
             | UnaryOp::ReductionXor
             | UnaryOp::ReductionXnor => {
-                value_to_math_bigint(evaluate_unary_expr(*op, expr, None)?)
+                value_to_math_bigint(evaluate_unary_expr(*op, expr, None, session)?)
             }
         },
         Expr::Binary { op, lhs, rhs } => {
@@ -1920,11 +2043,11 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
                     | BinaryOp::Modulus
                     | BinaryOp::Power
             ) {
-                return value_to_math_bigint(evaluate_binary_expr(*op, lhs, rhs, None)?);
+                return value_to_math_bigint(evaluate_binary_expr(*op, lhs, rhs, None, session)?);
             }
 
-            let lhs_value = evaluate_expr_as_math_bigint(lhs)?;
-            let rhs_value = evaluate_expr_as_math_bigint(rhs)?;
+            let lhs_value = evaluate_expr_as_math_bigint(lhs, session)?;
+            let rhs_value = evaluate_expr_as_math_bigint(rhs, session)?;
 
             match op {
                 BinaryOp::Add => Ok(lhs_value + rhs_value),
@@ -1964,8 +2087,12 @@ fn evaluate_expr_as_math_bigint(expr: &Expr) -> Result<BigInt, String> {
         | Expr::SignCast { .. }
         | Expr::BaseCast { .. }
         | Expr::RealConversion { .. }
-        | Expr::MathFunction { .. } => {
-            value_to_math_bigint(evaluate_expr_in_context(expr, None)?)
+        | Expr::MathFunction { .. }
+        // A reg has fixed width/signedness, so reading it through the
+        // standard pipeline and then converting to bigint matches the
+        // shape used by every other width-dependent leaf above.
+        | Expr::Identifier(_) => {
+            value_to_math_bigint(evaluate_expr_in_context(expr, None, session)?)
         }
         Expr::SystemTask { name } => Err(task_in_expression_error(name)),
     }

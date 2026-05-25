@@ -13,8 +13,15 @@ pub(crate) enum Token {
     // matches `$[a-zA-Z0-9_$]+`; the `$` shall not be followed by white space
     // (LRM 19.5 / README "Identifier white spaces").
     SystemIdentifier(String),
+    // LRM A.9.3 / 3.7.1: `simple_identifier ::= [a-zA-Z_]{[a-zA-Z0-9_$]}`.
+    // Keywords (e.g. `reg`, `signed`) are not lexed separately; the parser
+    // matches them on the identifier string.
+    Identifier(String),
     LParen,
     RParen,
+    LBracket,
+    RBracket,
+    Assign,
     Plus,
     Minus,
     Star,
@@ -111,15 +118,17 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 }
             }
             '=' => {
-                if !matches!(chars.peek(), Some((_, '='))) {
-                    return Err("expected `==` or `===`".to_string());
-                }
-                chars.next();
+                // Greedy: `===` > `==` > `=` (blocking assignment, LRM A.6.2).
                 if matches!(chars.peek(), Some((_, '='))) {
                     chars.next();
-                    tokens.push(Token::CaseEqual);
+                    if matches!(chars.peek(), Some((_, '='))) {
+                        chars.next();
+                        tokens.push(Token::CaseEqual);
+                    } else {
+                        tokens.push(Token::EqualEqual);
+                    }
                 } else {
-                    tokens.push(Token::EqualEqual);
+                    tokens.push(Token::Assign);
                 }
             }
             '!' => {
@@ -188,6 +197,8 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             ':' => tokens.push(Token::Colon),
             '{' => tokens.push(Token::LBrace),
             '}' => tokens.push(Token::RBrace),
+            '[' => tokens.push(Token::LBracket),
+            ']' => tokens.push(Token::RBracket),
             ',' => tokens.push(Token::Comma),
             ';' => tokens.push(Token::Semicolon),
             '\'' => {
@@ -199,7 +210,16 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::SystemIdentifier(read_system_identifier(&mut chars)?));
             }
             _ => {
-                tokens.push(read_integer_or_real_literal(ch, &mut chars)?);
+                // Simple identifiers (LRM 3.7.1) start with a letter or
+                // underscore and continue with [a-zA-Z0-9_$]. Route them here
+                // before the integer/real reader, otherwise a leading letter
+                // would land in the literal path and surface as "invalid
+                // decimal digits".
+                if ch.is_ascii_alphabetic() || ch == '_' {
+                    tokens.push(read_simple_identifier(ch, &mut chars));
+                } else {
+                    tokens.push(read_integer_or_real_literal(ch, &mut chars)?);
+                }
             }
         }
     }
@@ -498,8 +518,30 @@ fn is_expression_delimiter(ch: char) -> bool {
             | ':'
             | '{'
             | '}'
+            | '['
+            | ']'
             | ','
             | ';'
             | '$'
     )
+}
+
+// LRM 3.7.1 simple identifier reader. The leading character (letter or
+// underscore) has already been consumed; this gathers the rest of
+// `[a-zA-Z0-9_$]*`.
+fn read_simple_identifier<I>(first_ch: char, chars: &mut std::iter::Peekable<I>) -> Token
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let mut name = String::new();
+    name.push(first_ch);
+    while let Some((_, ch)) = chars.peek().copied() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
+            chars.next();
+            name.push(ch);
+        } else {
+            break;
+        }
+    }
+    Token::Identifier(name)
 }
