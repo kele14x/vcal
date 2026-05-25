@@ -516,8 +516,8 @@ fn evaluate_expr_in_context(
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
             Ok(match context {
-                Some(context) => value.resized_to_context(context.width, context.signed),
-                None => value.clone(),
+                Some(context) => value.value.resized_to_context(context.width, context.signed),
+                None => value.value.clone(),
             })
         }
     }
@@ -678,9 +678,9 @@ fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
             Ok(ExprMeta {
-                width: value.width,
-                signed: value.signed,
-                base: value.base,
+                width: value.value.width,
+                signed: value.value.signed,
+                base: value.value.base,
             })
         }
     }

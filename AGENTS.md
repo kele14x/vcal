@@ -14,7 +14,7 @@ What works:
 - All operators between integers
 - Two-pass context (width, signedness) propagation
 - Leftmost-base propagation
-- `reg [signed] [range] name { , name }` declarations and blocking assignment `name = expression` (LRM A.2.1.3 / A.6.2); persistent `Session` carries reg state across REPL turns
+- `reg [signed] [range] name { , name }` declarations and blocking assignment `name = expression` (LRM A.2.1.3 / A.6.2); persistent `Session` carries reg state across REPL turns, and each reg now preserves declared `msb`/`lsb` metadata for future bit/part-select work
 - `rustyline` history
 
 ## Active Scope
@@ -22,7 +22,7 @@ What works:
 - Single-line REPL input only
 - Integer and real literals, parentheses
 - Identifiers (simple_identifier per LRM 3.7.1) as primaries; `reg` is the only declared variable type so far (no `integer`/`real`/`time`, no init forms, no bit/part selects)
-- Top-level `Stmt` layer above `Expr`: declaration, blocking assignment, expression, and the hoisted `$finish`/`$stop` task forms; a `Session` owns the variable map and is threaded through every evaluator entry
+- Top-level `Stmt` layer above `Expr`: declaration, blocking assignment, expression, and the hoisted `$finish`/`$stop` task forms; a `Session` owns the variable map (`RegValue`, not just bare `IntegerValue`) and is threaded through every evaluator entry
 - All operators between integers; arithmetic / relational / equality / logical / `?:` between reals (Table 5-2)
   - Arithmetic ops (`+ - * / % **`, unary +, unary -)
   - Relational ops (`<`, `>`, `<=`, `>=`)
@@ -52,7 +52,7 @@ See README's "Supported Matrix" for the final target. Phase scoping beyond real 
 ## Structure
 
 - `src/main.rs` is the CLI entrypoint.
-- `src/lib.rs` is the facade: public API (`Session`, `evaluate_input`, `run_repl`, `run_interactive`, `Evaluation`, plus the `value` re-exports), the `Stmt` driver (`apply_stmt`, `compute_decl_width`), and module declarations.
+- `src/lib.rs` is the facade: public API (`Session`, `evaluate_input`, `run_repl`, `run_interactive`, `Evaluation`, plus the `value` re-exports), the `Stmt` driver (`apply_stmt`, `compute_decl_width`), `RegRange`/`RegValue` session storage, and module declarations.
 - `src/value.rs` — `LogicBit`, `Base`, `IntegerValue` (incl. width/sign/base/extension logic), bit ↔ bigint helpers, 4-value truth tables.
 - `src/lexer.rs` — `Token`, `tokenize`, literal text readers.
 - `src/parser.rs` — `Stmt`/`Expr`/`UnaryOp`/`BinaryOp` AST, `parse_statements`, `Parser` + precedence-climbing levels, decl/assign helpers, `parse_integer` and literal-text parsing helpers.

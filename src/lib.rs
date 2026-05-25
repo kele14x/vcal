@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 
-use num_bigint::Sign;
-use num_traits::ToPrimitive;
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive};
 
 mod eval;
 mod lexer;
@@ -16,6 +16,18 @@ pub use value::{Base, IntegerValue, LogicBit, Value};
 
 use parser::{Expr, Stmt};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegRange {
+    pub(crate) msb: BigInt,
+    pub(crate) lsb: BigInt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegValue {
+    pub(crate) range: Option<RegRange>,
+    pub(crate) value: IntegerValue,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Evaluation {
     pub output: String,
@@ -27,7 +39,7 @@ pub struct Evaluation {
 // shape by spinning up a throwaway session.
 #[derive(Debug, Default)]
 pub struct Session {
-    variables: HashMap<String, IntegerValue>,
+    variables: HashMap<String, RegValue>,
 }
 
 impl Session {
@@ -35,8 +47,14 @@ impl Session {
         Self::default()
     }
 
-    pub(crate) fn lookup(&self, name: &str) -> Option<&IntegerValue> {
+    pub(crate) fn lookup(&self, name: &str) -> Option<&RegValue> {
         self.variables.get(name)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lookup_reg_range(&self, name: &str) -> Option<(&BigInt, &BigInt)> {
+        self.lookup(name)
+            .and_then(|reg| reg.range.as_ref().map(|range| (&range.msb, &range.lsb)))
     }
 
     pub fn eval(&mut self, input: &str) -> Result<Evaluation, String> {
@@ -99,8 +117,12 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
             range,
             names,
         } => {
-            let width = match range {
-                Some((msb_expr, lsb_expr)) => compute_decl_width(msb_expr, lsb_expr, session)?,
+            let range = match range {
+                Some((msb_expr, lsb_expr)) => Some(evaluate_reg_range(msb_expr, lsb_expr, session)?),
+                None => None,
+            };
+            let width = match &range {
+                Some(range) => range.width()?,
                 None => 1,
             };
             // Redeclaration replaces the previous binding outright. The
@@ -112,12 +134,15 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
             for name in names {
                 session.variables.insert(
                     name.clone(),
-                    IntegerValue {
-                        width,
-                        signed: *signed,
-                        base: Base::Binary,
-                        bits: vec![LogicBit::X; width],
-                        unsized_literal: false,
+                    RegValue {
+                        range: range.clone(),
+                        value: IntegerValue {
+                            width,
+                            signed: *signed,
+                            base: Base::Binary,
+                            bits: vec![LogicBit::X; width],
+                            unsized_literal: false,
+                        },
                     },
                 );
             }
@@ -125,7 +150,7 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
         }
         Stmt::Assign { name, rhs } => {
             let (width, signed, base) = match session.lookup(name) {
-                Some(value) => (value.width, value.signed, value.base),
+                Some(reg) => (reg.value.width, reg.value.signed, reg.value.base),
                 None => return Err(format!("undeclared identifier: {name}")),
             };
             // A real RHS triggers an implicit real→integer conversion per
@@ -140,7 +165,9 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
                 bits: value.bits,
                 unsized_literal: false,
             };
-            session.variables.insert(name.clone(), updated.clone());
+            if let Some(reg) = session.variables.get_mut(name) {
+                reg.value = updated.clone();
+            }
             Ok((updated.canonical(), false))
         }
     }
@@ -148,27 +175,37 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
 
 // Evaluate a reg declaration's `[msb:lsb]` range. Each half is a constant
 // integer expression, evaluated in the current session so a prior reg can
-// be referenced (and immediately rejected because its bits are x). Negative
-// or x/z half values are rejected up-front; the width is |msb - lsb| + 1,
-// matching LRM 4.8's reversed-range tolerance. If that width would exceed
-// addressable `usize`, surface a normal error instead of overflowing.
-fn compute_decl_width(
+// be referenced (and immediately rejected because its bits are x). x/z half
+// values are rejected up-front; the width is |msb - lsb| + 1, so negative
+// endpoints and reversed ranges are both accepted per LRM 4.8. If that
+// width would exceed addressable `usize`, surface a normal error instead of
+// overflowing.
+fn evaluate_reg_range(
     msb_expr: &Expr,
     lsb_expr: &Expr,
     session: &Session,
-) -> Result<usize, String> {
+) -> Result<RegRange, String> {
     let msb = evaluate_range_endpoint(msb_expr, session, "msb")?;
     let lsb = evaluate_range_endpoint(lsb_expr, session, "lsb")?;
-    let diff = if msb >= lsb { msb - lsb } else { lsb - msb };
-    diff.checked_add(1)
-        .ok_or_else(|| "reg range width too large".to_string())
+    let range = RegRange { msb, lsb };
+    let _ = range.width()?;
+    Ok(range)
+}
+
+impl RegRange {
+    fn width(&self) -> Result<usize, String> {
+        let width = (&self.msb - &self.lsb).abs() + BigInt::from(1u8);
+        width
+            .to_usize()
+            .ok_or_else(|| "reg range width too large".to_string())
+    }
 }
 
 fn evaluate_range_endpoint(
     expr: &Expr,
     session: &Session,
     role: &str,
-) -> Result<usize, String> {
+) -> Result<BigInt, String> {
     if eval::expression_is_real(expr) {
         return Err(format!("reg range {role} cannot be real"));
     }
@@ -176,13 +213,7 @@ fn evaluate_range_endpoint(
     if value.has_unknown_bits() {
         return Err(format!("reg range {role} contains unknown bits"));
     }
-    let bigint = value.as_bigint(value.signed);
-    if bigint.sign() == Sign::Minus {
-        return Err(format!("reg range {role} must be non-negative"));
-    }
-    bigint
-        .to_usize()
-        .ok_or_else(|| format!("reg range {role} too large"))
+    Ok(value.as_bigint(value.signed))
 }
 
 pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {

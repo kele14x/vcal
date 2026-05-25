@@ -1,5 +1,7 @@
 use std::io::Cursor;
 
+use num_bigint::BigInt;
+
 use crate::lexer::{Token, tokenize};
 use crate::parser::{BinaryOp, Expr, UnaryOp, parse_expression, parse_integer};
 use crate::{Session, evaluate_input, run_repl};
@@ -4217,6 +4219,104 @@ fn reg_decl_with_reversed_range_yields_same_width() {
 }
 
 #[test]
+fn reversed_and_forward_reg_ranges_behave_the_same_in_expressions() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a").expect("forward decl");
+    session.eval("reg [0:3] b").expect("reversed decl");
+    session.eval("a = 4'b1010").expect("assign a");
+    session.eval("b = 4'b1010").expect("assign b");
+
+    assert_eq!(session.eval("a + 1").expect("a + 1").output, "32'b00000000000000000000000000001011");
+    assert_eq!(session.eval("b + 1").expect("b + 1").output, "32'b00000000000000000000000000001011");
+    assert_eq!(session.eval("a == b").expect("a == b").output, "1'b1");
+    assert_eq!(session.eval("{a,b}").expect("concat").output, "8'b10101010");
+}
+
+#[test]
+fn forward_and_reversed_reg_ranges_preserve_declared_endpoints() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a").expect("forward decl");
+    session.eval("reg [0:3] b").expect("reversed decl");
+
+    assert_eq!(
+        session.lookup_reg_range("a").expect("range for a"),
+        (&BigInt::from(3u8), &BigInt::from(0u8))
+    );
+    assert_eq!(
+        session.lookup_reg_range("b").expect("range for b"),
+        (&BigInt::from(0u8), &BigInt::from(3u8))
+    );
+}
+
+#[test]
+fn scalar_and_explicit_one_bit_reg_ranges_remain_distinct() {
+    let mut session = Session::new();
+    session.eval("reg a").expect("scalar decl");
+    session.eval("reg [0:0] b").expect("explicit one-bit decl");
+
+    assert_eq!(session.lookup_reg_range("a"), None);
+    assert_eq!(
+        session.lookup_reg_range("b").expect("range for b"),
+        (&BigInt::from(0u8), &BigInt::from(0u8))
+    );
+
+    assert_eq!(session.eval("a = 1'b1").expect("assign a").output, "1'b1");
+    assert_eq!(session.eval("b = 1'b1").expect("assign b").output, "1'b1");
+    assert_eq!(session.eval("a == b").expect("a == b").output, "1'b1");
+}
+
+#[test]
+fn assignment_preserves_declared_reg_range_metadata() {
+    let mut session = Session::new();
+    session.eval("reg [0:3] a").expect("decl");
+    session.eval("a = 4'b1010").expect("assign");
+
+    assert_eq!(
+        session.lookup_reg_range("a").expect("range for a"),
+        (&BigInt::from(0u8), &BigInt::from(3u8))
+    );
+}
+
+#[test]
+fn redeclaration_replaces_declared_reg_range_metadata() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a").expect("first decl");
+    session.eval("reg [0:3] a").expect("redecl");
+
+    assert_eq!(
+        session.lookup_reg_range("a").expect("range for a"),
+        (&BigInt::from(0u8), &BigInt::from(3u8))
+    );
+}
+
+#[test]
+fn negative_reg_ranges_preserve_declared_endpoints() {
+    let mut session = Session::new();
+    session.eval("reg [-1:0] a").expect("negative decl");
+    session.eval("reg [1:-2] b").expect("mixed-sign decl");
+
+    assert_eq!(
+        session.lookup_reg_range("a").expect("range for a"),
+        (&BigInt::from(-1), &BigInt::from(0u8))
+    );
+    assert_eq!(
+        session.lookup_reg_range("b").expect("range for b"),
+        (&BigInt::from(1u8), &BigInt::from(-2))
+    );
+}
+
+#[test]
+fn constant_expression_reg_ranges_store_evaluated_endpoints() {
+    let mut session = Session::new();
+    session.eval("reg [3+1:0] a").expect("decl");
+
+    assert_eq!(
+        session.lookup_reg_range("a").expect("range for a"),
+        (&BigInt::from(4u8), &BigInt::from(0u8))
+    );
+}
+
+#[test]
 fn reg_decl_with_constant_expression_range() {
     let mut session = Session::new();
     session.eval("reg [3+1:0] a").expect("decl");
@@ -4348,12 +4448,19 @@ fn redeclaration_replaces_the_previous_binding() {
 }
 
 #[test]
-fn reg_decl_rejects_negative_range_endpoint() {
-    let err = evaluate_input("reg [-1:0] a").expect_err("negative range should be rejected");
-    assert!(
-        err.contains("range") && err.contains("non-negative"),
-        "error should mention range and non-negative, got: {err}"
-    );
+fn reg_decl_accepts_negative_range_endpoint() {
+    let mut session = Session::new();
+    session.eval("reg [-1:0] a").expect("negative endpoint should be accepted");
+    assert_eq!(session.eval("a").expect("read").output, "2'bxx");
+}
+
+#[test]
+fn reg_decl_accepts_mixed_sign_range_endpoint() {
+    let mut session = Session::new();
+    session
+        .eval("reg [1:-2] a")
+        .expect("mixed-sign endpoints should be accepted");
+    assert_eq!(session.eval("a").expect("read").output, "4'bxxxx");
 }
 
 #[test]
