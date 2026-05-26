@@ -5295,6 +5295,33 @@ fn direction_error_runs_before_rhs_eval() {
 }
 
 #[test]
+fn lhs_bit_select_real_index_runs_before_rhs_eval() {
+    // Real-typed bit-select index is a structural LRM-5.2 violation; it
+    // must surface before the RHS is evaluated, so it wins over an
+    // undeclared-name RHS error.
+    let mut session = Session::new();
+    session.eval("reg [3:0] r = 4'h0").expect("decl");
+    let err = session
+        .eval("r[1.5] = undeclared_rhs")
+        .expect_err("real index rejected");
+    assert_eq!(err, "bit-select index cannot be real");
+    assert_eq!(session.eval("r").expect("read r").output, "4'b0000");
+}
+
+#[test]
+fn lhs_indexed_part_select_real_base_runs_before_rhs_eval() {
+    // Same rule for the `base` half of `+:` / `-:` — real bases are
+    // structurally illegal and must outrank an RHS error.
+    let mut session = Session::new();
+    session.eval("reg [3:0] r = 4'h0").expect("decl");
+    let err = session
+        .eval("r[1.5 +: 2] = undeclared_rhs")
+        .expect_err("real base rejected");
+    assert_eq!(err, "indexed part-select base cannot be real");
+    assert_eq!(session.eval("r").expect("read r").output, "4'b0000");
+}
+
+#[test]
 fn lhs_undeclared_in_concat_rejected_all_or_nothing() {
     // Concat with an undeclared leaf must not partially commit the
     // declared leaf.

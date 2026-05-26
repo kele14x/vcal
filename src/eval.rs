@@ -2518,8 +2518,9 @@ fn select_result_width(kind: &SelectKind, session: &Session) -> Result<usize, St
 // LRM A.6.2 blocking assignment, full A.8.5 variable_lvalue form. The
 // entrypoint runs every structural check (declared-name lookup,
 // scalar-reg-with-select rejection, part-select direction match, x/z in
-// constant endpoints, write-collision detection) *before* the RHS is
-// evaluated, then distributes the RHS bits into a staged variable map.
+// constant endpoints, zero indexed width, real-typed bit-select index /
+// indexed part-select base) *before* the RHS is evaluated, then
+// distributes the RHS bits into a staged variable map.
 // The caller swaps the staged map into the live session on success, so a
 // failure anywhere — even after some leaves' indices have been resolved
 // — leaves the session untouched.
@@ -2587,15 +2588,29 @@ fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
                 format!("bit-select or part-select on scalar reg `{name}` is illegal")
             })?;
             let width = match kind {
-                SelectKind::Bit { .. } => 1,
+                SelectKind::Bit { index } => {
+                    // Real-typed selects are illegal per LRM 5.2 — the
+                    // sibling RHS helpers (evaluate_bit_select,
+                    // evaluate_part_indexed_select) reject the same shapes
+                    // up-front. Catch them here too so the LHS structural
+                    // error wins over an RHS error, matching the
+                    // direction-mismatch precedence rule.
+                    if expression_is_real(index) {
+                        return Err("bit-select index cannot be real".to_string());
+                    }
+                    1
+                }
                 SelectKind::PartConst { msb, lsb } => {
                     let msb_sel = evaluate_constant_range_endpoint(msb, session, "msb")?;
                     let lsb_sel = evaluate_constant_range_endpoint(lsb, session, "lsb")?;
                     check_part_select_direction(range, &msb_sel, &lsb_sel)?;
                     compute_select_width(&msb_sel, &lsb_sel)?
                 }
-                SelectKind::PartIndexedUp { width, .. }
-                | SelectKind::PartIndexedDown { width, .. } => {
+                SelectKind::PartIndexedUp { base, width }
+                | SelectKind::PartIndexedDown { base, width } => {
+                    if expression_is_real(base) {
+                        return Err("indexed part-select base cannot be real".to_string());
+                    }
                     evaluate_indexed_select_width(width, session)?
                 }
             };
