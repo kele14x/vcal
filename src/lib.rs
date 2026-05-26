@@ -131,7 +131,33 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
             // earlier `reg [7:0] a` rather than need a separate "drop"
             // command. The new decl's width / signed / base / x-init all
             // wipe the old reg's state.
-            for name in names {
+            //
+            // Each name's init expression evaluates *before* the new binding
+            // replaces the old one, so a self-reference reads the prior
+            // value: with `reg [1:0] a = 2'b11` already in place,
+            // `reg a = a` sees the old 2-bit `a`, narrows it to the new
+            // 1-bit width via the assignment-RHS context, and stores
+            // `1'b1`. Names without an init still install x bits, so
+            // `reg a` (no init) wipes the prior binding cleanly. Inits are
+            // processed left-to-right, so a later name can refer to an
+            // earlier name's freshly-applied value in the same decl
+            // (`reg [3:0] a = 1, b = a + 1`) — matching the textual order
+            // implied by LRM A.2.3 list_of_variable_identifiers. Reusing
+            // `evaluate_assignment_rhs` keeps real→integer conversion
+            // (LRM §3.5.3, NaN/±∞ → x bits) and width / sign / base
+            // context propagation identical to `name = expr`.
+            for (name, init) in names {
+                let bits = match init {
+                    Some(init_expr) => eval::evaluate_assignment_rhs(
+                        init_expr,
+                        width,
+                        *signed,
+                        Base::Binary,
+                        session,
+                    )?
+                    .bits,
+                    None => vec![LogicBit::X; width],
+                };
                 session.variables.insert(
                     name.clone(),
                     RegValue {
@@ -140,7 +166,7 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
                             width,
                             signed: *signed,
                             base: Base::Binary,
-                            bits: vec![LogicBit::X; width],
+                            bits,
                             unsized_literal: false,
                         },
                     },

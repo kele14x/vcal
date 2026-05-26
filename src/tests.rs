@@ -4492,3 +4492,158 @@ fn session_state_persists_across_eval_calls() {
     );
     assert_eq!(session.eval("a").expect("read").output, "8'b00011110");
 }
+
+#[test]
+fn reg_decl_init_value_populates_bits() {
+    let mut session = Session::new();
+    session.eval("reg [7:0] a = 8'h2a").expect("decl with init");
+    assert_eq!(session.eval("a").expect("read").output, "8'b00101010");
+}
+
+#[test]
+fn reg_decl_init_truncates_wider_literal_to_reg_width() {
+    // The init RHS goes through the same width context as a blocking
+    // assignment, so an 8-bit literal narrowed to a 4-bit reg keeps the
+    // low 4 bits.
+    let mut session = Session::new();
+    session.eval("reg [3:0] a = 8'hff").expect("decl with init");
+    assert_eq!(session.eval("a").expect("read").output, "4'b1111");
+    let mut session = Session::new();
+    session.eval("reg [3:0] a = 8'h1f").expect("decl with init");
+    assert_eq!(session.eval("a").expect("read").output, "4'b1111");
+}
+
+#[test]
+fn reg_decl_init_sign_extends_into_signed_reg() {
+    // `-1` is unsized signed 32-bit; flowing through a signed 4-bit reg
+    // sign-extends down to all-ones — same path as `a = -1`.
+    let mut session = Session::new();
+    session.eval("reg signed [3:0] s = -1").expect("decl with signed init");
+    assert_eq!(session.eval("s").expect("read").output, "4'sb1111");
+}
+
+#[test]
+fn reg_decl_init_real_value_implicitly_converts_per_lrm_3_5_3() {
+    // Real init triggers the same implicit real→integer conversion as a
+    // blocking assignment: round half away from zero.
+    let mut session = Session::new();
+    session.eval("reg [7:0] a = 1.5").expect("real init rounds");
+    assert_eq!(session.eval("a").expect("read").output, "8'b00000010");
+    let mut session = Session::new();
+    session.eval("reg signed [7:0] a = -2.5").expect("ties away from zero");
+    assert_eq!(session.eval("a").expect("read").output, "8'sb11111101");
+    let mut session = Session::new();
+    session.eval("reg [7:0] a = 3.4").expect("rounds toward 3");
+    assert_eq!(session.eval("a").expect("read").output, "8'b00000011");
+}
+
+#[test]
+fn reg_decl_init_nan_or_infinity_fills_with_x_bits() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a = 0.0/0.0").expect("NaN");
+    assert_eq!(session.eval("a").expect("read").output, "4'bxxxx");
+    let mut session = Session::new();
+    session.eval("reg [3:0] a = 1.0/0.0").expect("+inf");
+    assert_eq!(session.eval("a").expect("read").output, "4'bxxxx");
+}
+
+#[test]
+fn reg_decl_partial_init_list_leaves_uninitialized_names_x() {
+    // `reg a, b = 5, c` declares three 1-bit regs; only `b` carries an
+    // init expression, so `a` and `c` retain the default x bits.
+    let mut session = Session::new();
+    session.eval("reg a, b = 5, c").expect("partial init list");
+    assert_eq!(session.eval("a").expect("read a").output, "1'bx");
+    assert_eq!(session.eval("b").expect("read b").output, "1'b1");
+    assert_eq!(session.eval("c").expect("read c").output, "1'bx");
+}
+
+#[test]
+fn reg_decl_init_sees_earlier_name_in_same_decl() {
+    // LRM A.2.3 lists variable_types in textual order, so the natural
+    // semantics — and the most useful for a calculator — is for `b`'s
+    // init to see `a`'s freshly-applied init value.
+    let mut session = Session::new();
+    session
+        .eval("reg [3:0] a = 1, b = a + 1")
+        .expect("sequential init");
+    assert_eq!(session.eval("a").expect("read a").output, "4'b0001");
+    assert_eq!(session.eval("b").expect("read b").output, "4'b0010");
+}
+
+#[test]
+fn reg_decl_self_referencing_init_reads_prior_binding() {
+    // The init expression is evaluated against the session as-is — i.e.
+    // before the new binding replaces the old one — so a self-reference
+    // pulls the prior value through the init RHS. Same-width redecl
+    // with `= a` is therefore an idiomatic "carry the old value forward".
+    let mut session = Session::new();
+    session.eval("reg [3:0] a = 7").expect("first decl");
+    session
+        .eval("reg [3:0] a = a")
+        .expect("redecl with self-init");
+    assert_eq!(session.eval("a").expect("read").output, "4'b0111");
+}
+
+#[test]
+fn reg_decl_self_referencing_init_narrows_prior_binding() {
+    // Narrowing redecl with `= a` carries the prior bits through the
+    // assignment-RHS width context, dropping high bits. With prior
+    // `reg [1:0] a = 2'b11` (=3) and a new 1-bit `reg a = a`, the low
+    // bit survives.
+    let mut session = Session::new();
+    session.eval("reg [1:0] a = 2'b11").expect("first decl");
+    session.eval("reg a = a").expect("redecl narrower with self-init");
+    assert_eq!(session.eval("a").expect("read").output, "1'b1");
+}
+
+#[test]
+fn reg_decl_self_referencing_init_without_prior_binding_errors() {
+    // No prior binding means the identifier in the init RHS is genuinely
+    // undeclared at evaluation time — surface the same error path as a
+    // normal expression.
+    let err = evaluate_input("reg a = a")
+        .expect_err("self-init without prior binding errors");
+    assert_eq!(err, "undeclared identifier: a");
+}
+
+#[test]
+fn reg_decl_init_can_reference_previously_declared_reg() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a = 5").expect("first decl");
+    session.eval("reg [7:0] b = a + 1").expect("init from prior reg");
+    assert_eq!(session.eval("b").expect("read").output, "8'b00000110");
+}
+
+#[test]
+fn reg_decl_init_preserves_declared_reg_range_metadata() {
+    // The init applies after the RegValue is inserted, so the range
+    // metadata stored at decl time is still present afterwards.
+    let mut session = Session::new();
+    session.eval("reg [0:3] a = 4'b1010").expect("decl with init");
+    assert_eq!(
+        session.lookup_reg_range("a").expect("range for a"),
+        (&BigInt::from(0u8), &BigInt::from(3u8))
+    );
+    assert_eq!(session.eval("a").expect("read").output, "4'b1010");
+}
+
+#[test]
+fn reg_decl_init_propagates_rhs_evaluation_error() {
+    // A bare init expression has access to the surrounding session, so
+    // referencing an undeclared identifier surfaces the usual error
+    // rather than silently leaving the new reg at x.
+    let err = evaluate_input("reg [3:0] a = nope")
+        .expect_err("undeclared identifier in init");
+    assert_eq!(err, "undeclared identifier: nope");
+}
+
+#[test]
+fn reg_decl_rejects_duplicate_names_even_with_init() {
+    let err = evaluate_input("reg [3:0] a = 1, a = 2")
+        .expect_err("duplicate names rejected");
+    assert!(
+        err.contains("duplicate name"),
+        "error should mention duplicate name, got: {err}"
+    );
+}

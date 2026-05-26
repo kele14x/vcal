@@ -108,13 +108,18 @@ pub(crate) enum Expr {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Stmt {
     Expr(Expr),
-    // LRM A.2.1.3: `reg [signed] [range] list_of_variable_identifiers ;`
-    // (no init form — that grammar belongs to `integer`/`real`). `range` is
-    // `Some((msb_expr, lsb_expr))` and constant-evaluated at apply time.
+    // LRM A.2.1.3: `reg [signed] [range] list_of_variable_identifiers ;`,
+    // where each item in the identifier list may carry an optional
+    // `= constant_expression` init. `range` is `Some((msb_expr, lsb_expr))`
+    // and constant-evaluated at apply time. Each name's optional init
+    // expression is evaluated at decl time using the same path as a
+    // blocking assignment so real→integer conversion (LRM §3.5.3) and
+    // width / sign / base context propagate identically. The unpacked
+    // `{ dimension }` form (2D arrays) is intentionally out of scope.
     Decl {
         signed: bool,
         range: Option<(Expr, Expr)>,
-        names: Vec<String>,
+        names: Vec<(String, Option<Expr>)>,
     },
     // LRM A.6.2 `blocking_assignment`. Only the variable-name LHS form is
     // supported; bit-/part-select LHSs are out of scope for this round.
@@ -385,7 +390,18 @@ impl<'a> Parser<'a> {
             None
         };
 
-        let mut names = Vec::new();
+        // LRM A.2.3 list_of_variable_identifiers ::=
+        //     variable_type { , variable_type }
+        // LRM A.2.3 variable_type ::=
+        //     variable_identifier { dimension }
+        //   | variable_identifier = constant_expression
+        // The `{ dimension }` (2D unpacked array) branch is out of scope, so
+        // each item is just `name [= expr]`. The init expression is parsed
+        // with `parse_expression`; commas naturally bind to the outer list,
+        // never to the init RHS, since no expression-level operator consumes
+        // a bare `,`. Inits are evaluated sequentially at apply time so
+        // `reg [3:0] a = 1, b = a + 1` sees `a = 1` when binding `b`.
+        let mut names: Vec<(String, Option<Expr>)> = Vec::new();
         loop {
             let name = match self.next() {
                 Some(Token::Identifier(n)) => n.clone(),
@@ -394,10 +410,16 @@ impl<'a> Parser<'a> {
             if matches!(name.as_str(), "reg" | "signed") {
                 return Err(format!("`{name}` cannot be used as a reg name"));
             }
-            if names.iter().any(|existing: &String| existing == &name) {
+            if names.iter().any(|(existing, _)| existing == &name) {
                 return Err(format!("duplicate name in reg declaration: {name}"));
             }
-            names.push(name);
+            let init = if matches!(self.peek(), Some(Token::Assign)) {
+                self.index += 1;
+                Some(self.parse_expression()?)
+            } else {
+                None
+            };
+            names.push((name, init));
             if matches!(self.peek(), Some(Token::Comma)) {
                 self.index += 1;
                 continue;

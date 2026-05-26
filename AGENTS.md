@@ -14,14 +14,14 @@ What works:
 - All operators between integers
 - Two-pass context (width, signedness) propagation
 - Leftmost-base propagation
-- `reg [signed] [range] name { , name }` declarations and blocking assignment `name = expression` (LRM A.2.1.3 / A.6.2); persistent `Session` carries reg state across REPL turns, and each reg now preserves declared `msb`/`lsb` metadata for future bit/part-select work
+- `reg [signed] [range] name [= constant_expression] { , name [= constant_expression] }` declarations and blocking assignment `name = expression` (LRM A.2.1.3 / A.2.3 / A.6.2); persistent `Session` carries reg state across REPL turns, each reg preserves declared `msb`/`lsb` metadata for future bit/part-select work, and per-name init values flow through the same RHS path as `=` (real→integer conversion, NaN/±∞ → x). Each init expression is evaluated against the session *before* the new binding replaces the old one, so a redecl with `= name` carries the prior value forward (e.g. `reg [1:0] a = 2'b11; reg a = a` → `1'b1`). The unpacked `{ dimension }` array form is intentionally out of scope.
 - `rustyline` history
 
 ## Active Scope
 
 - Single-line REPL input only
 - Integer and real literals, parentheses
-- Identifiers (simple_identifier per LRM 3.7.1) as primaries; `reg` is the only declared variable type so far (no `integer`/`real`/`time`, no init forms, no bit/part selects)
+- Identifiers (simple_identifier per LRM 3.7.1) as primaries; `reg` is the only declared variable type so far (no `integer`/`real`/`time`, no bit/part selects, no unpacked-array `{ dimension }` form). Per-name init via `name = constant_expression` is supported.
 - Top-level `Stmt` layer above `Expr`: declaration, blocking assignment, expression, and the hoisted `$finish`/`$stop` task forms; a `Session` owns the variable map (`RegValue`, not just bare `IntegerValue`) and is threaded through every evaluator entry
 - All operators between integers; arithmetic / relational / equality / logical / `?:` between reals (Table 5-2)
   - Arithmetic ops (`+ - * / % **`, unary +, unary -)
@@ -52,7 +52,7 @@ See README's "Supported Matrix" for the final target. Phase scoping beyond real 
 ## Structure
 
 - `src/main.rs` is the CLI entrypoint.
-- `src/lib.rs` is the facade: public API (`Session`, `evaluate_input`, `run_repl`, `run_interactive`, `Evaluation`, plus the `value` re-exports), the `Stmt` driver (`apply_stmt`, `compute_decl_width`), `RegRange`/`RegValue` session storage, and module declarations.
+- `src/lib.rs` is the facade: public API (`Session`, `evaluate_input`, `run_repl`, `run_interactive`, `Evaluation`, plus the `value` re-exports), the `Stmt` driver (`apply_stmt`, `evaluate_reg_range`), `RegRange`/`RegValue` session storage, and module declarations.
 - `src/value.rs` — `LogicBit`, `Base`, `IntegerValue` (incl. width/sign/base/extension logic), bit ↔ bigint helpers, 4-value truth tables.
 - `src/lexer.rs` — `Token`, `tokenize`, literal text readers.
 - `src/parser.rs` — `Stmt`/`Expr`/`UnaryOp`/`BinaryOp` AST, `parse_statements`, `Parser` + precedence-climbing levels, decl/assign helpers, `parse_integer` and literal-text parsing helpers.
