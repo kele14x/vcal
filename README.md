@@ -461,7 +461,7 @@ A declared reg can be sliced four ways (LRM 4.2.1 / 5.2.1 / 5.2.2):
 | Syntax        | Form                       | Result width  |
 |---------------|----------------------------|---------------|
 | `r[expr]`     | bit-select                 | 1             |
-| `r[m:l]`      | constant part-select       | `|m-l|+1`     |
+| `r[m:l]`      | part-select                | `|m-l|+1`     |
 | `r[b +: w]`   | indexed part-select up     | `w`           |
 | `r[b -: w]`   | indexed part-select down   | `w`           |
 
@@ -471,11 +471,28 @@ does not parse, matching the LRM production
 (`r[0] = 1'b1`) and the unpacked `{ dimension }` array form remain out
 of scope.
 
+Per LRM 5.2.1, "A bit-select or part-select of a scalar … shall be
+illegal." A reg declared without a range is a scalar even when its
+effective width is 1, so all four select forms on it are an error.
+`reg [0:0] a` is a 1-bit *vector*, on the other hand, and accepts the
+same selects any other vector does.
+
 Every select is unsigned (LRM 4.7) regardless of the source reg's
 signedness, and the result inherits the reg's display base. The width is
 fixed by the form, so the select acts as a leaf primary: outer-context
 width still widens it (zero-extension, since the result is unsigned),
 but the index / base / endpoint sub-expressions are self-determined.
+
+Unlike the LRM's elaboration-oriented constant-expression rules for
+`[m:l]` and the `width` half of `+:` / `-:`, vcal evaluates all four
+select forms at runtime against the current session state. So `m`, `l`,
+`base`, and `width` may be ordinary integer expressions that reference
+previously declared regs, as long as the final runtime values satisfy the
+same semantic checks (`width > 0`, no x/z in places where the operation
+needs a definite width, and constant-part-select direction matching the
+declared reg direction). This fits vcal's REPL model: there is no
+separate elaboration stage, so select operands are resolved when the line
+is evaluated.
 
 Source-index → internal-bit mapping is `internal = |src - lsb_decl|`,
 which works uniformly across forward, reversed, and negative-endpoint
@@ -490,7 +507,7 @@ is more significant; reversed decl → smaller is more significant).
 
 Two LRM clarifications worth pinning down:
 
-1. **Strict direction on constant part-select.** LRM 5.2.1 says "the
+1. **Strict direction on part-select.** LRM 5.2.1 says "the
    first expression shall address a more significant bit than the
    second", which uniquely fixes the legal direction relative to the
    reg's declared direction (`[m:l]` on `reg [7:0]` requires `m ≥ l`;
@@ -505,14 +522,13 @@ Two LRM clarifications worth pinning down:
    So `reg [3:0] a = 4'b0101; a[4:3]` is `2'bx0` — bit 4 is off the
    end, bit 3 is in range.
 
-x/z bits in a *runtime* index or base flow through the result: a
-bit-select with an unknown index is `1'bx`, and an indexed-part-select
-with an unknown `base` fills the whole result with `x` (we don't know
-which positions would have been in range). x/z bits in a *constant*
-part-select endpoint or in an indexed-select `width` are an error
-instead, because those positions must be constant integer expressions
-under LRM 5.2.1 / 5.2.2; a `width` of zero or negative is likewise
-rejected.
+x/z bits in a runtime index or base flow through the result: a bit-select
+with an unknown index is `1'bx`, and an indexed-part-select with an
+unknown `base` fills the whole result with `x` (we don't know which
+positions would have been in range). x/z bits in a part-select endpoint
+or in an indexed-select `width` are an error instead, because those
+positions must resolve to definite integers for the select shape to be
+known; a `width` of zero or negative is likewise rejected.
 
 ## Non-standard Behavior
 
@@ -531,6 +547,18 @@ The LRM specifies any unknown bits will cause the arithmetic operator returns al
 ### Bitwise operators
 
 LRM 1364-2005 has an internal inconsistency about operand extension: §5.1.10 says "the shorter operand is zero-filled in the most significant bit positions", but §5.5.2 says a narrower operand is sign-extended whenever the propagated type is signed (which, by §5.5.1, happens when *all* operands are signed). For `4'shF | 8'sh0` the two rules disagree — §5.1.10 would give `8'sh0F`, §5.5.2 gives `8'shFF`. vcal follows §5.5.2 (sign-extend when both signed, zero-extend otherwise), matching iverilog, VCS, Xcelium, and the IEEE 1800 (SystemVerilog) clarification that drops the §5.1.10 sentence entirely. This is the same extension rule already used by relational/equality/arithmetic in vcal, so all operators stay consistent.
+
+### Bit-select and part-select operands
+
+The Verilog LRM requires constant-expression operands for `r[m:l]` and
+for the `width` half of `r[b +: w]` / `r[b -: w]`, because simulators and
+synthesizers resolve those shapes during elaboration. vcal has no
+separate elaboration stage: the REPL evaluates each input directly
+against the current `Session`. So vcal deliberately relaxes those forms
+to ordinary integer expressions evaluated at runtime. The resulting
+values still must be usable as a select shape: part-select endpoints and
+indexed widths must resolve to definite integers, and indexed widths must
+be positive.
 
 ### Real numbers
 

@@ -4951,6 +4951,36 @@ fn bit_select_on_negative_endpoint_reg() {
 }
 
 #[test]
+fn select_on_scalar_reg_is_illegal_per_lrm_5_2_1() {
+    // LRM 5.2.1: "A bit-select or part-select of a scalar ... shall be
+    // illegal." A reg declared with no range is a scalar even when its
+    // width happens to be 1; all four select forms must reject it.
+    let mut session = Session::new();
+    session.eval("reg a").expect("scalar decl");
+    for form in ["a[0]", "a[0:0]", "a[0 +: 1]", "a[0 -: 1]"] {
+        let err = session
+            .eval(form)
+            .expect_err(&format!("{form} on scalar reg should error"));
+        assert!(
+            err.contains("scalar reg"),
+            "error should mention scalar reg, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn one_bit_vector_reg_still_allows_selects() {
+    // `reg [0:0] a` is a 1-bit *vector*, not a scalar, so the same
+    // selects that error on `reg a` succeed here.
+    let mut session = Session::new();
+    session.eval("reg [0:0] a = 1'b1").expect("vector decl");
+    assert_eq!(session.eval("a[0]").expect("bit").output, "1'b1");
+    assert_eq!(session.eval("a[0:0]").expect("part const").output, "1'b1");
+    assert_eq!(session.eval("a[0 +: 1]").expect("up").output, "1'b1");
+    assert_eq!(session.eval("a[0 -: 1]").expect("down").output, "1'b1");
+}
+
+#[test]
 fn indexed_part_select_requires_adjacent_colon() {
     // `+:` is lexed greedily and adjacency-only; a space between the
     // `+` and `:` breaks the token boundary and the bracket contents

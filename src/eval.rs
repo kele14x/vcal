@@ -2262,20 +2262,27 @@ fn evaluate_select(
     let reg = session
         .lookup(name)
         .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+    // LRM 5.2.1: "A bit-select or part-select of a scalar ... shall be
+    // illegal." A reg declared without a range is a scalar even when
+    // its width happens to be 1, distinct from the 1-bit vector
+    // `reg [0:0] a` which does accept selects.
+    let range = reg.range.as_ref().ok_or_else(|| {
+        format!("bit-select or part-select on scalar reg `{name}` is illegal")
+    })?;
     let base = reg.value.base;
     match kind {
-        SelectKind::Bit { index } => evaluate_bit_select(reg, index, base, session),
+        SelectKind::Bit { index } => evaluate_bit_select(reg, range, index, base, session),
         SelectKind::PartConst { msb, lsb } => {
-            evaluate_part_const_select(reg, msb, lsb, base, session)
+            evaluate_part_const_select(reg, range, msb, lsb, base, session)
         }
         SelectKind::PartIndexedUp {
             base: base_expr,
             width,
-        } => evaluate_part_indexed_select(reg, base_expr, width, base, session, true),
+        } => evaluate_part_indexed_select(reg, range, base_expr, width, base, session, true),
         SelectKind::PartIndexedDown {
             base: base_expr,
             width,
-        } => evaluate_part_indexed_select(reg, base_expr, width, base, session, false),
+        } => evaluate_part_indexed_select(reg, range, base_expr, width, base, session, false),
     }
 }
 
@@ -2285,6 +2292,7 @@ fn evaluate_select(
 // (e.g. `reg [-1:2]`) and signed-indexed selects line up.
 fn evaluate_bit_select(
     reg: &RegValue,
+    range: &RegRange,
     index: &Expr,
     result_base: Base,
     session: &Session,
@@ -2297,18 +2305,20 @@ fn evaluate_bit_select(
         return Ok(IntegerValue::all_x(1, false, result_base));
     }
     let src_index = index_value.as_bigint(index_value.signed);
-    let bit = match resolve_reg_index(reg.range.as_ref(), &src_index, reg.value.width) {
+    let bit = match resolve_reg_index(range, &src_index) {
         Some(internal) => reg.value.bits[internal],
         None => LogicBit::X,
     };
     Ok(IntegerValue::computed(1, false, result_base, vec![bit]))
 }
 
-// LRM 5.2.1 constant part-select. Both endpoints are constant
-// expressions evaluated against the current session (same shape as a
-// reg-decl range half), and direction must match the declared reg.
+// LRM 5.2.1 `[msb:lsb]` part-select. The endpoints are runtime
+// expressions in vcal (the LRM requires constants, but the REPL has no
+// separate elaboration stage), and their direction must match the
+// declared reg.
 fn evaluate_part_const_select(
     reg: &RegValue,
+    range: &RegRange,
     msb_expr: &Expr,
     lsb_expr: &Expr,
     result_base: Base,
@@ -2316,9 +2326,9 @@ fn evaluate_part_const_select(
 ) -> Result<IntegerValue, String> {
     let msb_sel = evaluate_constant_range_endpoint(msb_expr, session, "msb")?;
     let lsb_sel = evaluate_constant_range_endpoint(lsb_expr, session, "lsb")?;
-    check_part_const_direction(reg.range.as_ref(), &msb_sel, &lsb_sel)?;
+    check_part_select_direction(range, &msb_sel, &lsb_sel)?;
     let width = compute_select_width(&msb_sel, &lsb_sel)?;
-    materialize_part_select(reg, &msb_sel, &lsb_sel, width, result_base)
+    materialize_part_select(reg, range, &msb_sel, &lsb_sel, width, result_base)
 }
 
 // LRM 5.2.2 indexed part-select. `width` is a positive constant; `base`
@@ -2328,6 +2338,7 @@ fn evaluate_part_const_select(
 // range is the result's MSB depends on the reg's declared direction.
 fn evaluate_part_indexed_select(
     reg: &RegValue,
+    range: &RegRange,
     base_expr: &Expr,
     width_expr: &Expr,
     result_base: Base,
@@ -2353,13 +2364,13 @@ fn evaluate_part_indexed_select(
     };
     // Forward decl (msb_decl >= lsb_decl): larger source index is more
     // significant. Reversed decl: smaller source index is more
-    // significant. Scalar reg falls into the forward branch trivially —
-    // resolve_reg_index will reject any non-zero source index anyway.
-    let (msb_sel, lsb_sel) = match &reg.range {
-        Some(r) if r.msb < r.lsb => (src_lo, src_hi),
-        _ => (src_hi, src_lo),
+    // significant.
+    let (msb_sel, lsb_sel) = if range.msb < range.lsb {
+        (src_lo, src_hi)
+    } else {
+        (src_hi, src_lo)
     };
-    materialize_part_select(reg, &msb_sel, &lsb_sel, width, result_base)
+    materialize_part_select(reg, range, &msb_sel, &lsb_sel, width, result_base)
 }
 
 // Copies the bits of a part-select into the result, LSB-first. LRM
@@ -2368,6 +2379,7 @@ fn evaluate_part_indexed_select(
 // become x (e.g. `reg [3:0] a = 4'b0101; a[4:3]` → `2'bx0`).
 fn materialize_part_select(
     reg: &RegValue,
+    range: &RegRange,
     msb_sel: &BigInt,
     lsb_sel: &BigInt,
     width: usize,
@@ -2381,7 +2393,7 @@ fn materialize_part_select(
     let mut bits = Vec::with_capacity(width);
     let mut src = lsb_sel.clone();
     for _ in 0..width {
-        let bit = match resolve_reg_index(reg.range.as_ref(), &src, reg.value.width) {
+        let bit = match resolve_reg_index(range, &src) {
             Some(internal) => reg.value.bits[internal],
             None => LogicBit::X,
         };
@@ -2394,29 +2406,18 @@ fn materialize_part_select(
 // Source-index → internal-bits-index mapping. The formula
 // `internal = |src - lsb_decl|` works uniformly for forward decls
 // (`[7:0]`), reversed decls (`[0:7]`), and negative-endpoint decls
-// (`[-1:2]`); a scalar reg has no declared range so the only legal
-// source index is 0.
-fn resolve_reg_index(range: Option<&RegRange>, src: &BigInt, reg_width: usize) -> Option<usize> {
-    match range {
-        None => {
-            if src.is_zero() && reg_width >= 1 {
-                Some(0)
-            } else {
-                None
-            }
-        }
-        Some(r) => {
-            let (lo, hi) = if r.msb >= r.lsb {
-                (&r.lsb, &r.msb)
-            } else {
-                (&r.msb, &r.lsb)
-            };
-            if src < lo || src > hi {
-                return None;
-            }
-            (src - &r.lsb).abs().to_usize()
-        }
+// (`[-1:2]`). Scalar regs are rejected upstream in `evaluate_select`
+// per LRM 5.2.1, so a `range` is always available here.
+fn resolve_reg_index(range: &RegRange, src: &BigInt) -> Option<usize> {
+    let (lo, hi) = if range.msb >= range.lsb {
+        (&range.lsb, &range.msb)
+    } else {
+        (&range.msb, &range.lsb)
+    };
+    if src < lo || src > hi {
+        return None;
     }
+    (src - &range.lsb).abs().to_usize()
 }
 
 // Shape mirrors lib.rs::evaluate_range_endpoint — same "constant
@@ -2463,36 +2464,25 @@ fn evaluate_indexed_select_width(expr: &Expr, session: &Session) -> Result<usize
 // msb_sel vs lsb_sel must match the declared reg's direction. iverilog
 // merely warns; we treat it as an error because the rule is unambiguous
 // and silent reinterpretation hides a real bug.
-fn check_part_const_direction(
-    range: Option<&RegRange>,
+fn check_part_select_direction(
+    range: &RegRange,
     msb_sel: &BigInt,
     lsb_sel: &BigInt,
 ) -> Result<(), String> {
-    match range {
-        None => {
-            if msb_sel.is_zero() && lsb_sel.is_zero() {
-                Ok(())
-            } else {
-                Err("constant part-select on scalar reg must be [0:0]".to_string())
-            }
-        }
-        Some(r) => {
-            let forward = r.msb >= r.lsb;
-            let ok = if forward {
-                msb_sel >= lsb_sel
-            } else {
-                msb_sel <= lsb_sel
-            };
-            if ok {
-                Ok(())
-            } else {
-                Err(format!(
-                    "constant part-select direction does not match reg declaration: \
-                     reg is [{}:{}], select is [{}:{}]",
-                    r.msb, r.lsb, msb_sel, lsb_sel
-                ))
-            }
-        }
+    let forward = range.msb >= range.lsb;
+    let ok = if forward {
+        msb_sel >= lsb_sel
+    } else {
+        msb_sel <= lsb_sel
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "part-select direction does not match reg declaration: \
+             reg is [{}:{}], select is [{}:{}]",
+            range.msb, range.lsb, msb_sel, lsb_sel
+        ))
     }
 }
 
