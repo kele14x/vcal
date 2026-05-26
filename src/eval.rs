@@ -271,6 +271,9 @@ fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> 
             then_expr,
             else_expr,
         } => {
+            validate_expr_structure(cond, session)?;
+            validate_expr_structure(then_expr, session)?;
+            validate_expr_structure(else_expr, session)?;
             let cond_logical = logical_value_of_expr(cond, session)?;
             match cond_logical {
                 LogicBit::One => evaluate_expr_as_real(then_expr, session),
@@ -431,6 +434,192 @@ fn logical_value_of_expr(expr: &Expr, session: &Session) -> Result<LogicBit, Str
         Ok(logical_value_of_real(evaluate_expr_as_real(expr, session)?))
     } else {
         Ok(logical_value(&evaluate_expr_in_context(expr, None, session)?))
+    }
+}
+
+fn validate_select_expr_structure(
+    name: &str,
+    kind: &SelectKind,
+    inner: Option<&SelectKind>,
+    session: &Session,
+) -> Result<(), String> {
+    match kind {
+        SelectKind::Bit { index } => validate_expr_structure(index, session)?,
+        SelectKind::PartConst { msb, lsb } => {
+            validate_expr_structure(msb, session)?;
+            validate_expr_structure(lsb, session)?;
+        }
+        SelectKind::PartIndexedUp { base, width }
+        | SelectKind::PartIndexedDown { base, width } => {
+            validate_expr_structure(base, session)?;
+            validate_expr_structure(width, session)?;
+        }
+    }
+    if let Some(inner_kind) = inner {
+        match inner_kind {
+            SelectKind::Bit { index } => validate_expr_structure(index, session)?,
+            SelectKind::PartConst { msb, lsb } => {
+                validate_expr_structure(msb, session)?;
+                validate_expr_structure(lsb, session)?;
+            }
+            SelectKind::PartIndexedUp { base, width }
+            | SelectKind::PartIndexedDown { base, width } => {
+                validate_expr_structure(base, session)?;
+                validate_expr_structure(width, session)?;
+            }
+        }
+    }
+    let _ = infer_select_meta(name, kind, inner, session)?;
+    Ok(())
+}
+
+fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String> {
+    match expr {
+        Expr::Literal(_) | Expr::RealLiteral(_) => Ok(()),
+        Expr::Grouped(inner) => validate_expr_structure(inner, session),
+        Expr::Unary { op, expr } => {
+            validate_expr_structure(expr, session)?;
+            if expression_is_real(expr)
+                && matches!(
+                    op,
+                    UnaryOp::BitwiseNot
+                        | UnaryOp::ReductionAnd
+                        | UnaryOp::ReductionNand
+                        | UnaryOp::ReductionOr
+                        | UnaryOp::ReductionNor
+                        | UnaryOp::ReductionXor
+                        | UnaryOp::ReductionXnor
+                )
+            {
+                return Err(format!(
+                    "operator {} not allowed on real operand",
+                    unary_op_name(*op)
+                ));
+            }
+            Ok(())
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            validate_expr_structure(lhs, session)?;
+            validate_expr_structure(rhs, session)?;
+            if expression_is_real(lhs) || expression_is_real(rhs) {
+                match op {
+                    BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Power
+                    | BinaryOp::LessThan
+                    | BinaryOp::GreaterThan
+                    | BinaryOp::LessThanOrEqual
+                    | BinaryOp::GreaterThanOrEqual
+                    | BinaryOp::Equal
+                    | BinaryOp::NotEqual
+                    | BinaryOp::LogicalAnd
+                    | BinaryOp::LogicalOr => {}
+                    _ => {
+                        return Err(format!(
+                            "operator {} not allowed on real operand",
+                            binary_op_name(*op)
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            validate_expr_structure(cond, session)?;
+            validate_expr_structure(then_expr, session)?;
+            validate_expr_structure(else_expr, session)
+        }
+        Expr::Concatenation { items } => {
+            for item in items {
+                validate_expr_structure(item, session)?;
+                if expression_is_real(item) {
+                    return Err("concatenation operand cannot be real".to_string());
+                }
+            }
+            let _ = collect_concatenation_bits(items, session)?;
+            Ok(())
+        }
+        Expr::Replication { count, items } => {
+            validate_expr_structure(count, session)?;
+            if expression_is_real(count) {
+                return Err("replication count cannot be real".to_string());
+            }
+            for item in items {
+                validate_expr_structure(item, session)?;
+                if expression_is_real(item) {
+                    return Err("replication operand cannot be real".to_string());
+                }
+            }
+            let _ = evaluate_replication_count(count, session)?;
+            let _ = collect_concatenation_bits(items, session)?;
+            Ok(())
+        }
+        Expr::SignCast { signed, arg } => {
+            validate_expr_structure(arg, session)?;
+            if expression_is_real(arg) {
+                return Err(format!(
+                    "{} argument cannot be real",
+                    if *signed { "$signed" } else { "$unsigned" }
+                ));
+            }
+            Ok(())
+        }
+        Expr::BaseCast { base, arg } => {
+            validate_expr_structure(arg, session)?;
+            if expression_is_real(arg) {
+                return Err(format!("{} argument cannot be real", base_cast_name(*base)));
+            }
+            Ok(())
+        }
+        Expr::RealConversion { kind, arg } => {
+            validate_expr_structure(arg, session)?;
+            match kind {
+                RealConversionKind::IntegerToReal
+                | RealConversionKind::RealToInteger
+                | RealConversionKind::RealToBits => Ok(()),
+                RealConversionKind::BitsToReal => {
+                    if expression_is_real(arg) {
+                        return Err("$bitstoreal argument cannot be real".to_string());
+                    }
+                    let arg_meta = infer_expr_meta(arg, session)?;
+                    if arg_meta.width != 64 {
+                        return Err(format!(
+                            "$bitstoreal argument must be 64 bits wide, got {}",
+                            arg_meta.width
+                        ));
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Expr::MathFunction { kind, args } => {
+            for arg in args {
+                validate_expr_structure(arg, session)?;
+            }
+            if kind.is_real_result() {
+                Ok(())
+            } else {
+                let _ = infer_expr_meta(expr, session)?;
+                Ok(())
+            }
+        }
+        Expr::SystemTask { name } => Err(task_in_expression_error(name)),
+        Expr::Identifier(name) => {
+            let reg = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            let _ = reg.require_vector(name)?;
+            Ok(())
+        }
+        Expr::Select { name, kind, inner } => {
+            validate_select_expr_structure(name, kind, inner.as_deref(), session)
+        }
     }
 }
 
@@ -730,53 +919,70 @@ fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
         // `Expr::Select` arm here mirrors `evaluate_select`'s dispatch so
         // the two-pass context propagation sees the same shape the
         // materialised value will have.
-        Expr::Select { name, kind, inner } => {
-            let reg = session
-                .lookup(name)
-                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-            if let Some((_, elements)) = reg.array() {
-                if !matches!(kind, SelectKind::Bit { .. }) {
-                    return Err(format!(
-                        "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
-                    ));
-                }
-                let template = &elements[0];
-                if let Some(inner_kind) = inner {
-                    // The inner select runs against the packed element; it
-                    // must have a packed range to address, and the
-                    // resulting value is always unsigned per LRM 4.7.
-                    if reg.range.is_none() {
-                        return Err(format!(
-                            "bit-select or part-select on scalar array element `{name}` is illegal"
-                        ));
-                    }
-                    let width = select_result_width(inner_kind, session)?;
-                    return Ok(ExprMeta {
-                        width,
-                        signed: false,
-                        base: template.base,
-                    });
-                }
-                return Ok(ExprMeta {
-                    width: template.width,
-                    signed: template.signed,
-                    base: template.base,
-                });
-            }
-            if inner.is_some() {
+        Expr::Select { name, kind, inner } => infer_select_meta(name, kind, inner.as_deref(), session),
+    }
+}
+
+fn infer_select_meta(
+    name: &str,
+    kind: &SelectKind,
+    inner: Option<&SelectKind>,
+    session: &Session,
+) -> Result<ExprMeta, String> {
+    let reg = session
+        .lookup(name)
+        .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+    if reg.is_array() {
+        let index = match kind {
+            SelectKind::Bit { index } => index,
+            SelectKind::PartConst { .. }
+            | SelectKind::PartIndexedUp { .. }
+            | SelectKind::PartIndexedDown { .. } => {
                 return Err(format!(
-                    "chained select on `{name}` is illegal: `{name}` is not an array"
+                    "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
                 ));
             }
-            let value = reg.require_vector(name)?;
-            let width = select_result_width(kind, session)?;
-            Ok(ExprMeta {
+        };
+        if expression_is_real(index) {
+            return Err("array element index cannot be real".to_string());
+        }
+        let (_, elements) = reg
+            .array()
+            .expect("is_array() => array() returns Some");
+        let template = &elements[0];
+        if let Some(inner_kind) = inner {
+            let element_range = reg.range.as_ref().ok_or_else(|| {
+                format!("bit-select or part-select on scalar array element `{name}` is illegal")
+            })?;
+            let width = select_meta_width(inner_kind, element_range, session)?;
+            return Ok(ExprMeta {
                 width,
                 signed: false,
-                base: value.base,
-            })
+                base: template.base,
+            });
         }
+        return Ok(ExprMeta {
+            width: template.width,
+            signed: template.signed,
+            base: template.base,
+        });
     }
+    if inner.is_some() {
+        return Err(format!(
+            "chained select on `{name}` is illegal: `{name}` is not an array"
+        ));
+    }
+    let value = reg.require_vector(name)?;
+    let range = reg
+        .range
+        .as_ref()
+        .ok_or_else(|| format!("bit-select or part-select on scalar reg `{name}` is illegal"))?;
+    let width = select_meta_width(kind, range, session)?;
+    Ok(ExprMeta {
+        width,
+        signed: false,
+        base: value.base,
+    })
 }
 
 fn combine_binary_meta(op: BinaryOp, lhs_meta: ExprMeta, rhs_meta: ExprMeta) -> ExprMeta {
@@ -1561,6 +1767,9 @@ fn evaluate_conditional_expr(
     if expression_is_real(then_expr) || expression_is_real(else_expr) {
         unreachable!("real-typed conditional should be handled by the real path")
     }
+    validate_expr_structure(cond, session)?;
+    validate_expr_structure(then_expr, session)?;
+    validate_expr_structure(else_expr, session)?;
     let then_meta = infer_expr_meta(then_expr, session)?;
     let else_meta = infer_expr_meta(else_expr, session)?;
     let meta = ExprMeta {
@@ -2749,25 +2958,6 @@ fn select_meta_width(
             if expression_is_real(base) {
                 return Err("indexed part-select base cannot be real".to_string());
             }
-            evaluate_indexed_select_width(width, session)
-        }
-    }
-}
-
-// Same dispatch shape as `evaluate_select`, but only computes the
-// result width — used by `infer_expr_meta` so the surrounding
-// expression's two-pass width/sign inference matches what the
-// materialised select will produce.
-fn select_result_width(kind: &SelectKind, session: &Session) -> Result<usize, String> {
-    match kind {
-        SelectKind::Bit { .. } => Ok(1),
-        SelectKind::PartConst { msb, lsb } => {
-            let msb_sel = evaluate_constant_range_endpoint(msb, session, "msb")?;
-            let lsb_sel = evaluate_constant_range_endpoint(lsb, session, "lsb")?;
-            compute_select_width(&msb_sel, &lsb_sel)
-        }
-        SelectKind::PartIndexedUp { width, .. }
-        | SelectKind::PartIndexedDown { width, .. } => {
             evaluate_indexed_select_width(width, session)
         }
     }

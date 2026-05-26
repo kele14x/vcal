@@ -58,3 +58,8 @@ Specific forward-looking items lifted from the original requirements / gap notes
 ## Known issues
 
 - Malformed real literals like `1._0` or `9.` surface as `invalid decimal digits: 1.0` after the underscore-strip / digit-strip step, because the lexer's `real_after_dot` lookahead requires `.` followed by a digit and otherwise falls through to the integer path. The diagnostic is correct in spirit (the literal is not a valid real) but the message is misleading. A future pass should recognize "digit-run + `.`" as a real-literal commitment and emit a real-specific error.
+
+## Recent updates
+
+- Conditional-expression width inference now validates select operands structurally before borrowing their width, so malformed selects like `1 ? 4'd1 : r[1.0]` and `1 ? 4'd1 : a[0][0:3]` error even when they sit in an untaken branch.
+- Conditional expressions now structurally validate `cond`, `then`, and `else` before branch choice on both integer and real paths, so untaken branches can no longer hide static-semantic errors such as `$bitstoreal(1'b0)`, `1.0 % 1`, `$signed(1.0)`, or nested bad selects.

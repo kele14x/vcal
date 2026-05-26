@@ -2307,6 +2307,84 @@ fn conditional_signedness_propagates_per_5_5_1() {
 }
 
 #[test]
+fn untaken_conditional_branch_still_rejects_real_vector_bit_select_index() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] r").expect("decl");
+    let err = session
+        .eval("1 ? 4'd1 : r[1.0]")
+        .expect_err("real vector select index should fail during meta inference");
+    assert!(err.contains("bit-select index cannot be real"));
+}
+
+#[test]
+fn untaken_conditional_branch_still_rejects_real_array_element_index() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a [0:7]").expect("decl");
+    let err = session
+        .eval("1 ? 4'd1 : a[1.0]")
+        .expect_err("real array element index should fail during meta inference");
+    assert!(err.contains("array element index cannot be real"));
+}
+
+#[test]
+fn untaken_conditional_branch_still_rejects_real_array_inner_bit_select_index() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a [0:7]").expect("decl");
+    let err = session
+        .eval("1 ? 4'd1 : a[0][1.0]")
+        .expect_err("real inner bit-select index should fail during meta inference");
+    assert!(err.contains("bit-select index cannot be real"));
+}
+
+#[test]
+fn untaken_conditional_branch_still_rejects_array_inner_part_direction_mismatch() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a [0:7]").expect("decl");
+    let err = session
+        .eval("1 ? 4'd1 : a[0][0:3]")
+        .expect_err("inner direction mismatch should fail during meta inference");
+    assert!(err.contains("part-select direction does not match"));
+}
+
+#[test]
+fn untaken_real_conditional_branch_still_rejects_bitstoreal_wrong_width() {
+    let err = evaluate_input("1 ? 1.0 : $bitstoreal(1'b0)")
+        .expect_err("bad $bitstoreal width should fail during branch validation");
+    assert!(err.contains("$bitstoreal argument must be 64 bits wide"));
+}
+
+#[test]
+fn untaken_real_conditional_branch_still_rejects_modulus_on_real() {
+    let err = evaluate_input("1 ? 1.0 : 1.0 % 1")
+        .expect_err("real modulus should fail during branch validation");
+    assert!(err.contains("operator % not allowed on real operand"));
+}
+
+#[test]
+fn untaken_real_conditional_branch_still_rejects_sign_cast_on_real() {
+    let err = evaluate_input("1 ? 1.0 : $signed(1.0)")
+        .expect_err("sign cast on real should fail during branch validation");
+    assert!(err.contains("$signed argument cannot be real"));
+}
+
+#[test]
+fn untaken_real_conditional_branch_still_rejects_system_task() {
+    let err = evaluate_input("1 ? 1.0 : ($finish)")
+        .expect_err("system task should fail during branch validation");
+    assert!(err.contains("system task"));
+}
+
+#[test]
+fn hidden_error_in_conditional_condition_is_still_rejected() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] r").expect("decl");
+    let err = session
+        .eval("(1 ? 1'b1 : r[1.0]) ? 1'b1 : 1'b0")
+        .expect_err("invalid select in condition should fail before branch choice");
+    assert!(err.contains("bit-select index cannot be real"));
+}
+
+#[test]
 fn conditional_extends_per_5_5_2_not_per_5_1_13() {
     // LRM §5.1.13 last paragraph says the shorter branch is zero-filled
     // from the left, but §5.5.2 says signed-signed unifies under a
