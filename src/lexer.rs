@@ -24,6 +24,10 @@ pub(crate) enum Token {
     Assign,
     Plus,
     Minus,
+    // `+:` and `-:` open an indexed part-select (LRM 5.2.2). Lexed greedily
+    // and adjacency-only: no whitespace between the `+`/`-` and the `:`.
+    PlusColon,
+    MinusColon,
     Star,
     Slash,
     Percent,
@@ -70,8 +74,22 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
         match ch {
             '(' => tokens.push(Token::LParen),
             ')' => tokens.push(Token::RParen),
-            '+' => tokens.push(Token::Plus),
-            '-' => tokens.push(Token::Minus),
+            '+' => {
+                if matches!(chars.peek(), Some((_, ':'))) {
+                    chars.next();
+                    tokens.push(Token::PlusColon);
+                } else {
+                    tokens.push(Token::Plus);
+                }
+            }
+            '-' => {
+                if matches!(chars.peek(), Some((_, ':'))) {
+                    chars.next();
+                    tokens.push(Token::MinusColon);
+                } else {
+                    tokens.push(Token::Minus);
+                }
+            }
             '/' => tokens.push(Token::Slash),
             '%' => tokens.push(Token::Percent),
             '*' => {

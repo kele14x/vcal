@@ -100,6 +100,43 @@ pub(crate) enum Expr {
     // supports). The evaluator looks it up in the active `Session`; an
     // unknown name surfaces as "undeclared identifier: <name>".
     Identifier(String),
+    // LRM 4.2.1 / 5.2.1 / 5.2.2: bit-select and part-select on a declared
+    // identifier. Storing `name: String` rather than a nested
+    // `Expr::Identifier` is deliberate — it makes the grammar reject
+    // `4'b1111[0]` at parse time, because `parse_primary` only enters the
+    // bracket-pickup branch from the `Token::Identifier` arm. LHS selects
+    // and unpacked array `{ dimension }` are out of scope.
+    Select {
+        name: String,
+        kind: SelectKind,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SelectKind {
+    // `r[expr]`. `index` is a self-determined integer expression
+    // (LRM 4.2.1). Result is 1-bit unsigned.
+    Bit { index: Box<Expr> },
+    // `r[m:l]`. Both endpoints are constant expressions (LRM 5.2.1).
+    // Direction must match the declared reg direction.
+    PartConst {
+        msb: Box<Expr>,
+        lsb: Box<Expr>,
+    },
+    // `r[base +: width]`. `base` is a self-determined integer expression;
+    // `width` is a positive constant (LRM 5.2.2). Result spans the source
+    // range `[base, base + width - 1]`.
+    PartIndexedUp {
+        base: Box<Expr>,
+        width: Box<Expr>,
+    },
+    // `r[base -: width]`. `base` is a self-determined integer expression;
+    // `width` is a positive constant (LRM 5.2.2). Result spans the source
+    // range `[base - width + 1, base]`.
+    PartIndexedDown {
+        base: Box<Expr>,
+        width: Box<Expr>,
+    },
 }
 
 // Top-level inputs. A REPL line / piped script segment between semicolons is
@@ -725,7 +762,19 @@ impl<'a> Parser<'a> {
                 let name = name.clone();
                 self.parse_system_function_call(&name)
             }
-            Some(Token::Identifier(name)) => Ok(Expr::Identifier(name.clone())),
+            Some(Token::Identifier(name)) => {
+                let name = name.clone();
+                // Bit-select / part-select picked up here, not at
+                // statement level — so `r[0]` in expression position works
+                // while `4'b1111[0]` (literal primary) still parse-errors
+                // because we never reach this branch.
+                if matches!(self.peek(), Some(Token::LBracket)) {
+                    self.index += 1;
+                    self.parse_select_after_bracket(name)
+                } else {
+                    Ok(Expr::Identifier(name))
+                }
+            }
             Some(Token::LParen) => {
                 let expr = self.parse_expression()?;
                 match self.next() {
@@ -906,6 +955,61 @@ impl<'a> Parser<'a> {
             _ => return Err("missing closing brace in concatenation".to_string()),
         }
         Ok(Expr::Concatenation { items })
+    }
+
+    // Caller has consumed the `[` after an identifier; dispatch on the
+    // separator after the first sub-expression to pick the select form.
+    // Whitespace-around-`+`/`-` in the indexed-select forms doesn't pass
+    // through here because the lexer rejects it: `+:`/`-:` are
+    // adjacency-only tokens.
+    fn parse_select_after_bracket(&mut self, name: String) -> Result<Expr, String> {
+        let first = self.parse_expression()?;
+        let kind = match self.peek() {
+            Some(Token::RBracket) => {
+                self.index += 1;
+                SelectKind::Bit {
+                    index: Box::new(first),
+                }
+            }
+            Some(Token::Colon) => {
+                self.index += 1;
+                let lsb = self.parse_expression()?;
+                match self.next() {
+                    Some(Token::RBracket) => {}
+                    _ => return Err("expected `]` after part-select range".to_string()),
+                }
+                SelectKind::PartConst {
+                    msb: Box::new(first),
+                    lsb: Box::new(lsb),
+                }
+            }
+            Some(Token::PlusColon) => {
+                self.index += 1;
+                let width = self.parse_expression()?;
+                match self.next() {
+                    Some(Token::RBracket) => {}
+                    _ => return Err("expected `]` after indexed part-select width".to_string()),
+                }
+                SelectKind::PartIndexedUp {
+                    base: Box::new(first),
+                    width: Box::new(width),
+                }
+            }
+            Some(Token::MinusColon) => {
+                self.index += 1;
+                let width = self.parse_expression()?;
+                match self.next() {
+                    Some(Token::RBracket) => {}
+                    _ => return Err("expected `]` after indexed part-select width".to_string()),
+                }
+                SelectKind::PartIndexedDown {
+                    base: Box::new(first),
+                    width: Box::new(width),
+                }
+            }
+            _ => return Err("expected `]`, `:`, `+:`, or `-:` in select".to_string()),
+        };
+        Ok(Expr::Select { name, kind })
     }
 
     fn parse_concatenation_items(&mut self) -> Result<Vec<Expr>, String> {

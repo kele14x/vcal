@@ -454,6 +454,66 @@ participates in the surrounding expression like any other primary — its
 on the left of `+` makes the result render in binary). Referencing an
 undeclared name is an error.
 
+### Bit-select and part-select
+
+A declared reg can be sliced four ways (LRM 4.2.1 / 5.2.1 / 5.2.2):
+
+| Syntax        | Form                       | Result width  |
+|---------------|----------------------------|---------------|
+| `r[expr]`     | bit-select                 | 1             |
+| `r[m:l]`      | constant part-select       | `|m-l|+1`     |
+| `r[b +: w]`   | indexed part-select up     | `w`           |
+| `r[b -: w]`   | indexed part-select down   | `w`           |
+
+The select grammar only attaches to a declared identifier — `4'b1111[0]`
+does not parse, matching the LRM production
+`identifier [ { [ expression ] } [ range_expression ] ]`. LHS selects
+(`r[0] = 1'b1`) and the unpacked `{ dimension }` array form remain out
+of scope.
+
+Every select is unsigned (LRM 4.7) regardless of the source reg's
+signedness, and the result inherits the reg's display base. The width is
+fixed by the form, so the select acts as a leaf primary: outer-context
+width still widens it (zero-extension, since the result is unsigned),
+but the index / base / endpoint sub-expressions are self-determined.
+
+Source-index → internal-bit mapping is `internal = |src - lsb_decl|`,
+which works uniformly across forward, reversed, and negative-endpoint
+decls. For example, `reg [-1:2] r = 4'b1011` has width 4; `r[-1]` maps
+to internal index `|-1 - 2| = 3` (the MSB end of the stored bits) and
+`r[2]` maps to internal index `0` (the LSB end). For indexed
+part-selects the source range is always numerically `[base, base+w-1]`
+(for `+:`) or `[base-w+1, base]` (for `-:`) regardless of the reg's
+declared direction; which end of that range becomes the result's MSB
+depends on the declared direction (forward decl → larger source index
+is more significant; reversed decl → smaller is more significant).
+
+Two LRM clarifications worth pinning down:
+
+1. **Strict direction on constant part-select.** LRM 5.2.1 says "the
+   first expression shall address a more significant bit than the
+   second", which uniquely fixes the legal direction relative to the
+   reg's declared direction (`[m:l]` on `reg [7:0]` requires `m ≥ l`;
+   on `reg [0:7]` requires `m ≤ l`). iverilog merely warns when the
+   directions disagree; vcal errors, because the rule is unambiguous
+   and silently reinterpreting the select hides a real bug.
+2. **Out-of-range part-select bits are x per position.** LRM 4.2.1
+   mandates that a bit-select with an out-of-range index returns `x`.
+   For partial-overlap part-selects we apply the same rule one position
+   at a time: each result bit whose source index falls outside the
+   declared reg becomes `x`, and in-range bits keep their actual value.
+   So `reg [3:0] a = 4'b0101; a[4:3]` is `2'bx0` — bit 4 is off the
+   end, bit 3 is in range.
+
+x/z bits in a *runtime* index or base flow through the result: a
+bit-select with an unknown index is `1'bx`, and an indexed-part-select
+with an unknown `base` fills the whole result with `x` (we don't know
+which positions would have been in range). x/z bits in a *constant*
+part-select endpoint or in an indexed-select `width` are an error
+instead, because those positions must be constant integer expressions
+under LRM 5.2.1 / 5.2.2; a `width` of zero or negative is likewise
+rejected.
+
 ## Non-standard Behavior
 
 ### Trailing semicolons

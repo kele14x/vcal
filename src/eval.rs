@@ -1,8 +1,8 @@
 use num_bigint::{BigInt, BigUint, Sign};
-use num_traits::{FromPrimitive, One, ToPrimitive, Zero};
+use num_traits::{FromPrimitive, One, Signed, ToPrimitive, Zero};
 
-use crate::Session;
-use crate::parser::{BinaryOp, Expr, MathFunctionKind, RealConversionKind, UnaryOp};
+use crate::{RegRange, RegValue, Session};
+use crate::parser::{BinaryOp, Expr, MathFunctionKind, RealConversionKind, SelectKind, UnaryOp};
 use crate::value::{
     Base, IntegerValue, LogicBit, Value, bits_to_biguint, bitwise_and_bits, bitwise_not_bit,
     bitwise_or_bits, bitwise_xnor_bits, bitwise_xor_bits,
@@ -161,6 +161,9 @@ pub(crate) fn expression_is_real(expr: &Expr) -> bool {
         // far. The Session lookup happens later in the integer pipeline;
         // here we only need the result-type, and that's always integer.
         Expr::Identifier(_) => false,
+        // Bit-select / part-select on a reg is always integer-typed
+        // (LRM 4.7: part-select is unsigned).
+        Expr::Select { .. } => false,
     }
 }
 
@@ -366,6 +369,7 @@ fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> 
         // `evaluate_expr_in_context`. Reaching this branch means the
         // dispatch missed an integer leaf in a real-result expression.
         Expr::Identifier(_) => unreachable!("identifier always has integer result type"),
+        Expr::Select { .. } => unreachable!("select always has integer result type"),
     }
 }
 
@@ -518,6 +522,20 @@ fn evaluate_expr_in_context(
             Ok(match context {
                 Some(context) => value.value.resized_to_context(context.width, context.signed),
                 None => value.value.clone(),
+            })
+        }
+        // Bit- / part-select on a declared reg: the slice is computed
+        // self-determined (its width and unsigned-ness are fixed by the
+        // select form), then widens to the outer context the same way an
+        // Identifier does. Per LRM 4.7, the result is always unsigned, so
+        // a wider signed outer context zero-extends rather than
+        // sign-extends — `resized_to_context(width, context.signed)`
+        // already implements that because the value itself is unsigned.
+        Expr::Select { name, kind } => {
+            let value = evaluate_select(name, kind, session)?;
+            Ok(match context {
+                Some(context) => value.resized_to_context(context.width, context.signed),
+                None => value,
             })
         }
     }
@@ -681,6 +699,22 @@ fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
                 width: value.value.width,
                 signed: value.value.signed,
                 base: value.value.base,
+            })
+        }
+        // LRM 4.7 / 5.2.1 / 5.2.2: select width depends on its form
+        // (1 for bit-select, |msb-lsb|+1 for constant part-select,
+        // the constant `width` for indexed part-selects). The result is
+        // always unsigned; the display base flows from the reg's stored
+        // base so an arithmetic context still gets a meaningful render.
+        Expr::Select { name, kind } => {
+            let reg = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            let width = select_result_width(kind, session)?;
+            Ok(ExprMeta {
+                width,
+                signed: false,
+                base: reg.value.base,
             })
         }
     }
@@ -1588,6 +1622,10 @@ fn is_indefinite_width(expr: &Expr) -> bool {
         // evaluator pipeline; the structural check here only needs the
         // type-shape answer.
         Expr::Identifier(_) => false,
+        // Bit-/part-select width is fixed by its form (1 for bit-select,
+        // |m-l|+1 for constant part-select, the constant `width` for the
+        // indexed forms), so the result width is always definite.
+        Expr::Select { .. } => false,
     }
 }
 
@@ -2090,8 +2128,11 @@ fn evaluate_expr_as_math_bigint(expr: &Expr, session: &Session) -> Result<BigInt
         | Expr::MathFunction { .. }
         // A reg has fixed width/signedness, so reading it through the
         // standard pipeline and then converting to bigint matches the
-        // shape used by every other width-dependent leaf above.
-        | Expr::Identifier(_) => {
+        // shape used by every other width-dependent leaf above. A select
+        // is the same shape — fixed width determined by its form, always
+        // unsigned per LRM 4.7.
+        | Expr::Identifier(_)
+        | Expr::Select { .. } => {
             value_to_math_bigint(evaluate_expr_in_context(expr, None, session)?)
         }
         Expr::SystemTask { name } => Err(task_in_expression_error(name)),
@@ -2206,4 +2247,276 @@ fn is_reduction_op(op: UnaryOp) -> bool {
             | UnaryOp::ReductionXor
             | UnaryOp::ReductionXnor
     )
+}
+
+// LRM 4.2.1 / 5.2.1 / 5.2.2 bit-/part-select dispatch. The reg lookup
+// happens once here so each kind helper receives `&RegValue` directly
+// rather than re-resolving the name. Every helper produces an unsigned
+// self-determined IntegerValue; outer-context widening is applied by
+// the `Expr::Select` arm of `evaluate_expr_in_context`.
+fn evaluate_select(
+    name: &str,
+    kind: &SelectKind,
+    session: &Session,
+) -> Result<IntegerValue, String> {
+    let reg = session
+        .lookup(name)
+        .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+    let base = reg.value.base;
+    match kind {
+        SelectKind::Bit { index } => evaluate_bit_select(reg, index, base, session),
+        SelectKind::PartConst { msb, lsb } => {
+            evaluate_part_const_select(reg, msb, lsb, base, session)
+        }
+        SelectKind::PartIndexedUp {
+            base: base_expr,
+            width,
+        } => evaluate_part_indexed_select(reg, base_expr, width, base, session, true),
+        SelectKind::PartIndexedDown {
+            base: base_expr,
+            width,
+        } => evaluate_part_indexed_select(reg, base_expr, width, base, session, false),
+    }
+}
+
+// LRM 4.2.1: a bit-select with an x/z anywhere in the index yields x;
+// an out-of-range index also yields x. The index is self-determined and
+// interpreted under its own signedness so negative-endpoint regs
+// (e.g. `reg [-1:2]`) and signed-indexed selects line up.
+fn evaluate_bit_select(
+    reg: &RegValue,
+    index: &Expr,
+    result_base: Base,
+    session: &Session,
+) -> Result<IntegerValue, String> {
+    if expression_is_real(index) {
+        return Err("bit-select index cannot be real".to_string());
+    }
+    let index_value = evaluate_expr_in_context(index, None, session)?;
+    if index_value.has_unknown_bits() {
+        return Ok(IntegerValue::all_x(1, false, result_base));
+    }
+    let src_index = index_value.as_bigint(index_value.signed);
+    let bit = match resolve_reg_index(reg.range.as_ref(), &src_index, reg.value.width) {
+        Some(internal) => reg.value.bits[internal],
+        None => LogicBit::X,
+    };
+    Ok(IntegerValue::computed(1, false, result_base, vec![bit]))
+}
+
+// LRM 5.2.1 constant part-select. Both endpoints are constant
+// expressions evaluated against the current session (same shape as a
+// reg-decl range half), and direction must match the declared reg.
+fn evaluate_part_const_select(
+    reg: &RegValue,
+    msb_expr: &Expr,
+    lsb_expr: &Expr,
+    result_base: Base,
+    session: &Session,
+) -> Result<IntegerValue, String> {
+    let msb_sel = evaluate_constant_range_endpoint(msb_expr, session, "msb")?;
+    let lsb_sel = evaluate_constant_range_endpoint(lsb_expr, session, "lsb")?;
+    check_part_const_direction(reg.range.as_ref(), &msb_sel, &lsb_sel)?;
+    let width = compute_select_width(&msb_sel, &lsb_sel)?;
+    materialize_part_select(reg, &msb_sel, &lsb_sel, width, result_base)
+}
+
+// LRM 5.2.2 indexed part-select. `width` is a positive constant; `base`
+// is a self-determined integer expression. The source range is always
+// numerically [base, base+w-1] for `+:` and [base-w+1, base] for `-:`,
+// independent of the declared reg direction; which end of that source
+// range is the result's MSB depends on the reg's declared direction.
+fn evaluate_part_indexed_select(
+    reg: &RegValue,
+    base_expr: &Expr,
+    width_expr: &Expr,
+    result_base: Base,
+    session: &Session,
+    is_up: bool,
+) -> Result<IntegerValue, String> {
+    let width = evaluate_indexed_select_width(width_expr, session)?;
+    if expression_is_real(base_expr) {
+        return Err("indexed part-select base cannot be real".to_string());
+    }
+    let base_value = evaluate_expr_in_context(base_expr, None, session)?;
+    if base_value.has_unknown_bits() {
+        return Ok(IntegerValue::all_x(width, false, result_base));
+    }
+    let base_int = base_value.as_bigint(base_value.signed);
+    let span = BigInt::from(width - 1);
+    let (src_lo, src_hi) = if is_up {
+        let hi = &base_int + &span;
+        (base_int, hi)
+    } else {
+        let lo = &base_int - &span;
+        (lo, base_int)
+    };
+    // Forward decl (msb_decl >= lsb_decl): larger source index is more
+    // significant. Reversed decl: smaller source index is more
+    // significant. Scalar reg falls into the forward branch trivially —
+    // resolve_reg_index will reject any non-zero source index anyway.
+    let (msb_sel, lsb_sel) = match &reg.range {
+        Some(r) if r.msb < r.lsb => (src_lo, src_hi),
+        _ => (src_hi, src_lo),
+    };
+    materialize_part_select(reg, &msb_sel, &lsb_sel, width, result_base)
+}
+
+// Copies the bits of a part-select into the result, LSB-first. LRM
+// 4.2.1's "out-of-range → x" rule is applied per position, so in-range
+// source bits keep their value and only the out-of-range positions
+// become x (e.g. `reg [3:0] a = 4'b0101; a[4:3]` → `2'bx0`).
+fn materialize_part_select(
+    reg: &RegValue,
+    msb_sel: &BigInt,
+    lsb_sel: &BigInt,
+    width: usize,
+    result_base: Base,
+) -> Result<IntegerValue, String> {
+    let step: BigInt = if msb_sel >= lsb_sel {
+        BigInt::one()
+    } else {
+        -BigInt::one()
+    };
+    let mut bits = Vec::with_capacity(width);
+    let mut src = lsb_sel.clone();
+    for _ in 0..width {
+        let bit = match resolve_reg_index(reg.range.as_ref(), &src, reg.value.width) {
+            Some(internal) => reg.value.bits[internal],
+            None => LogicBit::X,
+        };
+        bits.push(bit);
+        src += &step;
+    }
+    Ok(IntegerValue::computed(width, false, result_base, bits))
+}
+
+// Source-index → internal-bits-index mapping. The formula
+// `internal = |src - lsb_decl|` works uniformly for forward decls
+// (`[7:0]`), reversed decls (`[0:7]`), and negative-endpoint decls
+// (`[-1:2]`); a scalar reg has no declared range so the only legal
+// source index is 0.
+fn resolve_reg_index(range: Option<&RegRange>, src: &BigInt, reg_width: usize) -> Option<usize> {
+    match range {
+        None => {
+            if src.is_zero() && reg_width >= 1 {
+                Some(0)
+            } else {
+                None
+            }
+        }
+        Some(r) => {
+            let (lo, hi) = if r.msb >= r.lsb {
+                (&r.lsb, &r.msb)
+            } else {
+                (&r.msb, &r.lsb)
+            };
+            if src < lo || src > hi {
+                return None;
+            }
+            (src - &r.lsb).abs().to_usize()
+        }
+    }
+}
+
+// Shape mirrors lib.rs::evaluate_range_endpoint — same "constant
+// integer, no x/z" contract a reg-decl range half follows, just with a
+// "part-select" diagnostic prefix so the error attributes correctly.
+fn evaluate_constant_range_endpoint(
+    expr: &Expr,
+    session: &Session,
+    role: &str,
+) -> Result<BigInt, String> {
+    if expression_is_real(expr) {
+        return Err(format!("part-select {role} cannot be real"));
+    }
+    let value = evaluate_constant_expr(expr, session)?;
+    if value.has_unknown_bits() {
+        return Err(format!("part-select {role} contains unknown bits"));
+    }
+    Ok(value.as_bigint(value.signed))
+}
+
+// LRM 5.2.2: the `width` half of an indexed part-select is a
+// constant_expression and "shall be a positive constant". Reject
+// real, x/z, zero, and negative values up front so the materialise
+// step can assume a usize-fitting positive count.
+fn evaluate_indexed_select_width(expr: &Expr, session: &Session) -> Result<usize, String> {
+    if expression_is_real(expr) {
+        return Err("indexed part-select width cannot be real".to_string());
+    }
+    let value = evaluate_constant_expr(expr, session)?;
+    if value.has_unknown_bits() {
+        return Err("indexed part-select width contains unknown bits".to_string());
+    }
+    let width = value.as_bigint(value.signed);
+    if width.sign() != Sign::Plus {
+        return Err("indexed part-select width must be positive".to_string());
+    }
+    width
+        .to_usize()
+        .ok_or_else(|| "indexed part-select width too large".to_string())
+}
+
+// LRM 5.2.1: "the first expression shall address a more significant bit
+// than the second expression". Read strictly: the relative ordering of
+// msb_sel vs lsb_sel must match the declared reg's direction. iverilog
+// merely warns; we treat it as an error because the rule is unambiguous
+// and silent reinterpretation hides a real bug.
+fn check_part_const_direction(
+    range: Option<&RegRange>,
+    msb_sel: &BigInt,
+    lsb_sel: &BigInt,
+) -> Result<(), String> {
+    match range {
+        None => {
+            if msb_sel.is_zero() && lsb_sel.is_zero() {
+                Ok(())
+            } else {
+                Err("constant part-select on scalar reg must be [0:0]".to_string())
+            }
+        }
+        Some(r) => {
+            let forward = r.msb >= r.lsb;
+            let ok = if forward {
+                msb_sel >= lsb_sel
+            } else {
+                msb_sel <= lsb_sel
+            };
+            if ok {
+                Ok(())
+            } else {
+                Err(format!(
+                    "constant part-select direction does not match reg declaration: \
+                     reg is [{}:{}], select is [{}:{}]",
+                    r.msb, r.lsb, msb_sel, lsb_sel
+                ))
+            }
+        }
+    }
+}
+
+fn compute_select_width(msb_sel: &BigInt, lsb_sel: &BigInt) -> Result<usize, String> {
+    let diff = (msb_sel - lsb_sel).abs() + BigInt::one();
+    diff.to_usize()
+        .ok_or_else(|| "part-select width too large".to_string())
+}
+
+// Same dispatch shape as `evaluate_select`, but only computes the
+// result width — used by `infer_expr_meta` so the surrounding
+// expression's two-pass width/sign inference matches what the
+// materialised select will produce.
+fn select_result_width(kind: &SelectKind, session: &Session) -> Result<usize, String> {
+    match kind {
+        SelectKind::Bit { .. } => Ok(1),
+        SelectKind::PartConst { msb, lsb } => {
+            let msb_sel = evaluate_constant_range_endpoint(msb, session, "msb")?;
+            let lsb_sel = evaluate_constant_range_endpoint(lsb, session, "lsb")?;
+            compute_select_width(&msb_sel, &lsb_sel)
+        }
+        SelectKind::PartIndexedUp { width, .. }
+        | SelectKind::PartIndexedDown { width, .. } => {
+            evaluate_indexed_select_width(width, session)
+        }
+    }
 }
