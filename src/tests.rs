@@ -4639,6 +4639,35 @@ fn reg_decl_init_propagates_rhs_evaluation_error() {
 }
 
 #[test]
+fn reg_decl_failed_init_in_multi_name_decl_leaves_no_partial_state() {
+    // The decl is committed all-or-nothing: a later init's failure means
+    // none of the earlier names land in the session, so the user does not
+    // see `a` silently bound when the line ended in an error.
+    let mut session = Session::new();
+    let err = session
+        .eval("reg [3:0] a = 1, b = nope")
+        .expect_err("undeclared identifier in init");
+    assert_eq!(err, "undeclared identifier: nope");
+    assert!(session.lookup("a").is_none(), "a should not be bound");
+    assert!(session.lookup("b").is_none(), "b should not be bound");
+}
+
+#[test]
+fn reg_decl_failed_init_preserves_prior_binding_for_redeclared_name() {
+    // Stronger version of the rollback: when `a` already has a binding,
+    // a failed redecl that names `a` must leave the prior `a` exactly as
+    // it was — staged inserts never reach the live session on error.
+    let mut session = Session::new();
+    session.eval("reg [3:0] a = 7").expect("prior decl");
+    let err = session
+        .eval("reg [3:0] a = 1, b = nope")
+        .expect_err("undeclared identifier in init");
+    assert_eq!(err, "undeclared identifier: nope");
+    assert_eq!(session.eval("a").expect("read a").output, "4'b0111");
+    assert!(session.lookup("b").is_none(), "b should not be bound");
+}
+
+#[test]
 fn reg_decl_rejects_duplicate_names_even_with_init() {
     let err = evaluate_input("reg [3:0] a = 1, a = 2")
         .expect_err("duplicate names rejected");

@@ -14,7 +14,7 @@ What works:
 - All operators between integers
 - Two-pass context (width, signedness) propagation
 - Leftmost-base propagation
-- `reg [signed] [range] name [= constant_expression] { , name [= constant_expression] }` declarations and blocking assignment `name = expression` (LRM A.2.1.3 / A.2.3 / A.6.2); persistent `Session` carries reg state across REPL turns, each reg preserves declared `msb`/`lsb` metadata for future bit/part-select work, and per-name init values flow through the same RHS path as `=` (real→integer conversion, NaN/±∞ → x). Each init expression is evaluated against the session *before* the new binding replaces the old one, so a redecl with `= name` carries the prior value forward (e.g. `reg [1:0] a = 2'b11; reg a = a` → `1'b1`). The unpacked `{ dimension }` array form is intentionally out of scope.
+- `reg [signed] [range] name [= constant_expression] { , name [= constant_expression] }` declarations and blocking assignment `name = expression` (LRM A.2.1.3 / A.2.3 / A.6.2); persistent `Session` carries reg state across REPL turns, each reg preserves declared `msb`/`lsb` metadata for future bit/part-select work, and per-name init values flow through the same RHS path as `=` (real→integer conversion, NaN/±∞ → x). Each init expression is evaluated against the session *before* the new binding replaces the old one, so a redecl with `= name` carries the prior value forward (e.g. `reg [1:0] a = 2'b11; reg a = a` → `1'b1`). The whole decl statement commits all-or-nothing — if any init errors, the live session is left untouched, even for earlier names in the same list. The unpacked `{ dimension }` array form is intentionally out of scope.
 - `rustyline` history
 
 ## Active Scope

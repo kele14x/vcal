@@ -132,33 +132,53 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
             // command. The new decl's width / signed / base / x-init all
             // wipe the old reg's state.
             //
-            // Each name's init expression evaluates *before* the new binding
-            // replaces the old one, so a self-reference reads the prior
-            // value: with `reg [1:0] a = 2'b11` already in place,
-            // `reg a = a` sees the old 2-bit `a`, narrows it to the new
-            // 1-bit width via the assignment-RHS context, and stores
-            // `1'b1`. Names without an init still install x bits, so
-            // `reg a` (no init) wipes the prior binding cleanly. Inits are
-            // processed left-to-right, so a later name can refer to an
-            // earlier name's freshly-applied value in the same decl
-            // (`reg [3:0] a = 1, b = a + 1`) — matching the textual order
-            // implied by LRM A.2.3 list_of_variable_identifiers. Reusing
-            // `evaluate_assignment_rhs` keeps real→integer conversion
-            // (LRM §3.5.3, NaN/±∞ → x bits) and width / sign / base
-            // context propagation identical to `name = expr`.
+            // The whole decl is committed all-or-nothing: every init runs
+            // against a `staged` clone of the live variable map, and the
+            // live session only adopts the result if *all* names finish
+            // without error. This stops `reg [3:0] a = 1, b = nope` from
+            // silently binding `a` even though the statement errored.
+            //
+            // Within the staging area, names are processed left-to-right
+            // and each commit is visible to the next name's init, so
+            // `reg [3:0] a = 1, b = a + 1` still resolves `b` against the
+            // freshly-applied `a` (matching the textual order implied by
+            // LRM A.2.3 list_of_variable_identifiers).
+            //
+            // Each init expression evaluates *before* its own binding
+            // replaces the corresponding prior entry in the staging map,
+            // so a self-reference reads the prior value: with
+            // `reg [1:0] a = 2'b11` already in place, `reg a = a` sees the
+            // old 2-bit `a`, narrows it to the new 1-bit width via the
+            // assignment-RHS context, and stores `1'b1`. Names without an
+            // init still install x bits, so `reg a` (no init) wipes the
+            // prior binding cleanly.
+            //
+            // Reusing `evaluate_assignment_rhs` keeps real→integer
+            // conversion (LRM §3.5.3, NaN/±∞ → x bits) and width / sign /
+            // base context propagation identical to `name = expr`. To
+            // avoid cloning `staged` on every iteration, we
+            // `std::mem::take` the map into a throwaway `Session` view for
+            // the duration of the eval call, then move it back out.
+            let mut staged = session.variables.clone();
             for (name, init) in names {
                 let bits = match init {
-                    Some(init_expr) => eval::evaluate_assignment_rhs(
-                        init_expr,
-                        width,
-                        *signed,
-                        Base::Binary,
-                        session,
-                    )?
-                    .bits,
+                    Some(init_expr) => {
+                        let view = Session {
+                            variables: std::mem::take(&mut staged),
+                        };
+                        let outcome = eval::evaluate_assignment_rhs(
+                            init_expr,
+                            width,
+                            *signed,
+                            Base::Binary,
+                            &view,
+                        );
+                        staged = view.variables;
+                        outcome?.bits
+                    }
                     None => vec![LogicBit::X; width],
                 };
-                session.variables.insert(
+                staged.insert(
                     name.clone(),
                     RegValue {
                         range: range.clone(),
@@ -172,6 +192,7 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
                     },
                 );
             }
+            session.variables = staged;
             Ok((String::new(), false))
         }
         Stmt::Assign { name, rhs } => {
