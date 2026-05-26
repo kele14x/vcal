@@ -1,77 +1,8 @@
-# Implementation Notes
+# Per-operator semantics
 
-## General evaluation model
+The general evaluation model — width, signedness, leaf extension, base inheritance — lives in [expressions.md](expressions.md). Intentional divergences from the LRM are flagged in [non-standard.md](non-standard.md).
 
-### Core evaluation and literal extension
-
-- vcal uses propagated-context unification per LRM §5.5.2, so context-determined expressions push width and signedness down to leaf primaries before evaluation.
-- Relational results remain self-determined 1-bit unsigned values, with x/z propagation handled after operand unification.
-- Unsized-literal extension is implemented with an `unsized_literal: bool` flag on `IntegerValue`, set only by the unsized parser branches (`parse_unsized_decimal` and the `width_hint.is_none()` arms of `parse_based_decimal` / `parse_based_radix`) and cleared on computed values and `resized_to_context` output.
-- `resized_to_context` splits into two paths:
-  - unsized + wider context -> `extend_unsized_to`, which fills from the literal's own signedness unless the MSB is x/z
-  - sized or equal-width -> the normal §5.5.4 path
-- This matches iverilog in cases such as `'bx | 64'b0` -> `64'bx...x` and `'shFFFFFFFF | 64'b0` -> `64'hFFFF_FFFF_FFFF_FFFF`, while sized operands still follow propagated-context extension, e.g. `32'sbx | 34'b0` -> `34'b00xx...x`.
-
-### Operator precedence and associativity
-
-- All operators associate left-to-right except the conditional operator, which associates right-to-left.
-- `**` is still left-associative, so `3 ** 3 ** 3 = (3 ** 3) ** 3 = 19683`. This differs from Python, where `3 ** 3 ** 3 = 7625597484987`.
-- Expression evaluation short-circuits where applicable.
-
-### Width rules
-
-- Mainly derived from LRM §5.4.
-- There are two kinds of expression bit-length rules:
-  - self-determined expressions: width is determined only by the expression itself
-  - context-determined expressions: width is determined by both the expression and the context it appears in
-- vcal models this with two related widths for context-determined expressions:
-  - natural width: the width inferred bottom-up from the expression's own operands, before any outer context is applied
-  - effective evaluation width: the width actually used when evaluating the expression after propagated outer context is applied
-- If an expression is context-determined, its effective evaluation width is `max(L(expr), L(context))`, where `L(expr)` is the expression's natural width. If there is no outer propagated context, the effective width is just the natural width.
-- Common natural-width rules in vcal:
-  - binary arithmetic and binary bitwise: `L(expr) = max(L(lhs), L(rhs))`
-  - unary `+`, unary `-`, and unary `~`: `L(expr) = L(operand)`
-  - shifts: `L(expr) = L(lhs)`; the RHS stays self-determined and does not contribute to result width
-  - conditional `?:`: `L(expr) = max(L(then), L(else))`
-- Example: `<` always returns a 1-bit unsigned result, so `a < b` is self-determined. By contrast, the RHS of an assignment is context-determined by both itself and the LHS width.
-- vcal evaluates expressions in two passes:
-  - first pass: bottom-up inference of self-determined width and signedness for each AST node
-  - second pass: top-down context-determined evaluation so parent expressions can widen child arithmetic before truncation
-- The second pass is required for cases like `(a + b) + 0`, where the outer expression widens the inner arithmetic before overflow is applied.
-
-### Leaf-extension rules
-
-- Leaf-extension splits by whether the leaf is a sized literal or an unsized literal.
-- Sized leaf: extension follows §5.5.4 together with the propagated-type rule from §5.5.2.
-  - signed propagated context -> sign-extend, propagating x/z if the MSB is x/z
-  - unsigned propagated context -> zero-extend regardless of the operand's own signedness or MSB
-- Unsized leaf: extension follows LRM Table 5-22 footnote a, independent of propagated signedness.
-  - if the literal MSB is x or z, fill with that MSB
-  - otherwise, fill from the literal's own declared signedness: sign-extend if signed, zero-extend if unsigned
-  - the literal also keeps its self-determined >=32-bit width if the context is narrower
-- Footnote a diverges from §5.5.4 in two iverilog-confirmed cases, and vcal follows iverilog / footnote a for unsized leaves:
-  - `'bx | 64'b0` -> `64'bxxxx...x` because footnote a x-extends the MSB; §5.5.4 would zero-fill the upper 32 bits
-  - `'shFFFFFFFF | 64'b0` -> `64'hFFFF_FFFF_FFFF_FFFF` because footnote a sign-extends per the literal's own `'sh`; §5.5.4 would zero-extend under unsigned propagated context
-- Sized operands still follow propagated-context rules, so `32'sbx | 34'b0` becomes `34'b00xx...x`.
-- Inside context-determined sub-expressions, outer width still propagates all the way to leaf literals, so `('bx | 4'b0) | 64'b0` also becomes `64'bxxxx...x`.
-- If literal digits occupy fewer bits than the literal width, or fewer than 32 bits for an unsized literal, the value is automatically left-padded.
-  - ordinary unsigned digits pad with `0`
-  - `x` digits pad with `x`
-  - `z` / `?` digits pad with `z`
-- This digit-padding rule is not sign extension.
-- An unsized constant remains unsized after parsing; its default >=32-bit form is only an intermediate. When it becomes an operand of an expression wider than 32 bits, leaf extension still follows footnote a rather than §5.5.4. Sized literals continue to follow §5.5.4.
-
-### Signedness rules
-
-- Mainly derived from LRM §5.5.
-- Unlike width, signedness depends only on the operands.
-- Simple decimal numbers are signed.
-- Some operators are self-determined in signedness.
-- Example: `<` always yields an unsigned result, and also always yields 1 bit.
-
-## Operator-specific notes
-
-### Arithmetic operators
+## Arithmetic operators
 
 - There are six binary arithmetic operators: `+`, `-`, `*`, `/`, `%`, and `**`; and two unary arithmetic operators: unary `+` and unary `-`.
 - Arithmetic operators are context-determined in width, including the `unary +` and `unary -` operators.
@@ -84,8 +15,9 @@
 - Width/context resize happens before unary `-` is evaluated, so `-4'sb0001` is not always interchangeable with the already-resized bit pattern `4'sb1111`.
 - Resizing follows the propagated context signedness, so even a signed operand may be zero-extended in an unsigned context.
   - Example: `4'sb1000 + 8'b0` -> `8'b00001000`, because the propagated context is unsigned and `4'sb1000` is extended with zeros before evaluation.
+- x/z handling: vcal follows iverilog's convention rather than the strict LRM rule. See [non-standard.md](non-standard.md) → "Arithmetic operators".
 
-### Relational operators
+## Relational operators
 
 - Relational operators share their operand-unification path with equality operators.
 - The relational expression itself has a self-determined 1-bit result width, but before comparison it first decides a single propagated operand context for both operands:
@@ -101,7 +33,7 @@
   - `4'sb1111 < 8'd255` -> `1'b1`. Under unsigned propagated context, `4'sb1111` zero-extends to `8'b00001111` (= 15), not `8'b11111111`.
   - `-4'sb1000 < 8'd9` -> `1'b0`. Propagation reaches the leaf `4'sb1000`, which zero-extends to `0000_1000` (= 8); unary negation at 8-bit unsigned wraps to `1111_1000` (= 248), so `248 < 9` is false.
 
-### Equality operators
+## Equality operators
 
 - Equality expressions also have a self-determined 1-bit result width.
 - Operand unification is otherwise identical to the relational operators:
@@ -119,7 +51,7 @@
   - `4'sbx000 === 8'b0000x000` -> `1'b1` because mixed signedness makes the propagated context unsigned, so zero-fill applies
   - `4'sbx000 === 8'bxxxxx000` -> `1'b0` because the RHS upper `xxxx` does not match the zero-filled upper bits of the LHS
 
-### Logical operators
+## Logical operators
 
 - Logical operands are reduced to a 1-bit logical value before applying the operator.
 - Reduction rule:
@@ -129,7 +61,7 @@
 - `!`, `&&`, and `||` follow the LRM §5.1.9 truth tables.
 - Binary logical operators return a self-determined 1-bit unsigned result, which may then widen in an outer arithmetic context just like relational and equality operators.
 
-### Bitwise operators
+## Bitwise operators
 
 - Binary bitwise operators have:
   - natural width = `max(L(lhs), L(rhs))`
@@ -145,12 +77,13 @@
   - operand-preserving for unary `~`
 - `~^` and `^~` always denote the same operator.
 - There is no all-x short-circuit; per-bit truth tables are applied position by position.
+- LRM divergence on operand extension when both operands are signed: see [non-standard.md](non-standard.md) → "Bitwise operators".
 - Implementation notes:
   - The parser precedence band is `&` > `^/~^/^~` > `|`, between `==` and `&&`.
   - Bare `&` and `|` now lex as bitwise operators instead of being rejected.
   - `~^` and `^~` collapse to one token.
 
-### Reduction operators
+## Reduction operators
 
 - `&`, `|`, `^`, `~^`, and `^~` are also binary bitwise operators, so they are disambiguated by parse position: unary when no left-hand operand exists, binary otherwise.
 - `~&` and `~|` exist only as unary reduction operators; using them in a binary position is a syntax error.
@@ -165,7 +98,7 @@
   - Binary `&` / `|` / `^` / `~^` / `^~` tokens are reused at unary position via parse-position disambiguation, without token rewriting.
   - A single `reduce_bits` helper performs the fold; negated reductions invert the folded result.
 
-### Shift operators
+## Shift operators
 
 - There are four shift operators: `<<`, `<<<`, `>>`, and `>>>`.
 - Per LRM §5.1.12, the LHS is context-determined like arithmetic, while the RHS is self-determined and always treated as an unsigned number.
@@ -189,7 +122,7 @@
   - Greedy lexing of `<<<` / `<<` and `>>>` / `>>` preserves `<=` / `>=` / `<` / `>`.
   - Shift count is clamped to the result width so `BigUint`-sized counts saturate safely to the all-fill result.
 
-### Conditional operator
+## Conditional operator
 
 - Verilog's only ternary operator is `expression1 ? expression2 : expression3`.
 - It is right-associative, so `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`.
@@ -202,12 +135,13 @@
 - If the condition is x/z, both branches are evaluated and merged per bit:
   - agreeing bits stay as-is, including x/x and z/z
   - disagreeing bits become x
+  - This per-bit merge follows iverilog rather than LRM Table 5-21; see [non-standard.md](non-standard.md) → "Conditional operator".
 - Result base inherits from the then branch, i.e. `expression2`, the leftmost data-carrying branch.
 - Width extension for the branches exposes the same §5.1.13 vs §5.5.2 inconsistency seen in the bitwise rules. §5.1.13 says the shorter operand should be lengthened with zero-fill, while §5.5.2 says sign-extend whenever the propagated type is signed. For `1 ? 4'shF : 8'sh0` the rules disagree. vcal follows §5.5.2 and matches iverilog:
   - `1 ? 4'shF : 8'sh0` -> `8'shff`
   - `1 ? 4'shF : 8'h0` -> `8'h0f`
 
-### Concatenation and replication operators
+## Concatenation and replication operators
 
 - The brace forms from LRM §5.1.14 are primaries, so they sit alongside literals and grouped expressions rather than participating in infix precedence.
 - Syntax:
