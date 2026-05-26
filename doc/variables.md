@@ -176,3 +176,82 @@ positions would have been in range). x/z bits in a part-select endpoint
 or in an indexed-select `width` are an error instead, because those
 positions must resolve to definite integers for the select shape to be
 known; a `width` of zero or negative is likewise rejected.
+
+## Unpacked arrays
+
+A `reg` decl may add one unpacked dimension to declare a 1-D array
+(LRM 4.9):
+
+```text
+reg [packed_range] name [unpacked_range] { , name [unpacked_range] }
+```
+
+For example, `reg [3:0] a [0:15]` declares 16 elements, each a 4-bit
+unsigned vector. The packed range governs each element's shape; the
+unpacked range governs how many elements exist and how they are
+addressed. Both endpoints follow the same constant-integer rule the
+packed range uses (no x/z, evaluated against the current session).
+
+- Multi-dimensional arrays, packed-array-of-array forms, and array
+  initializers are out of scope — only the single unpacked dimension
+  shown above is accepted.
+- An array decl cannot carry an init expression: `reg [3:0] a [0:7] = ...`
+  is rejected. Every element starts at all-`x` of the packed shape.
+- The unpacked range may be reversed (`reg [3:0] a [15:0]`) or use
+  negative endpoints (`reg [3:0] a [-2:1]`); the resolved index
+  mapping uses `internal = |src - lsb_unpacked|`, the same formula
+  the packed-range mapping uses.
+
+The array name on its own is unreadable — `a` (where `a` is an array)
+errors with "array `a` cannot be used as a value". The only way to
+read or write through an array is via an element-select on the outer
+unpacked dim:
+
+| Form              | Meaning                                          |
+|-------------------|--------------------------------------------------|
+| `a[i]`            | the whole packed element at unpacked index `i`   |
+| `a[i][n]`         | bit `n` of that element                          |
+| `a[i][m:l]`       | part-select of that element                      |
+| `a[i][b +: w]`    | upward indexed part-select of that element       |
+| `a[i][b -: w]`    | downward indexed part-select of that element     |
+
+The outer select must be a `Bit` form (`a[i]`) — `a[m:l]`, `a[b +: w]`,
+`a[b -: w]` are all rejected with "part-select on array `a` is illegal".
+The inner select, when present, runs against the chosen element's
+packed range and follows the same rules vector-reg selects do
+(direction match, width > 0, real-typed endpoints rejected, etc.).
+
+Element-select reads (RHS):
+
+- `a[i]` returns the chosen element in its packed shape, or an all-`x`
+  value of that shape if `i` is x/z or out of range (LRM 4.2.1 + 4.9).
+- `a[i][...]` first resolves the element (x/z or OOB index → all-`x`
+  element fallback), then evaluates the inner select against that
+  element. So `a[1'bx][0]` returns `1'bx`, and an inner-select against
+  an OOB element returns x bits at every position.
+- Bit-/part-select on a scalar-array element (`reg a [0:7]`) is
+  rejected — there are no bits to address.
+
+Element-select writes (LHS):
+
+- `a[i] = expr` writes the whole element in element-shape context
+  (width / signed / base from the packed range, base hardcoded to
+  binary at decl time).
+- `a[i][n] = expr`, `a[i][m:l] = expr`, and the indexed forms write
+  only the named positions of the chosen element; other positions are
+  preserved. The RHS evaluates in the *inner select's* shape (width
+  set by the form, unsigned per LRM 4.7, base inherited from the
+  element).
+- An x/z or OOB outer index drops the entire write — no element is
+  mutated — but the echo still prints the RHS in the lvalue's shape so
+  the calculator output is consistent with the vector-reg
+  "x/z-index drops the write" case. The same per-position drop rule
+  the vector-reg path uses applies to the inner select: `a[0][5:2]`
+  on a 4-bit element drops bits 4 and 5 (OOB), writes bits 3:2.
+- Array-element leaves may appear inside a concat LHS: `{b, a[0][2:0],
+  a[1]} = 11'b...` distributes the RHS bit stream right-to-left across
+  the leaves just like a vector-only concat would. A bare array name as
+  a concat leaf is still rejected (no way to address all elements at
+  once).
+- All-or-nothing commit still holds: any structural error on any leaf
+  aborts the whole assignment before any reg is mutated.

@@ -14,7 +14,7 @@ mod tests;
 
 pub use value::{Base, IntegerValue, LogicBit, Value};
 
-use parser::{Expr, Stmt};
+use parser::{DeclName, Expr, Stmt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegRange {
@@ -22,10 +22,83 @@ pub(crate) struct RegRange {
     pub(crate) lsb: BigInt,
 }
 
+// A reg's payload. `Vector` is the existing scalar/vector reg; `Array` is
+// the new 1-D unpacked-array form (`reg [3:0] a [0:15]`). The packed
+// range (the `[3:0]` part) still lives in `RegValue::range`; `Array.dim`
+// holds the *unpacked* dimension (`[0:15]`). Each element is an
+// IntegerValue with the same width / signedness / base as a freshly
+// declared vector reg of that packed range, all-x at decl time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RegStorage {
+    Vector(IntegerValue),
+    Array {
+        dim: RegRange,
+        elements: Vec<IntegerValue>,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegValue {
     pub(crate) range: Option<RegRange>,
-    pub(crate) value: IntegerValue,
+    pub(crate) storage: RegStorage,
+}
+
+impl RegValue {
+    // True for the array form (`reg [3:0] a [0:15]`). Distinct from a
+    // vector reg because reading the bare name is illegal for an array
+    // and array-element access is illegal for a vector.
+    pub(crate) fn is_array(&self) -> bool {
+        matches!(self.storage, RegStorage::Array { .. })
+    }
+
+    // Vector-only accessor used by every non-array codepath. Arrays
+    // surface as an error from the caller before this is reached, so
+    // panicking here would mask a missed dispatch in eval.
+    pub(crate) fn vector(&self) -> Option<&IntegerValue> {
+        match &self.storage {
+            RegStorage::Vector(value) => Some(value),
+            RegStorage::Array { .. } => None,
+        }
+    }
+
+    // Same as `vector()` but errors with the canonical
+    // "array name cannot be used as a value" diagnostic when the reg is
+    // an array. Used everywhere a vector-only path resolves an
+    // identifier — it makes the array-name-as-primary rejection
+    // uniform without duplicating the error string at each callsite.
+    pub(crate) fn require_vector(&self, name: &str) -> Result<&IntegerValue, String> {
+        self.vector()
+            .ok_or_else(|| format!("array `{name}` cannot be used as a value"))
+    }
+
+    pub(crate) fn vector_mut(&mut self) -> Option<&mut IntegerValue> {
+        match &mut self.storage {
+            RegStorage::Vector(value) => Some(value),
+            RegStorage::Array { .. } => None,
+        }
+    }
+
+    // Array-only accessor. Mirrors `vector()`: returns the unpacked
+    // dimension and the element slice for an array, `None` for a
+    // vector. Keeps `RegStorage` private to lib.rs while letting eval
+    // dispatch on the storage kind via `is_array()` + `array()`.
+    pub(crate) fn array(&self) -> Option<(&RegRange, &[IntegerValue])> {
+        match &self.storage {
+            RegStorage::Array { dim, elements } => Some((dim, elements.as_slice())),
+            RegStorage::Vector(_) => None,
+        }
+    }
+
+    // Mutable variant of `array()`. Used by the array-element-write
+    // path so the element at the chosen index can be replaced in-place
+    // on a staged variable map clone, without exposing `RegStorage` to
+    // eval.rs.
+    pub(crate) fn array_mut(&mut self) -> Option<(&RegRange, &mut [IntegerValue])> {
+        match &mut self.storage {
+            RegStorage::Array { dim, elements } => Some((dim, elements.as_mut_slice())),
+            RegStorage::Vector(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -55,6 +128,23 @@ impl Session {
     pub(crate) fn lookup_reg_range(&self, name: &str) -> Option<(&BigInt, &BigInt)> {
         self.lookup(name)
             .and_then(|reg| reg.range.as_ref().map(|range| (&range.msb, &range.lsb)))
+    }
+
+    // Test helper: returns (msb, lsb, element_count) for an array reg, or
+    // `None` for a vector reg / undeclared name. Keeps the array storage
+    // shape behind a single read accessor so tests don't have to import
+    // `RegStorage`.
+    #[cfg(test)]
+    pub(crate) fn lookup_reg_array(
+        &self,
+        name: &str,
+    ) -> Option<(BigInt, BigInt, usize)> {
+        self.lookup(name).and_then(|reg| match &reg.storage {
+            RegStorage::Array { dim, elements } => {
+                Some((dim.msb.clone(), dim.lsb.clone(), elements.len()))
+            }
+            RegStorage::Vector(_) => None,
+        })
     }
 
     pub fn eval(&mut self, input: &str) -> Result<Evaluation, String> {
@@ -160,35 +250,73 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
             // `std::mem::take` the map into a throwaway `Session` view for
             // the duration of the eval call, then move it back out.
             let mut staged = session.variables.clone();
-            for (name, init) in names {
-                let bits = match init {
-                    Some(init_expr) => {
+            for DeclName { name, init, dim } in names {
+                // Build the element prototype: every reg (whether
+                // bare-name, vector, or array-of-vector) carries the
+                // same (width, signed, base = Binary) shape on each
+                // element. For an array we also evaluate the unpacked
+                // dimension here so a malformed dim aborts the whole
+                // decl before any name is committed.
+                let storage = if let Some((dim_msb_expr, dim_lsb_expr)) = dim {
+                    if init.is_some() {
+                        // Should already be caught by the parser, but
+                        // keep the runtime check tight in case the AST
+                        // is constructed by some other path later.
+                        return Err(format!(
+                            "array variable `{name}` cannot have an init expression"
+                        ));
+                    }
+                    let dim_range = {
                         let view = Session {
                             variables: std::mem::take(&mut staged),
                         };
-                        let outcome = eval::evaluate_assignment_rhs(
-                            init_expr,
-                            width,
-                            *signed,
-                            Base::Binary,
-                            &view,
-                        );
+                        let outcome = evaluate_reg_range(dim_msb_expr, dim_lsb_expr, &view);
                         staged = view.variables;
-                        outcome?.bits
+                        outcome?
+                    };
+                    let count = dim_range.width()?;
+                    let element_template = IntegerValue {
+                        width,
+                        signed: *signed,
+                        base: Base::Binary,
+                        bits: vec![LogicBit::X; width],
+                        unsized_literal: false,
+                    };
+                    RegStorage::Array {
+                        dim: dim_range,
+                        elements: vec![element_template; count],
                     }
-                    None => vec![LogicBit::X; width],
+                } else {
+                    let bits = match init {
+                        Some(init_expr) => {
+                            let view = Session {
+                                variables: std::mem::take(&mut staged),
+                            };
+                            let outcome = eval::evaluate_assignment_rhs(
+                                init_expr,
+                                width,
+                                *signed,
+                                Base::Binary,
+                                &view,
+                            );
+                            staged = view.variables;
+                            outcome?.bits
+                        }
+                        None => vec![LogicBit::X; width],
+                    };
+                    RegStorage::Vector(IntegerValue {
+                        width,
+                        signed: *signed,
+                        base: Base::Binary,
+                        bits,
+                        unsized_literal: false,
+                    })
                 };
                 staged.insert(
                     name.clone(),
                     RegValue {
                         range: range.clone(),
-                        value: IntegerValue {
-                            width,
-                            signed: *signed,
-                            base: Base::Binary,
-                            bits,
-                            unsized_literal: false,
-                        },
+                        storage,
                     },
                 );
             }

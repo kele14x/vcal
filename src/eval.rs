@@ -520,12 +520,13 @@ fn evaluate_expr_in_context(
         // literal does. An unknown name is the user's first sign that they
         // forgot a `reg` decl, so the error is plain.
         Expr::Identifier(name) => {
-            let value = session
+            let reg = session
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            let value = reg.require_vector(name)?;
             Ok(match context {
-                Some(context) => value.value.resized_to_context(context.width, context.signed),
-                None => value.value.clone(),
+                Some(context) => value.resized_to_context(context.width, context.signed),
+                None => value.clone(),
             })
         }
         // Bit- / part-select on a declared reg: the slice is computed
@@ -535,8 +536,12 @@ fn evaluate_expr_in_context(
         // a wider signed outer context zero-extends rather than
         // sign-extends — `resized_to_context(width, context.signed)`
         // already implements that because the value itself is unsigned.
-        Expr::Select { name, kind } => {
-            let value = evaluate_select(name, kind, session)?;
+        //
+        // Chained selects (`a[i][m:l]`) flow through the same outer-context
+        // pipeline: `evaluate_select` resolves both selects and yields the
+        // inner result, which is then widened to the propagated context.
+        Expr::Select { name, kind, inner } => {
+            let value = evaluate_select(name, kind, inner.as_deref(), session)?;
             Ok(match context {
                 Some(context) => value.resized_to_context(context.width, context.signed),
                 None => value,
@@ -696,13 +701,14 @@ fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
         // A reg's meta is exactly the IntegerValue's stored (width, signed,
         // base) — same shape `Expr::Literal` produces from its value.
         Expr::Identifier(name) => {
-            let value = session
+            let reg = session
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            let value = reg.require_vector(name)?;
             Ok(ExprMeta {
-                width: value.value.width,
-                signed: value.value.signed,
-                base: value.value.base,
+                width: value.width,
+                signed: value.signed,
+                base: value.base,
             })
         }
         // LRM 4.7 / 5.2.1 / 5.2.2: select width depends on its form
@@ -710,15 +716,64 @@ fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
         // the constant `width` for indexed part-selects). The result is
         // always unsigned; the display base flows from the reg's stored
         // base so an arithmetic context still gets a meaningful render.
-        Expr::Select { name, kind } => {
+        //
+        // Array-element selects (LRM 4.9) are the exception: `a[i]`
+        // returns the whole packed element, so its meta is the element's
+        // (width, signed, base) — same shape a vector reg of the same
+        // packed range produces from `Expr::Identifier`. Part-selects on
+        // the unpacked dimension are illegal and surface the same
+        // diagnostic the evaluator does.
+        //
+        // Chained selects (`a[i][m:l]`) take their width from the inner
+        // select form (always unsigned, base inherited from the element
+        // — which is always `Binary` at array decl time today).
+        // `Expr::Select` arm here mirrors `evaluate_select`'s dispatch so
+        // the two-pass context propagation sees the same shape the
+        // materialised value will have.
+        Expr::Select { name, kind, inner } => {
             let reg = session
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            if let Some((_, elements)) = reg.array() {
+                if !matches!(kind, SelectKind::Bit { .. }) {
+                    return Err(format!(
+                        "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
+                    ));
+                }
+                let template = &elements[0];
+                if let Some(inner_kind) = inner {
+                    // The inner select runs against the packed element; it
+                    // must have a packed range to address, and the
+                    // resulting value is always unsigned per LRM 4.7.
+                    if reg.range.is_none() {
+                        return Err(format!(
+                            "bit-select or part-select on scalar array element `{name}` is illegal"
+                        ));
+                    }
+                    let width = select_result_width(inner_kind, session)?;
+                    return Ok(ExprMeta {
+                        width,
+                        signed: false,
+                        base: template.base,
+                    });
+                }
+                return Ok(ExprMeta {
+                    width: template.width,
+                    signed: template.signed,
+                    base: template.base,
+                });
+            }
+            if inner.is_some() {
+                return Err(format!(
+                    "chained select on `{name}` is illegal: `{name}` is not an array"
+                ));
+            }
+            let value = reg.require_vector(name)?;
             let width = select_result_width(kind, session)?;
             Ok(ExprMeta {
                 width,
                 signed: false,
-                base: reg.value.base,
+                base: value.base,
             })
         }
     }
@@ -2258,14 +2313,42 @@ fn is_reduction_op(op: UnaryOp) -> bool {
 // rather than re-resolving the name. Every helper produces an unsigned
 // self-determined IntegerValue; outer-context widening is applied by
 // the `Expr::Select` arm of `evaluate_expr_in_context`.
+//
+// `inner` carries the second select in `a[i][...]`. It is only meaningful
+// when `reg` is an array (the outer `kind` must then be a `Bit` element
+// pick); on a vector reg `inner.is_some()` is rejected because a vector
+// select already produces a self-determined integer value with no further
+// sub-structure to address.
 fn evaluate_select(
     name: &str,
     kind: &SelectKind,
+    inner: Option<&SelectKind>,
     session: &Session,
 ) -> Result<IntegerValue, String> {
     let reg = session
         .lookup(name)
         .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+    // LRM 4.9: an array reference is `name[expr]` — exactly one element
+    // index that yields the whole packed-vector element. Part-select and
+    // indexed-part-select forms apply to the packed range, not to the
+    // unpacked dimension, so they have no meaning on the array's outer
+    // bracket and are rejected here. Selecting *inside* a chosen element
+    // (e.g. `a[i][m:l]`) routes through `evaluate_array_chained_select`
+    // when `inner` is present.
+    if reg.is_array() {
+        return match inner {
+            None => evaluate_array_element_select(name, reg, kind, session),
+            Some(inner_kind) => {
+                evaluate_array_chained_select(name, reg, kind, inner_kind, session)
+            }
+        };
+    }
+    if inner.is_some() {
+        return Err(format!(
+            "chained select on `{name}` is illegal: `{name}` is not an array"
+        ));
+    }
+    let value = reg.require_vector(name)?;
     // LRM 5.2.1: "A bit-select or part-select of a scalar ... shall be
     // illegal." A reg declared without a range is a scalar even when
     // its width happens to be 1, distinct from the 1-bit vector
@@ -2273,21 +2356,159 @@ fn evaluate_select(
     let range = reg.range.as_ref().ok_or_else(|| {
         format!("bit-select or part-select on scalar reg `{name}` is illegal")
     })?;
-    let base = reg.value.base;
+    let base = value.base;
+    apply_select_kind(value, range, kind, base, session)
+}
+
+// Dispatch a `SelectKind` against an already-resolved (value, range)
+// pair. Factored out of `evaluate_select` so the chained array-element
+// path can reuse the exact same per-kind logic against the chosen
+// element's value/range, keeping vector and array inner-selects
+// bit-identical to a plain vector-reg select.
+fn apply_select_kind(
+    value: &IntegerValue,
+    range: &RegRange,
+    kind: &SelectKind,
+    result_base: Base,
+    session: &Session,
+) -> Result<IntegerValue, String> {
     match kind {
-        SelectKind::Bit { index } => evaluate_bit_select(reg, range, index, base, session),
+        SelectKind::Bit { index } => evaluate_bit_select(value, range, index, result_base, session),
         SelectKind::PartConst { msb, lsb } => {
-            evaluate_part_const_select(reg, range, msb, lsb, base, session)
+            evaluate_part_const_select(value, range, msb, lsb, result_base, session)
         }
         SelectKind::PartIndexedUp {
             base: base_expr,
             width,
-        } => evaluate_part_indexed_select(reg, range, base_expr, width, base, session, true),
+        } => evaluate_part_indexed_select(
+            value, range, base_expr, width, result_base, session, true,
+        ),
         SelectKind::PartIndexedDown {
             base: base_expr,
             width,
-        } => evaluate_part_indexed_select(reg, range, base_expr, width, base, session, false),
+        } => evaluate_part_indexed_select(
+            value, range, base_expr, width, result_base, session, false,
+        ),
     }
+}
+
+// LRM 4.9 unpacked-array element select. `a[i]` resolves `i` against
+// the declared unpacked dimension (`a [msb:lsb]`) and returns the
+// whole packed-vector element at that position. The element's
+// (width, signed, base) is the packed vector's shape, identical to a
+// freshly-declared vector reg of the same packed range.
+//
+// Out-of-range index / x or z in the index both surface as an all-x
+// value of the element's width — mirroring LRM 4.2.1's bit-select OOB
+// rule and §4.2.1's "x/z in index → x" rule. The element's signedness
+// and base flow through unchanged so an arithmetic context on top of
+// `a[i]` lines up with the same context on a vector reg of the same
+// packed range.
+//
+// Only `SelectKind::Bit` is legal on the outer bracket — part-selects
+// and indexed-part-selects on the unpacked dimension have no LRM
+// meaning (the packed and unpacked dimensions form distinct namespaces
+// per §4.9), so we reject them with a dedicated diagnostic instead of
+// quietly reinterpreting them.
+fn evaluate_array_element_select(
+    name: &str,
+    reg: &RegValue,
+    kind: &SelectKind,
+    session: &Session,
+) -> Result<IntegerValue, String> {
+    let (dim, elements) = reg
+        .array()
+        .expect("evaluate_array_element_select called on a non-array reg");
+    let index = match kind {
+        SelectKind::Bit { index } => index,
+        SelectKind::PartConst { .. }
+        | SelectKind::PartIndexedUp { .. }
+        | SelectKind::PartIndexedDown { .. } => {
+            return Err(format!(
+                "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
+            ));
+        }
+    };
+    if expression_is_real(index) {
+        return Err("array element index cannot be real".to_string());
+    }
+    // Every element shares the packed-range shape, so the OOB / x-z
+    // fallback can read its width/signed/base off any one of them. The
+    // dim's width is always >= 1 (RegRange::width enforces that at
+    // decl time), so `elements[0]` always exists.
+    let template = &elements[0];
+    let index_value = evaluate_expr_in_context(index, None, session)?;
+    if index_value.has_unknown_bits() {
+        return Ok(IntegerValue::all_x(
+            template.width,
+            template.signed,
+            template.base,
+        ));
+    }
+    let src_index = index_value.as_bigint(index_value.signed);
+    let element = match resolve_reg_index(dim, &src_index) {
+        Some(internal) => elements[internal].clone(),
+        None => IntegerValue::all_x(template.width, template.signed, template.base),
+    };
+    Ok(element)
+}
+
+// LRM 4.9 + 5.2.1/5.2.2: `a[i][...]` — pick an unpacked element, then
+// run a bit-/part-select against the chosen element's packed range.
+// Element selection (outer `kind`) shares all rules with
+// `evaluate_array_element_select`: only `SelectKind::Bit` is legal on
+// the outer bracket; real indices, x/z indices, and OOB indices all
+// fall back to an all-x element of the packed shape. The inner select
+// (`inner_kind`) then runs against either the chosen element or the
+// all-x fallback, producing a self-determined unsigned value with the
+// element's display base — bit-identical to the same select on a plain
+// vector reg of the same packed range. Scalar array elements (regs
+// declared without a packed range, e.g. `reg a [0:7]`) have no bits to
+// address, so the inner select is rejected with the same diagnostic
+// shape the vector-reg path uses for scalars.
+fn evaluate_array_chained_select(
+    name: &str,
+    reg: &RegValue,
+    kind: &SelectKind,
+    inner_kind: &SelectKind,
+    session: &Session,
+) -> Result<IntegerValue, String> {
+    let (dim, elements) = reg
+        .array()
+        .expect("evaluate_array_chained_select called on a non-array reg");
+    let index = match kind {
+        SelectKind::Bit { index } => index,
+        SelectKind::PartConst { .. }
+        | SelectKind::PartIndexedUp { .. }
+        | SelectKind::PartIndexedDown { .. } => {
+            return Err(format!(
+                "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
+            ));
+        }
+    };
+    if expression_is_real(index) {
+        return Err("array element index cannot be real".to_string());
+    }
+    // A bit-/part-select on the chosen element requires the element to
+    // have a packed range — scalar array elements have no bits to
+    // address (LRM 5.2.1 scalar-reg rule).
+    let range = reg.range.as_ref().ok_or_else(|| {
+        format!("bit-select or part-select on scalar array element `{name}` is illegal")
+    })?;
+    let template = &elements[0];
+    let element = {
+        let index_value = evaluate_expr_in_context(index, None, session)?;
+        if index_value.has_unknown_bits() {
+            IntegerValue::all_x(template.width, template.signed, template.base)
+        } else {
+            let src_index = index_value.as_bigint(index_value.signed);
+            match resolve_reg_index(dim, &src_index) {
+                Some(internal) => elements[internal].clone(),
+                None => IntegerValue::all_x(template.width, template.signed, template.base),
+            }
+        }
+    };
+    apply_select_kind(&element, range, inner_kind, element.base, session)
 }
 
 // LRM 4.2.1: a bit-select with an x/z anywhere in the index yields x;
@@ -2295,7 +2516,7 @@ fn evaluate_select(
 // interpreted under its own signedness so negative-endpoint regs
 // (e.g. `reg [-1:2]`) and signed-indexed selects line up.
 fn evaluate_bit_select(
-    reg: &RegValue,
+    value: &IntegerValue,
     range: &RegRange,
     index: &Expr,
     result_base: Base,
@@ -2310,7 +2531,7 @@ fn evaluate_bit_select(
     }
     let src_index = index_value.as_bigint(index_value.signed);
     let bit = match resolve_reg_index(range, &src_index) {
-        Some(internal) => reg.value.bits[internal],
+        Some(internal) => value.bits[internal],
         None => LogicBit::X,
     };
     Ok(IntegerValue::computed(1, false, result_base, vec![bit]))
@@ -2321,7 +2542,7 @@ fn evaluate_bit_select(
 // separate elaboration stage), and their direction must match the
 // declared reg.
 fn evaluate_part_const_select(
-    reg: &RegValue,
+    value: &IntegerValue,
     range: &RegRange,
     msb_expr: &Expr,
     lsb_expr: &Expr,
@@ -2332,7 +2553,7 @@ fn evaluate_part_const_select(
     let lsb_sel = evaluate_constant_range_endpoint(lsb_expr, session, "lsb")?;
     check_part_select_direction(range, &msb_sel, &lsb_sel)?;
     let width = compute_select_width(&msb_sel, &lsb_sel)?;
-    materialize_part_select(reg, range, &msb_sel, &lsb_sel, width, result_base)
+    materialize_part_select(value, range, &msb_sel, &lsb_sel, width, result_base)
 }
 
 // LRM 5.2.2 indexed part-select. `width` is a positive constant; `base`
@@ -2341,7 +2562,7 @@ fn evaluate_part_const_select(
 // independent of the declared reg direction; which end of that source
 // range is the result's MSB depends on the reg's declared direction.
 fn evaluate_part_indexed_select(
-    reg: &RegValue,
+    value: &IntegerValue,
     range: &RegRange,
     base_expr: &Expr,
     width_expr: &Expr,
@@ -2374,7 +2595,7 @@ fn evaluate_part_indexed_select(
     } else {
         (src_hi, src_lo)
     };
-    materialize_part_select(reg, range, &msb_sel, &lsb_sel, width, result_base)
+    materialize_part_select(value, range, &msb_sel, &lsb_sel, width, result_base)
 }
 
 // Copies the bits of a part-select into the result, LSB-first. LRM
@@ -2382,7 +2603,7 @@ fn evaluate_part_indexed_select(
 // source bits keep their value and only the out-of-range positions
 // become x (e.g. `reg [3:0] a = 4'b0101; a[4:3]` → `2'bx0`).
 fn materialize_part_select(
-    reg: &RegValue,
+    value: &IntegerValue,
     range: &RegRange,
     msb_sel: &BigInt,
     lsb_sel: &BigInt,
@@ -2398,7 +2619,7 @@ fn materialize_part_select(
     let mut src = lsb_sel.clone();
     for _ in 0..width {
         let bit = match resolve_reg_index(range, &src) {
-            Some(internal) => reg.value.bits[internal],
+            Some(internal) => value.bits[internal],
             None => LogicBit::X,
         };
         bits.push(bit);
@@ -2496,6 +2717,43 @@ fn compute_select_width(msb_sel: &BigInt, lsb_sel: &BigInt) -> Result<usize, Str
         .ok_or_else(|| "part-select width too large".to_string())
 }
 
+// LHS structural validation + width for one `SelectKind` against a
+// `range` (which is either the named vector reg's packed range, or the
+// chosen array element's packed range for a chained `a[i][...]` LHS).
+// Runs the same checks the RHS materialisers run (real-typed bit-select
+// index / indexed part-select base, part-select direction match against
+// `range`, indexed-width is a positive constant), so any malformed
+// select on the LHS surfaces before the RHS is even looked at — keeping
+// the precedence "LHS structural error wins over RHS error" identical
+// to the bare-vector case.
+fn select_meta_width(
+    kind: &SelectKind,
+    range: &RegRange,
+    session: &Session,
+) -> Result<usize, String> {
+    match kind {
+        SelectKind::Bit { index } => {
+            if expression_is_real(index) {
+                return Err("bit-select index cannot be real".to_string());
+            }
+            Ok(1)
+        }
+        SelectKind::PartConst { msb, lsb } => {
+            let msb_sel = evaluate_constant_range_endpoint(msb, session, "msb")?;
+            let lsb_sel = evaluate_constant_range_endpoint(lsb, session, "lsb")?;
+            check_part_select_direction(range, &msb_sel, &lsb_sel)?;
+            compute_select_width(&msb_sel, &lsb_sel)
+        }
+        SelectKind::PartIndexedUp { base, width }
+        | SelectKind::PartIndexedDown { base, width } => {
+            if expression_is_real(base) {
+                return Err("indexed part-select base cannot be real".to_string());
+            }
+            evaluate_indexed_select_width(width, session)
+        }
+    }
+}
+
 // Same dispatch shape as `evaluate_select`, but only computes the
 // result width — used by `infer_expr_meta` so the surrounding
 // expression's two-pass width/sign inference matches what the
@@ -2530,6 +2788,16 @@ fn select_result_width(kind: &SelectKind, session: &Session) -> Result<usize, St
 // select/concat leaf, base = leftmost-leaf base). For a bare-name LHS
 // this matches the reg's stored `(width, signed, base)` so the printed
 // canonical form is bit-identical to the pre-lvalue behavior.
+//
+// LRM 4.9 array-element writes — bare `a[i] = expr`, chained
+// `a[i][m:l] = expr`, and concat leaves carrying either form — route
+// through the same `lvalue_meta` / `distribute_bits_to_leaves` pipeline
+// the vector-reg case uses. `LeafTarget::ArrayElement` carries the
+// chosen unpacked-dim index alongside the per-position internal-bit map,
+// so a single rightward walk through the rhs bit stream uniformly
+// services every leaf shape; the outer-index x/z and OOB cases drop the
+// element via `element: None` while still advancing the cursor by the
+// leaf's nominal width (matching LRM 4.2.1's "no assignment performed").
 pub(crate) fn evaluate_lvalue_assignment(
     lvalue: &LValue,
     rhs: &Expr,
@@ -2573,52 +2841,88 @@ fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
             let reg = session
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            let value = reg.require_vector(name)?;
             Ok(ExprMeta {
-                width: reg.value.width,
-                signed: reg.value.signed,
-                base: reg.value.base,
+                width: value.width,
+                signed: value.signed,
+                base: value.base,
             })
         }
-        LValue::Select { name, kind } => {
+        LValue::Select { name, kind, inner } => {
             let reg = session
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-            // LRM 5.2.1 scalar-reg rejection. Mirrors `evaluate_select`.
-            let range = reg.range.as_ref().ok_or_else(|| {
-                format!("bit-select or part-select on scalar reg `{name}` is illegal")
-            })?;
-            let width = match kind {
-                SelectKind::Bit { index } => {
-                    // Real-typed selects are illegal per LRM 5.2 — the
-                    // sibling RHS helpers (evaluate_bit_select,
-                    // evaluate_part_indexed_select) reject the same shapes
-                    // up-front. Catch them here too so the LHS structural
-                    // error wins over an RHS error, matching the
-                    // direction-mismatch precedence rule.
-                    if expression_is_real(index) {
-                        return Err("bit-select index cannot be real".to_string());
+            if reg.is_array() {
+                // LRM 4.9: only `Bit` is legal as the outer select on an
+                // array name. `evaluate_array_element_select` enforces
+                // the same rejection on the RHS path; surfacing it here
+                // keeps the LHS structural error class consistent.
+                let index = match kind {
+                    SelectKind::Bit { index } => index,
+                    SelectKind::PartConst { .. }
+                    | SelectKind::PartIndexedUp { .. }
+                    | SelectKind::PartIndexedDown { .. } => {
+                        return Err(format!(
+                            "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
+                        ));
                     }
-                    1
+                };
+                if expression_is_real(index) {
+                    return Err("array element index cannot be real".to_string());
                 }
-                SelectKind::PartConst { msb, lsb } => {
-                    let msb_sel = evaluate_constant_range_endpoint(msb, session, "msb")?;
-                    let lsb_sel = evaluate_constant_range_endpoint(lsb, session, "lsb")?;
-                    check_part_select_direction(range, &msb_sel, &lsb_sel)?;
-                    compute_select_width(&msb_sel, &lsb_sel)?
+                // The chosen element's shape is the one every element
+                // shares — array decl bakes Base::Binary into the
+                // element template, so `(width, signed, base)` is read
+                // off `elements[0]` (always present: RegRange::width
+                // enforces count >= 1 at decl time).
+                let (_, elements) = reg
+                    .array()
+                    .expect("is_array() => array() returns Some");
+                let template = &elements[0];
+                if let Some(inner_kind) = inner {
+                    // `a[i][...]` — inner select runs against the
+                    // chosen element. Mirrors `evaluate_array_chained_select`'s
+                    // scalar-element rejection so the structural error
+                    // matches the RHS-path diagnostic.
+                    let element_range = reg.range.as_ref().ok_or_else(|| {
+                        format!(
+                            "bit-select or part-select on scalar array element `{name}` is illegal"
+                        )
+                    })?;
+                    let width = select_meta_width(inner_kind, element_range, session)?;
+                    Ok(ExprMeta {
+                        width,
+                        signed: false,
+                        base: template.base,
+                    })
+                } else {
+                    // `a[i] = expr` — element-shape context.
+                    Ok(ExprMeta {
+                        width: template.width,
+                        signed: template.signed,
+                        base: template.base,
+                    })
                 }
-                SelectKind::PartIndexedUp { base, width }
-                | SelectKind::PartIndexedDown { base, width } => {
-                    if expression_is_real(base) {
-                        return Err("indexed part-select base cannot be real".to_string());
-                    }
-                    evaluate_indexed_select_width(width, session)?
+            } else {
+                if inner.is_some() {
+                    // Same diagnostic as the RHS chained-select-on-vector
+                    // rejection (`evaluate_select`).
+                    return Err(format!(
+                        "chained select on `{name}` is illegal: `{name}` is not an array"
+                    ));
                 }
-            };
-            Ok(ExprMeta {
-                width,
-                signed: false,
-                base: reg.value.base,
-            })
+                let value = reg.require_vector(name)?;
+                // LRM 5.2.1 scalar-reg rejection. Mirrors `evaluate_select`.
+                let range = reg.range.as_ref().ok_or_else(|| {
+                    format!("bit-select or part-select on scalar reg `{name}` is illegal")
+                })?;
+                let width = select_meta_width(kind, range, session)?;
+                Ok(ExprMeta {
+                    width,
+                    signed: false,
+                    base: value.base,
+                })
+            }
         }
         LValue::Concat(items) => {
             if items.is_empty() {
@@ -2660,108 +2964,42 @@ fn flatten_lvalue_leaves<'a>(lvalue: &'a LValue, out: &mut Vec<&'a LValue>) {
     }
 }
 
-// Resolves a leaf to (reg_name, LSB-first per-position internal-index
-// sequence). `Some(internal)` = in-range position, will receive a bit;
-// `None` = out-of-range / x-z-index drop. The vector's length always
+// Where a leaf's RHS bits land. `Vector` is the existing scalar/vector
+// reg target; `ArrayElement` carries the chosen unpacked-dim index
+// alongside the per-position internal-bit map. `positions.len()` always
 // equals the leaf's nominal width (so the bit-cursor advances uniformly
-// even on dropped positions).
-fn leaf_internal_indices(
-    leaf: &LValue,
-    session: &Session,
-) -> Result<(String, Vec<Option<usize>>), String> {
-    match leaf {
-        LValue::Name(name) => {
-            let reg = session
-                .lookup(name)
-                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-            // Bare-name leaf spans every internal bit, LSB-first.
-            let indices = (0..reg.value.width).map(Some).collect();
-            Ok((name.clone(), indices))
+// even on dropped positions). The split lets `distribute_bits_to_leaves`
+// run one rightward walk through the RHS bit stream and dispatch on the
+// target variant per leaf, without two parallel codepaths.
+//
+// For `ArrayElement`, `element: None` means the outer-index was x/z or
+// OOB (LRM 4.9 + 4.2.1 "no assignment performed") — the slot still
+// consumes `positions.len()` cursor bits so the surrounding concat
+// distribution stays aligned, but no element is written.
+enum LeafTarget {
+    Vector {
+        name: String,
+        positions: Vec<Option<usize>>,
+    },
+    ArrayElement {
+        name: String,
+        element: Option<usize>,
+        positions: Vec<Option<usize>>,
+    },
+}
+
+impl LeafTarget {
+    fn positions(&self) -> &[Option<usize>] {
+        match self {
+            Self::Vector { positions, .. } | Self::ArrayElement { positions, .. } => positions,
         }
-        LValue::Select { name, kind } => {
-            let reg = session
-                .lookup(name)
-                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-            let range = reg.range.as_ref().ok_or_else(|| {
-                format!("bit-select or part-select on scalar reg `{name}` is illegal")
-            })?;
-            match kind {
-                SelectKind::Bit { index } => {
-                    if expression_is_real(index) {
-                        return Err("bit-select index cannot be real".to_string());
-                    }
-                    let index_value = evaluate_expr_in_context(index, None, session)?;
-                    if index_value.has_unknown_bits() {
-                        // LRM 4.2.1: x/z index → no assignment performed.
-                        return Ok((name.clone(), vec![None]));
-                    }
-                    let src = index_value.as_bigint(index_value.signed);
-                    Ok((name.clone(), vec![resolve_reg_index(range, &src)]))
-                }
-                SelectKind::PartConst { msb, lsb } => {
-                    // The range endpoints, direction, and width were
-                    // already validated by `lvalue_meta` (so we can
-                    // assume both endpoints are definite and direction
-                    // matches), but re-evaluate here for the indices —
-                    // the existing eval helpers are pure / cheap, and a
-                    // single round of re-evaluation keeps this helper
-                    // standalone.
-                    let msb_sel = evaluate_constant_range_endpoint(msb, session, "msb")?;
-                    let lsb_sel = evaluate_constant_range_endpoint(lsb, session, "lsb")?;
-                    let width = compute_select_width(&msb_sel, &lsb_sel)?;
-                    Ok((
-                        name.clone(),
-                        per_position_indices(range, &msb_sel, &lsb_sel, width),
-                    ))
-                }
-                SelectKind::PartIndexedUp {
-                    base: base_expr,
-                    width: width_expr,
-                }
-                | SelectKind::PartIndexedDown {
-                    base: base_expr,
-                    width: width_expr,
-                } => {
-                    let is_up = matches!(kind, SelectKind::PartIndexedUp { .. });
-                    let width = evaluate_indexed_select_width(width_expr, session)?;
-                    if expression_is_real(base_expr) {
-                        return Err("indexed part-select base cannot be real".to_string());
-                    }
-                    let base_value = evaluate_expr_in_context(base_expr, None, session)?;
-                    if base_value.has_unknown_bits() {
-                        // LRM 5.2.2 / 4.2.1: x/z in the base means
-                        // every position is unresolved → all dropped.
-                        return Ok((name.clone(), vec![None; width]));
-                    }
-                    let base_int = base_value.as_bigint(base_value.signed);
-                    let span = BigInt::from(width - 1);
-                    let (src_lo, src_hi) = if is_up {
-                        let hi = &base_int + &span;
-                        (base_int, hi)
-                    } else {
-                        let lo = &base_int - &span;
-                        (lo, base_int)
-                    };
-                    // Same direction logic as `evaluate_part_indexed_select`:
-                    // for a forward decl, the larger source index is the
-                    // MSB side; for a reversed decl, the smaller is.
-                    let (msb_sel, lsb_sel) = if range.msb < range.lsb {
-                        (src_lo, src_hi)
-                    } else {
-                        (src_hi, src_lo)
-                    };
-                    Ok((name.clone(), per_position_indices(range, &msb_sel, &lsb_sel, width)))
-                }
-            }
-        }
-        // Concats aren't leaves — flatten_lvalue_leaves never reaches them.
-        LValue::Concat(_) => unreachable!("leaf_internal_indices called on a Concat"),
     }
 }
 
 // LSB-first per-position resolver shared by the const and indexed
-// part-select arms. Steps from `lsb_sel` toward `msb_sel` (±1 depending
-// on which is larger) and maps each source index through
+// part-select arms (LHS distribution + the outer-element-dropped
+// inner-select fallback). Steps from `lsb_sel` toward `msb_sel` (±1
+// depending on which is larger) and maps each source index through
 // `resolve_reg_index`. Mirrors `materialize_part_select` so the LHS
 // distribution lines up bit-for-bit with the equivalent RHS read.
 fn per_position_indices(
@@ -2784,21 +3022,179 @@ fn per_position_indices(
     indices
 }
 
+// LSB-first per-position internal-bit map for one `SelectKind` against a
+// `range`. Used by both the vector-reg distribution and the chained
+// `a[i][...]` distribution (the latter passes the element's packed
+// range). Assumes `lvalue_meta` has already done the structural checks
+// (direction match, indexed-width positive, real-index rejection) so
+// only the *value-dependent* resolution (index x/z → all-`None`,
+// out-of-range index → `None` at that slot) happens here. Returning a
+// `Vec` keyed off the leaf's nominal width keeps the bit cursor in
+// `distribute_bits_to_leaves` uniform even when the entire select is
+// dropped.
+fn select_positions(
+    kind: &SelectKind,
+    range: &RegRange,
+    session: &Session,
+) -> Result<Vec<Option<usize>>, String> {
+    match kind {
+        SelectKind::Bit { index } => {
+            let index_value = evaluate_expr_in_context(index, None, session)?;
+            if index_value.has_unknown_bits() {
+                // LRM 4.2.1: x/z index → no assignment performed.
+                return Ok(vec![None]);
+            }
+            let src = index_value.as_bigint(index_value.signed);
+            Ok(vec![resolve_reg_index(range, &src)])
+        }
+        SelectKind::PartConst { msb, lsb } => {
+            // Endpoints / direction / width were validated by
+            // `lvalue_meta`; re-evaluating here is cheap and keeps this
+            // helper standalone.
+            let msb_sel = evaluate_constant_range_endpoint(msb, session, "msb")?;
+            let lsb_sel = evaluate_constant_range_endpoint(lsb, session, "lsb")?;
+            let width = compute_select_width(&msb_sel, &lsb_sel)?;
+            Ok(per_position_indices(range, &msb_sel, &lsb_sel, width))
+        }
+        SelectKind::PartIndexedUp {
+            base: base_expr,
+            width: width_expr,
+        }
+        | SelectKind::PartIndexedDown {
+            base: base_expr,
+            width: width_expr,
+        } => {
+            let is_up = matches!(kind, SelectKind::PartIndexedUp { .. });
+            let width = evaluate_indexed_select_width(width_expr, session)?;
+            let base_value = evaluate_expr_in_context(base_expr, None, session)?;
+            if base_value.has_unknown_bits() {
+                // LRM 5.2.2 / 4.2.1: x/z in the base means every
+                // position is unresolved → all dropped.
+                return Ok(vec![None; width]);
+            }
+            let base_int = base_value.as_bigint(base_value.signed);
+            let span = BigInt::from(width - 1);
+            let (src_lo, src_hi) = if is_up {
+                let hi = &base_int + &span;
+                (base_int, hi)
+            } else {
+                let lo = &base_int - &span;
+                (lo, base_int)
+            };
+            // Same direction logic as `evaluate_part_indexed_select`:
+            // for a forward decl, the larger source index is the MSB
+            // side; for a reversed decl, the smaller is.
+            let (msb_sel, lsb_sel) = if range.msb < range.lsb {
+                (src_lo, src_hi)
+            } else {
+                (src_hi, src_lo)
+            };
+            Ok(per_position_indices(range, &msb_sel, &lsb_sel, width))
+        }
+    }
+}
+
+// Resolves a leaf to a `LeafTarget`. For a bare vector name the target
+// is `Vector` with every position present; for a vector select it is
+// `Vector` with the chosen per-position internals (some `None` for
+// x/z-index or OOB drops). For an array-element leaf (`a[i]` or
+// `a[i][...]`) it is `ArrayElement` carrying the resolved outer index
+// (or `None` if the outer index was x/z or OOB) and the per-position
+// map for the inner span — bare-element if no inner select (every
+// internal bit), inner-select if one is present. Structural checks have
+// already run inside `lvalue_meta`, so this helper only resolves
+// value-dependent indices.
+fn leaf_target(leaf: &LValue, session: &Session) -> Result<LeafTarget, String> {
+    match leaf {
+        LValue::Name(name) => {
+            let reg = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            let value = reg.require_vector(name)?;
+            // Bare-name leaf spans every internal bit, LSB-first.
+            let positions = (0..value.width).map(Some).collect();
+            Ok(LeafTarget::Vector {
+                name: name.clone(),
+                positions,
+            })
+        }
+        LValue::Select { name, kind, inner } => {
+            let reg = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            if reg.is_array() {
+                // Outer kind is guaranteed `Bit` by `lvalue_meta`.
+                let (dim, elements) = reg
+                    .array()
+                    .expect("is_array() => array() returns Some");
+                let SelectKind::Bit { index } = kind else {
+                    unreachable!("lvalue_meta rejected non-Bit outer select on array");
+                };
+                let index_value = evaluate_expr_in_context(index, None, session)?;
+                let element = if index_value.has_unknown_bits() {
+                    None
+                } else {
+                    let src = index_value.as_bigint(index_value.signed);
+                    resolve_reg_index(dim, &src)
+                };
+                let positions = if let Some(inner_kind) = inner {
+                    // Inner select runs against the chosen element's
+                    // packed range. Resolve positions regardless of
+                    // whether the outer index dropped — both branches
+                    // produce a vec of length `inner_width`, so the
+                    // bit-cursor stays aligned. Index/base value errors
+                    // in the inner select still surface here.
+                    let element_range = reg.range.as_ref().expect(
+                        "chained inner select on scalar element rejected by lvalue_meta",
+                    );
+                    select_positions(inner_kind, element_range, session)?
+                } else {
+                    // Whole-element write — every internal bit is
+                    // present (LSB-first).
+                    let template = &elements[0];
+                    (0..template.width).map(Some).collect()
+                };
+                Ok(LeafTarget::ArrayElement {
+                    name: name.clone(),
+                    element,
+                    positions,
+                })
+            } else {
+                // Vector leaf — structural validation (incl. scalar-reg
+                // rejection) already happened in `lvalue_meta`.
+                let _ = reg.require_vector(name)?;
+                let range = reg.range.as_ref().expect(
+                    "scalar-reg-with-select rejected by lvalue_meta",
+                );
+                let positions = select_positions(kind, range, session)?;
+                Ok(LeafTarget::Vector {
+                    name: name.clone(),
+                    positions,
+                })
+            }
+        }
+        // Concats aren't leaves — flatten_lvalue_leaves never reaches them.
+        LValue::Concat(_) => unreachable!("leaf_target called on a Concat"),
+    }
+}
+
 // Walks leaves right-to-left (rightmost leaf = LSB end of the RHS bit
 // stream) with a cursor into `rhs_bits` (LSB-first). For each leaf,
-// `leaf_internal_indices` returns the LSB-first per-position internal
-// indices; in-range positions receive the corresponding RHS bit,
+// `leaf_target` returns the `LeafTarget` describing where each internal
+// position lands; in-range positions receive the corresponding RHS bit,
 // out-of-range / x-z-index positions consume their cursor slot silently
-// (LRM 4.2.1 "no assignment performed"). The expect on the get_mut is
-// safe because every leaf name was resolved by `lvalue_meta` before the
-// staged map was created.
+// (LRM 4.2.1 "no assignment performed"). For an `ArrayElement` whose
+// outer index x/z'd or went OOB, the entire leaf drops (LRM 4.9 +
+// 4.2.1) but still consumes its nominal width's worth of cursor bits.
+// The expect on the get_mut is safe because every leaf name was
+// resolved by `lvalue_meta` before the staged map was created.
 //
 // IEEE 1364-2005 does not say what happens when an lvalue
 // concatenation names the same target bit more than once
-// (`{a[0], a[0]} = ...`), so the result is implementation-defined. vcal's
-// natural right-to-left walk just lets each write overwrite the staged
-// bit, so the leaf closer to the MSB end of the concat wins — it is
-// processed last because the rightmost leaf is processed first.
+// (`{a[0], a[0]} = ...`), so the result is implementation-defined.
+// vcal's natural right-to-left walk just lets each write overwrite the
+// staged bit, so the leaf closer to the MSB end of the concat wins —
+// it is processed last because the rightmost leaf is processed first.
 fn distribute_bits_to_leaves(
     leaves: &[&LValue],
     rhs_bits: &[LogicBit],
@@ -2807,16 +3203,51 @@ fn distribute_bits_to_leaves(
 ) -> Result<(), String> {
     let mut cursor = 0usize;
     for leaf in leaves.iter().rev() {
-        let (name, indices) = leaf_internal_indices(leaf, session)?;
-        let reg = staged
-            .get_mut(&name)
-            .expect("leaf name validated by lvalue_meta");
-        for opt_internal in indices {
-            let bit = rhs_bits[cursor];
-            if let Some(internal) = opt_internal {
-                reg.value.bits[internal] = bit;
+        let target = leaf_target(leaf, session)?;
+        let width = target.positions().len();
+        match target {
+            LeafTarget::Vector { name, positions } => {
+                let reg = staged
+                    .get_mut(&name)
+                    .expect("leaf name validated by lvalue_meta");
+                let value = reg
+                    .vector_mut()
+                    .expect("vector leaf confirmed by lvalue_meta");
+                for opt_internal in positions {
+                    let bit = rhs_bits[cursor];
+                    if let Some(internal) = opt_internal {
+                        value.bits[internal] = bit;
+                    }
+                    cursor += 1;
+                }
             }
-            cursor += 1;
+            LeafTarget::ArrayElement {
+                name,
+                element,
+                positions,
+            } => {
+                if let Some(element_index) = element {
+                    let reg = staged
+                        .get_mut(&name)
+                        .expect("leaf name validated by lvalue_meta");
+                    let (_, elements) = reg
+                        .array_mut()
+                        .expect("array leaf confirmed by lvalue_meta");
+                    let target_element = &mut elements[element_index];
+                    for opt_internal in positions {
+                        let bit = rhs_bits[cursor];
+                        if let Some(internal) = opt_internal {
+                            target_element.bits[internal] = bit;
+                        }
+                        cursor += 1;
+                    }
+                } else {
+                    // Outer-index x/z or OOB: no assignment performed,
+                    // but the cursor still advances by the leaf's
+                    // nominal width so adjacent leaves stay aligned.
+                    cursor += width;
+                }
+            }
         }
     }
     debug_assert_eq!(cursor, rhs_bits.len(), "leaf widths sum to total LHS width");

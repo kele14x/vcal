@@ -104,11 +104,25 @@ pub(crate) enum Expr {
     // identifier. Storing `name: String` rather than a nested
     // `Expr::Identifier` is deliberate — it makes the grammar reject
     // `4'b1111[0]` at parse time, because `parse_primary` only enters the
-    // bracket-pickup branch from the `Token::Identifier` arm. LHS selects
-    // and unpacked array `{ dimension }` are out of scope.
+    // bracket-pickup branch from the `Token::Identifier` arm.
+    //
+    // `inner` carries an optional second select that applies to the result
+    // of the first, supporting LRM 4.9 chained array-element selects like
+    // `a[i][m:l]` (where `a` is a 1-D unpacked array). The parser doesn't
+    // know whether `name` is an array, so it accepts the chained shape
+    // syntactically and lets the evaluator decide:
+    //   - array reg + `inner.is_some()` → outer must be `Bit` (element
+    //     pick), inner is any select kind applied to the chosen element
+    //     using the element's packed range.
+    //   - vector reg + `inner.is_some()` → rejected (a vector select
+    //     already yields a 1-bit / part-select value with no sub-structure
+    //     to address).
+    // Only one chained level is allowed, mirroring vcal's 1-D-array scope;
+    // the parser surfaces a clean error on a third bracket.
     Select {
         name: String,
         kind: SelectKind,
+        inner: Option<Box<SelectKind>>,
     },
 }
 
@@ -146,17 +160,21 @@ pub(crate) enum SelectKind {
 pub(crate) enum Stmt {
     Expr(Expr),
     // LRM A.2.1.3: `reg [signed] [range] list_of_variable_identifiers ;`,
-    // where each item in the identifier list may carry an optional
-    // `= constant_expression` init. `range` is `Some((msb_expr, lsb_expr))`
-    // and constant-evaluated at apply time. Each name's optional init
-    // expression is evaluated at decl time using the same path as a
-    // blocking assignment so real→integer conversion (LRM §3.5.3) and
-    // width / sign / base context propagate identically. The unpacked
-    // `{ dimension }` form (2D arrays) is intentionally out of scope.
+    // where each item in the identifier list may carry either an
+    // optional `= constant_expression` init (the vector / scalar form) or
+    // an unpacked dimension `[ msb_expr : lsb_expr ]` (the 1-D array form
+    // per LRM A.2.2.1 `variable_type`). The two arms of `variable_type`
+    // are mutually exclusive in the LRM — an array variable has no init
+    // expression — and we enforce that at parse time. `range` is the
+    // packed range (constant-evaluated at apply time); each `init`'s
+    // evaluation reuses the same path as a blocking assignment so
+    // real→integer conversion (LRM §3.5.3) and width / sign / base
+    // context propagate identically. Multi-dim arrays remain out of
+    // scope: only one trailing `[ … ]` after the name is accepted.
     Decl {
         signed: bool,
         range: Option<(Expr, Expr)>,
-        names: Vec<(String, Option<Expr>)>,
+        names: Vec<DeclName>,
     },
     // LRM A.6.2 `blocking_assignment` over the full `variable_lvalue`
     // production (LRM A.8.5): a hierarchical name with optional bit /
@@ -173,6 +191,17 @@ pub(crate) enum Stmt {
     Task(String),
 }
 
+// One entry in a `reg` decl's `list_of_variable_identifiers`. Exactly one
+// of `init` or `dim` may be present (the LRM `variable_type` grammar is
+// a strict `name [= expr]` | `name { dimension }` split); the parser
+// rejects an attempted combination up-front.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DeclName {
+    pub(crate) name: String,
+    pub(crate) init: Option<Expr>,
+    pub(crate) dim: Option<(Expr, Expr)>,
+}
+
 // LRM A.8.5 `variable_lvalue`. Storing this as its own enum (rather than
 // reusing `Expr`) keeps the LHS grammar a strict subset and lets
 // evaluators match exhaustively without re-checking shape at every
@@ -181,10 +210,23 @@ pub(crate) enum Stmt {
 // `+:` / `-:` indexed forms) carry across to the LHS unchanged.
 // `Concat` items are in source order: leftmost first, which is also the
 // MSB side of the assembled bit stream — matching `Expr::Concatenation`.
+//
+// `inner` on `Select` carries the optional chained-select shape
+// (LRM 4.9: `a[i][m:l]` selects a sub-range inside an unpacked-array
+// element). It mirrors the `inner` field on `Expr::Select`; on the LHS
+// the evaluator routes the array-element case (`reg.is_array()`) through
+// the same per-position distribution path the vector-reg LHS uses, with
+// the inner select choosing which bits inside the chosen element receive
+// RHS bits. The vector-reg LHS still rejects `inner.is_some()` because a
+// vector select has no further sub-structure to address.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum LValue {
     Name(String),
-    Select { name: String, kind: SelectKind },
+    Select {
+        name: String,
+        kind: SelectKind,
+        inner: Option<Box<SelectKind>>,
+    },
     Concat(Vec<LValue>),
 }
 
@@ -456,16 +498,20 @@ impl<'a> Parser<'a> {
 
         // LRM A.2.3 list_of_variable_identifiers ::=
         //     variable_type { , variable_type }
-        // LRM A.2.3 variable_type ::=
+        // LRM A.2.2.1 variable_type ::=
         //     variable_identifier { dimension }
         //   | variable_identifier = constant_expression
-        // The `{ dimension }` (2D unpacked array) branch is out of scope, so
-        // each item is just `name [= expr]`. The init expression is parsed
-        // with `parse_expression`; commas naturally bind to the outer list,
-        // never to the init RHS, since no expression-level operator consumes
-        // a bare `,`. Inits are evaluated sequentially at apply time so
-        // `reg [3:0] a = 1, b = a + 1` sees `a = 1` when binding `b`.
-        let mut names: Vec<(String, Option<Expr>)> = Vec::new();
+        // The two arms are mutually exclusive in the LRM — an array
+        // variable has no init expression — so each item is either
+        // `name [ msb : lsb ]` or `name [= expr]`. We accept at most one
+        // trailing dimension bracket (vcal's 1-D scope; multi-dim is
+        // deferred). The init expression is parsed with
+        // `parse_expression`; commas naturally bind to the outer list,
+        // never to the init RHS, since no expression-level operator
+        // consumes a bare `,`. Inits are evaluated sequentially at apply
+        // time so `reg [3:0] a = 1, b = a + 1` sees `a = 1` when binding
+        // `b`.
+        let mut names: Vec<DeclName> = Vec::new();
         loop {
             let name = match self.next() {
                 Some(Token::Identifier(n)) => n.clone(),
@@ -474,16 +520,46 @@ impl<'a> Parser<'a> {
             if matches!(name.as_str(), "reg" | "signed") {
                 return Err(format!("`{name}` cannot be used as a reg name"));
             }
-            if names.iter().any(|(existing, _)| existing == &name) {
+            if names.iter().any(|existing| existing.name == name) {
                 return Err(format!("duplicate name in reg declaration: {name}"));
             }
+            // Try the unpacked-dimension form first: a `[` immediately
+            // after the name is always an array dimension here, not a
+            // select (selects don't appear at decl position).
+            let dim = if matches!(self.peek(), Some(Token::LBracket)) {
+                self.index += 1;
+                let msb = self.parse_expression()?;
+                match self.next() {
+                    Some(Token::Colon) => {}
+                    _ => return Err("expected `:` in array dimension".to_string()),
+                }
+                let lsb = self.parse_expression()?;
+                match self.next() {
+                    Some(Token::RBracket) => {}
+                    _ => return Err("expected `]` after array dimension".to_string()),
+                }
+                if matches!(self.peek(), Some(Token::LBracket)) {
+                    return Err(
+                        "multi-dimensional arrays are not supported (only one `[…]` after the name)"
+                            .to_string(),
+                    );
+                }
+                Some((msb, lsb))
+            } else {
+                None
+            };
             let init = if matches!(self.peek(), Some(Token::Assign)) {
+                if dim.is_some() {
+                    return Err(format!(
+                        "array variable `{name}` cannot have an init expression"
+                    ));
+                }
                 self.index += 1;
                 Some(self.parse_expression()?)
             } else {
                 None
             };
-            names.push((name, init));
+            names.push(DeclName { name, init, dim });
             if matches!(self.peek(), Some(Token::Comma)) {
                 self.index += 1;
                 continue;
@@ -989,7 +1065,35 @@ impl<'a> Parser<'a> {
     // Whitespace-around-`+`/`-` in the indexed-select forms doesn't pass
     // through here because the lexer rejects it: `+:`/`-:` are
     // adjacency-only tokens.
+    //
+    // After the first bracket pair is consumed we peek for a second `[`.
+    // If present, we parse another `SelectKind` (LRM 4.9 chained
+    // array-element select like `a[i][m:l]`). A third bracket is rejected
+    // up-front since vcal only supports 1-D unpacked arrays — chaining
+    // further would have no LRM meaning under the current grammar.
     fn parse_select_after_bracket(&mut self, name: String) -> Result<Expr, String> {
+        let kind = self.parse_select_kind()?;
+        let inner = if matches!(self.peek(), Some(Token::LBracket)) {
+            self.index += 1;
+            let inner_kind = self.parse_select_kind()?;
+            if matches!(self.peek(), Some(Token::LBracket)) {
+                return Err(
+                    "chained selects beyond one inner bracket are not supported".to_string(),
+                );
+            }
+            Some(Box::new(inner_kind))
+        } else {
+            None
+        };
+        Ok(Expr::Select { name, kind, inner })
+    }
+
+    // Parse one `SelectKind` from inside a `[...]` group. The opening `[`
+    // has already been consumed by the caller; this method consumes the
+    // closing `]` for the matched form. Shared by the outer-bracket parse
+    // path and the chained inner-bracket path so both grammars stay in
+    // lockstep — adding a new select form here lights up both surfaces.
+    fn parse_select_kind(&mut self) -> Result<SelectKind, String> {
         let first = self.parse_expression()?;
         let kind = match self.peek() {
             Some(Token::RBracket) => {
@@ -1036,7 +1140,7 @@ impl<'a> Parser<'a> {
             }
             _ => return Err("expected `]`, `:`, `+:`, or `-:` in select".to_string()),
         };
-        Ok(Expr::Select { name, kind })
+        Ok(kind)
     }
 
     fn parse_concatenation_items(&mut self) -> Result<Vec<Expr>, String> {
@@ -1087,7 +1191,14 @@ fn top_level_task_name(expr: &Expr) -> Option<String> {
 fn expression_to_lvalue(expr: Expr) -> Result<LValue, String> {
     match expr {
         Expr::Identifier(name) => Ok(LValue::Name(name)),
-        Expr::Select { name, kind } => Ok(LValue::Select { name, kind }),
+        // Chained selects (`a[i][m:l]`) pass straight through: on the LHS
+        // the evaluator routes the array-element + inner-select case through
+        // the same per-position distribution path the vector-reg LHS uses
+        // (LRM 4.9). The structural validation (only `Bit` outer on an
+        // array, inner forbidden on a vector, inner part-select direction
+        // matches the element's packed range) happens in `lvalue_meta`, so
+        // the parser stays purely syntactic here.
+        Expr::Select { name, kind, inner } => Ok(LValue::Select { name, kind, inner }),
         Expr::Grouped(inner) => expression_to_lvalue(*inner),
         Expr::Concatenation { items } => {
             let lvalues = items

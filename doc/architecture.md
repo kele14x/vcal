@@ -3,7 +3,7 @@
 ## Source layout
 
 - `src/main.rs` — CLI entrypoint.
-- `src/lib.rs` — facade: public API (`Session`, `evaluate_input`, `run_repl`, `run_interactive`, `Evaluation`, plus the `value` re-exports), the `Stmt` driver (`apply_stmt`, `evaluate_reg_range`), `RegRange` / `RegValue` session storage, and module declarations.
+- `src/lib.rs` — facade: public API (`Session`, `evaluate_input`, `run_repl`, `run_interactive`, `Evaluation`, plus the `value` re-exports), the `Stmt` driver (`apply_stmt`, `evaluate_reg_range`), `RegRange` / `RegValue` / `RegStorage` (the `Vector` vs `Array` sum type for the unpacked-dim reg storage) session storage, and module declarations.
 - `src/value.rs` — `LogicBit`, `Base`, `IntegerValue` (incl. width/sign/base/extension logic), bit ↔ bigint helpers, 4-value truth tables.
 - `src/lexer.rs` — `Token`, `tokenize`, literal text readers.
 - `src/parser.rs` — `Stmt` / `Expr` / `UnaryOp` / `BinaryOp` AST, `parse_statements`, `Parser` + precedence-climbing levels, decl/assign helpers, `parse_integer` and literal-text parsing helpers.
