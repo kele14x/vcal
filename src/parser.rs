@@ -158,15 +158,34 @@ pub(crate) enum Stmt {
         range: Option<(Expr, Expr)>,
         names: Vec<(String, Option<Expr>)>,
     },
-    // LRM A.6.2 `blocking_assignment`. Only the variable-name LHS form is
-    // supported; bit-/part-select LHSs are out of scope for this round.
+    // LRM A.6.2 `blocking_assignment` over the full `variable_lvalue`
+    // production (LRM A.8.5): a hierarchical name with optional bit /
+    // part / indexed-part select, or an arbitrarily nested
+    // concatenation of those. The dedicated `LValue` enum makes
+    // operators / literals / replications unrepresentable on the LHS
+    // by construction.
     Assign {
-        name: String,
+        lvalue: LValue,
         rhs: Expr,
     },
     // LRM 17.4: `$finish` / `$stop` hoisted to the statement level so the
     // driver can exit without going through the expression evaluator.
     Task(String),
+}
+
+// LRM A.8.5 `variable_lvalue`. Storing this as its own enum (rather than
+// reusing `Expr`) keeps the LHS grammar a strict subset and lets
+// evaluators match exhaustively without re-checking shape at every
+// callsite. `SelectKind` is the same one the RHS-side `Expr::Select`
+// uses, so all four select forms (bit-select, [m:l] part-select, and the
+// `+:` / `-:` indexed forms) carry across to the LHS unchanged.
+// `Concat` items are in source order: leftmost first, which is also the
+// MSB side of the assembled bit stream — matching `Expr::Concatenation`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LValue {
+    Name(String),
+    Select { name: String, kind: SelectKind },
+    Concat(Vec<LValue>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -371,25 +390,33 @@ impl<'a> Parser<'a> {
     // assignment / expression as a calculator line). Keyword recognition is
     // string-based on `Token::Identifier`; with only two keywords (`reg`,
     // `signed`) a dedicated `Token::Keyword` would be premature.
+    //
+    // The blocking-assignment LHS can be a bare name, a bit/part-select on
+    // a name, or an arbitrarily nested concatenation of those — `name`,
+    // `name[...]`, and `{...}` are all already valid `Expr` shapes, so we
+    // parse the LHS as an `Expr` first and convert it to an `LValue` via
+    // `expression_to_lvalue` only after spotting `=`. If `=` doesn't follow
+    // we keep the parsed `Expr` as the statement payload — no rewind, no
+    // double parse. The leading-token gate keeps the existing
+    // `$finish`/expression path undisturbed.
     fn parse_statement(&mut self) -> Result<Stmt, String> {
         if matches!(self.peek(), Some(Token::Identifier(name)) if name == "reg") {
             self.index += 1;
             return self.parse_decl();
         }
 
-        // Blocking assignment: bare identifier followed by `=`. Anything
-        // more elaborate (bit-select LHS etc.) falls through to the
-        // expression path and surfaces a parse error there.
-        if let (Some(Token::Identifier(_)), Some(Token::Assign)) =
-            (self.tokens.get(self.index), self.tokens.get(self.index + 1))
-        {
-            let name = match self.next() {
-                Some(Token::Identifier(n)) => n.clone(),
-                _ => unreachable!("guarded above"),
-            };
-            self.index += 1; // consume `=`
-            let rhs = self.parse_expression()?;
-            return Ok(Stmt::Assign { name, rhs });
+        if matches!(self.peek(), Some(Token::Identifier(_) | Token::LBrace)) {
+            let expr = self.parse_expression()?;
+            if matches!(self.peek(), Some(Token::Assign)) {
+                let lvalue = expression_to_lvalue(expr)?;
+                self.index += 1; // consume `=`
+                let rhs = self.parse_expression()?;
+                return Ok(Stmt::Assign { lvalue, rhs });
+            }
+            if let Some(name) = top_level_task_name(&expr) {
+                return Ok(Stmt::Task(name));
+            }
+            return Ok(Stmt::Expr(expr));
         }
 
         let expr = self.parse_expression()?;
@@ -1047,6 +1074,32 @@ fn top_level_task_name(expr: &Expr) -> Option<String> {
         Expr::Grouped(inner) => top_level_task_name(inner),
         Expr::SystemTask { name } => Some(name.clone()),
         _ => None,
+    }
+}
+
+// LRM A.8.5 `variable_lvalue`. Called after `parse_statement` has parsed
+// the LHS as an `Expr` and confirmed `=` follows. Accept only the shapes
+// the LRM production allows; reject everything else with a uniform
+// "invalid lvalue" diagnostic. `Grouped` is unwrapped because the
+// statement parser otherwise would force users to repeat themselves for
+// `(a) = ...`, and the leniency matches how `top_level_task_name`
+// already walks through parens for `($finish)`.
+fn expression_to_lvalue(expr: Expr) -> Result<LValue, String> {
+    match expr {
+        Expr::Identifier(name) => Ok(LValue::Name(name)),
+        Expr::Select { name, kind } => Ok(LValue::Select { name, kind }),
+        Expr::Grouped(inner) => expression_to_lvalue(*inner),
+        Expr::Concatenation { items } => {
+            let lvalues = items
+                .into_iter()
+                .map(expression_to_lvalue)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(LValue::Concat(lvalues))
+        }
+        Expr::Replication { .. } => {
+            Err("invalid lvalue: replication is not a variable_lvalue".to_string())
+        }
+        _ => Err("invalid lvalue: expected name, bit/part-select, or concatenation".to_string()),
     }
 }
 

@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{FromPrimitive, One, Signed, ToPrimitive, Zero};
 
 use crate::{RegRange, RegValue, Session};
-use crate::parser::{BinaryOp, Expr, MathFunctionKind, RealConversionKind, SelectKind, UnaryOp};
+use crate::parser::{
+    BinaryOp, Expr, LValue, MathFunctionKind, RealConversionKind, SelectKind, UnaryOp,
+};
 use crate::value::{
     Base, IntegerValue, LogicBit, Value, bits_to_biguint, bitwise_and_bits, bitwise_not_bit,
     bitwise_or_bits, bitwise_xnor_bits, bitwise_xor_bits,
@@ -2509,4 +2513,297 @@ fn select_result_width(kind: &SelectKind, session: &Session) -> Result<usize, St
             evaluate_indexed_select_width(width, session)
         }
     }
+}
+
+// LRM A.6.2 blocking assignment, full A.8.5 variable_lvalue form. The
+// entrypoint runs every structural check (declared-name lookup,
+// scalar-reg-with-select rejection, part-select direction match, x/z in
+// constant endpoints, write-collision detection) *before* the RHS is
+// evaluated, then distributes the RHS bits into a staged variable map.
+// The caller swaps the staged map into the live session on success, so a
+// failure anywhere — even after some leaves' indices have been resolved
+// — leaves the session untouched.
+//
+// The returned `IntegerValue` is the RHS evaluated in the total-LHS
+// context (width = sum of leaf widths, signed = false for any
+// select/concat leaf, base = leftmost-leaf base). For a bare-name LHS
+// this matches the reg's stored `(width, signed, base)` so the printed
+// canonical form is bit-identical to the pre-lvalue behavior.
+pub(crate) fn evaluate_lvalue_assignment(
+    lvalue: &LValue,
+    rhs: &Expr,
+    session: &Session,
+) -> Result<(HashMap<String, RegValue>, IntegerValue), String> {
+    let meta = lvalue_meta(lvalue, session)?;
+    let mut leaves: Vec<&LValue> = Vec::new();
+    flatten_lvalue_leaves(lvalue, &mut leaves);
+    let rhs_value = evaluate_assignment_rhs(rhs, meta.width, meta.signed, meta.base, session)?;
+    // Per LRM 5.5.1 the integer pipeline widens to `max(ctx_width,
+    // expr_width)` (so `r = -5` on an 8-bit `r` returns 32 bits — the
+    // unsized literal's natural width wins). Distributing those over the
+    // LHS requires exactly `meta.width` bits: truncate the LSB-end if
+    // the RHS came back wider, extend with context-fill if narrower.
+    // Re-stamp `(width, signed, base)` from the lvalue context for the
+    // same reason — the leftmost-base inference would otherwise let the
+    // RHS's display base leak into the echo (so `a = 4'hF + 4'hF` would
+    // render in hex).
+    let sized = rhs_value.resized_to_context(meta.width, meta.signed);
+    let displayed = IntegerValue {
+        width: meta.width,
+        signed: meta.signed,
+        base: meta.base,
+        bits: sized.bits.clone(),
+        unsized_literal: false,
+    };
+    let mut staged = session.variables.clone();
+    distribute_bits_to_leaves(&leaves, &sized.bits, &mut staged, session)?;
+    Ok((staged, displayed))
+}
+
+// LRM 5.6 LHS context derivation. Runs the same constant-endpoint /
+// direction / scalar-reg / indexed-width checks the RHS select helpers
+// do, so any structural problem on the LHS surfaces before the RHS is
+// even looked at. Returning an `ExprMeta` keeps the call shape parallel
+// to `infer_expr_meta` so the surrounding context-propagation story
+// stays one-paradigm.
+fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
+    match lvalue {
+        LValue::Name(name) => {
+            let reg = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            Ok(ExprMeta {
+                width: reg.value.width,
+                signed: reg.value.signed,
+                base: reg.value.base,
+            })
+        }
+        LValue::Select { name, kind } => {
+            let reg = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            // LRM 5.2.1 scalar-reg rejection. Mirrors `evaluate_select`.
+            let range = reg.range.as_ref().ok_or_else(|| {
+                format!("bit-select or part-select on scalar reg `{name}` is illegal")
+            })?;
+            let width = match kind {
+                SelectKind::Bit { .. } => 1,
+                SelectKind::PartConst { msb, lsb } => {
+                    let msb_sel = evaluate_constant_range_endpoint(msb, session, "msb")?;
+                    let lsb_sel = evaluate_constant_range_endpoint(lsb, session, "lsb")?;
+                    check_part_select_direction(range, &msb_sel, &lsb_sel)?;
+                    compute_select_width(&msb_sel, &lsb_sel)?
+                }
+                SelectKind::PartIndexedUp { width, .. }
+                | SelectKind::PartIndexedDown { width, .. } => {
+                    evaluate_indexed_select_width(width, session)?
+                }
+            };
+            Ok(ExprMeta {
+                width,
+                signed: false,
+                base: reg.value.base,
+            })
+        }
+        LValue::Concat(items) => {
+            if items.is_empty() {
+                return Err("lvalue concatenation requires at least one operand".to_string());
+            }
+            let mut total_width = 0usize;
+            let mut leftmost_base = Base::Binary;
+            for (idx, item) in items.iter().enumerate() {
+                let item_meta = lvalue_meta(item, session)?;
+                total_width = total_width.saturating_add(item_meta.width);
+                if idx == 0 {
+                    leftmost_base = item_meta.base;
+                }
+            }
+            if total_width == 0 {
+                return Err("lvalue must have at least one operand with positive size".to_string());
+            }
+            Ok(ExprMeta {
+                width: total_width,
+                signed: false,
+                base: leftmost_base,
+            })
+        }
+    }
+}
+
+// Left-to-right (MSB-side first) leaf enumeration. Used by both the
+// write-collision pass and the bit-distribution pass; both walk the
+// resulting slice in reverse so the rightmost leaf consumes the LSB end
+// of the RHS bit stream.
+fn flatten_lvalue_leaves<'a>(lvalue: &'a LValue, out: &mut Vec<&'a LValue>) {
+    match lvalue {
+        LValue::Name(_) | LValue::Select { .. } => out.push(lvalue),
+        LValue::Concat(items) => {
+            for item in items {
+                flatten_lvalue_leaves(item, out);
+            }
+        }
+    }
+}
+
+// Resolves a leaf to (reg_name, LSB-first per-position internal-index
+// sequence). `Some(internal)` = in-range position, will receive a bit;
+// `None` = out-of-range / x-z-index drop. The vector's length always
+// equals the leaf's nominal width (so the bit-cursor advances uniformly
+// even on dropped positions).
+fn leaf_internal_indices(
+    leaf: &LValue,
+    session: &Session,
+) -> Result<(String, Vec<Option<usize>>), String> {
+    match leaf {
+        LValue::Name(name) => {
+            let reg = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            // Bare-name leaf spans every internal bit, LSB-first.
+            let indices = (0..reg.value.width).map(Some).collect();
+            Ok((name.clone(), indices))
+        }
+        LValue::Select { name, kind } => {
+            let reg = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            let range = reg.range.as_ref().ok_or_else(|| {
+                format!("bit-select or part-select on scalar reg `{name}` is illegal")
+            })?;
+            match kind {
+                SelectKind::Bit { index } => {
+                    if expression_is_real(index) {
+                        return Err("bit-select index cannot be real".to_string());
+                    }
+                    let index_value = evaluate_expr_in_context(index, None, session)?;
+                    if index_value.has_unknown_bits() {
+                        // LRM 4.2.1: x/z index → no assignment performed.
+                        return Ok((name.clone(), vec![None]));
+                    }
+                    let src = index_value.as_bigint(index_value.signed);
+                    Ok((name.clone(), vec![resolve_reg_index(range, &src)]))
+                }
+                SelectKind::PartConst { msb, lsb } => {
+                    // The range endpoints, direction, and width were
+                    // already validated by `lvalue_meta` (so we can
+                    // assume both endpoints are definite and direction
+                    // matches), but re-evaluate here for the indices —
+                    // the existing eval helpers are pure / cheap, and a
+                    // single round of re-evaluation keeps this helper
+                    // standalone.
+                    let msb_sel = evaluate_constant_range_endpoint(msb, session, "msb")?;
+                    let lsb_sel = evaluate_constant_range_endpoint(lsb, session, "lsb")?;
+                    let width = compute_select_width(&msb_sel, &lsb_sel)?;
+                    Ok((
+                        name.clone(),
+                        per_position_indices(range, &msb_sel, &lsb_sel, width),
+                    ))
+                }
+                SelectKind::PartIndexedUp {
+                    base: base_expr,
+                    width: width_expr,
+                }
+                | SelectKind::PartIndexedDown {
+                    base: base_expr,
+                    width: width_expr,
+                } => {
+                    let is_up = matches!(kind, SelectKind::PartIndexedUp { .. });
+                    let width = evaluate_indexed_select_width(width_expr, session)?;
+                    if expression_is_real(base_expr) {
+                        return Err("indexed part-select base cannot be real".to_string());
+                    }
+                    let base_value = evaluate_expr_in_context(base_expr, None, session)?;
+                    if base_value.has_unknown_bits() {
+                        // LRM 5.2.2 / 4.2.1: x/z in the base means
+                        // every position is unresolved → all dropped.
+                        return Ok((name.clone(), vec![None; width]));
+                    }
+                    let base_int = base_value.as_bigint(base_value.signed);
+                    let span = BigInt::from(width - 1);
+                    let (src_lo, src_hi) = if is_up {
+                        let hi = &base_int + &span;
+                        (base_int, hi)
+                    } else {
+                        let lo = &base_int - &span;
+                        (lo, base_int)
+                    };
+                    // Same direction logic as `evaluate_part_indexed_select`:
+                    // for a forward decl, the larger source index is the
+                    // MSB side; for a reversed decl, the smaller is.
+                    let (msb_sel, lsb_sel) = if range.msb < range.lsb {
+                        (src_lo, src_hi)
+                    } else {
+                        (src_hi, src_lo)
+                    };
+                    Ok((name.clone(), per_position_indices(range, &msb_sel, &lsb_sel, width)))
+                }
+            }
+        }
+        // Concats aren't leaves — flatten_lvalue_leaves never reaches them.
+        LValue::Concat(_) => unreachable!("leaf_internal_indices called on a Concat"),
+    }
+}
+
+// LSB-first per-position resolver shared by the const and indexed
+// part-select arms. Steps from `lsb_sel` toward `msb_sel` (±1 depending
+// on which is larger) and maps each source index through
+// `resolve_reg_index`. Mirrors `materialize_part_select` so the LHS
+// distribution lines up bit-for-bit with the equivalent RHS read.
+fn per_position_indices(
+    range: &RegRange,
+    msb_sel: &BigInt,
+    lsb_sel: &BigInt,
+    width: usize,
+) -> Vec<Option<usize>> {
+    let step: BigInt = if msb_sel >= lsb_sel {
+        BigInt::one()
+    } else {
+        -BigInt::one()
+    };
+    let mut indices = Vec::with_capacity(width);
+    let mut src = lsb_sel.clone();
+    for _ in 0..width {
+        indices.push(resolve_reg_index(range, &src));
+        src += &step;
+    }
+    indices
+}
+
+// Walks leaves right-to-left (rightmost leaf = LSB end of the RHS bit
+// stream) with a cursor into `rhs_bits` (LSB-first). For each leaf,
+// `leaf_internal_indices` returns the LSB-first per-position internal
+// indices; in-range positions receive the corresponding RHS bit,
+// out-of-range / x-z-index positions consume their cursor slot silently
+// (LRM 4.2.1 "no assignment performed"). The expect on the get_mut is
+// safe because every leaf name was resolved by `lvalue_meta` before the
+// staged map was created.
+//
+// IEEE 1364-2005 does not say what happens when an lvalue
+// concatenation names the same target bit more than once
+// (`{a[0], a[0]} = ...`), so the result is implementation-defined. vcal's
+// natural right-to-left walk just lets each write overwrite the staged
+// bit, so the leaf closer to the MSB end of the concat wins — it is
+// processed last because the rightmost leaf is processed first.
+fn distribute_bits_to_leaves(
+    leaves: &[&LValue],
+    rhs_bits: &[LogicBit],
+    staged: &mut HashMap<String, RegValue>,
+    session: &Session,
+) -> Result<(), String> {
+    let mut cursor = 0usize;
+    for leaf in leaves.iter().rev() {
+        let (name, indices) = leaf_internal_indices(leaf, session)?;
+        let reg = staged
+            .get_mut(&name)
+            .expect("leaf name validated by lvalue_meta");
+        for opt_internal in indices {
+            let bit = rhs_bits[cursor];
+            if let Some(internal) = opt_internal {
+                reg.value.bits[internal] = bit;
+            }
+            cursor += 1;
+        }
+    }
+    debug_assert_eq!(cursor, rhs_bits.len(), "leaf widths sum to total LHS width");
+    Ok(())
 }

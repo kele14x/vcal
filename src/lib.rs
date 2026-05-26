@@ -195,27 +195,20 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
             session.variables = staged;
             Ok((String::new(), false))
         }
-        Stmt::Assign { name, rhs } => {
-            let (width, signed, base) = match session.lookup(name) {
-                Some(reg) => (reg.value.width, reg.value.signed, reg.value.base),
-                None => return Err(format!("undeclared identifier: {name}")),
-            };
-            // A real RHS triggers an implicit real→integer conversion per
-            // LRM §3.5.3 (round to nearest, ties away from zero), handled
-            // inside `evaluate_assignment_rhs`. NaN / ±∞ have no integer
-            // image and surface as the lvalue filled with x bits.
-            let value = eval::evaluate_assignment_rhs(rhs, width, signed, base, session)?;
-            let updated = IntegerValue {
-                width,
-                signed,
-                base,
-                bits: value.bits,
-                unsized_literal: false,
-            };
-            if let Some(reg) = session.variables.get_mut(name) {
-                reg.value = updated.clone();
-            }
-            Ok((updated.canonical(), false))
+        Stmt::Assign { lvalue, rhs } => {
+            // LRM A.6.2 blocking assignment with the full A.8.5
+            // variable_lvalue form. All structural validation, RHS
+            // evaluation, and bit distribution happen inside
+            // `evaluate_lvalue_assignment`, which returns a staged copy
+            // of the variable map on success — we swap it in atomically
+            // so a multi-leaf concat LHS that fails partway leaves the
+            // live session untouched (mirroring `Stmt::Decl`'s
+            // all-or-nothing commit). The displayed value is the RHS
+            // evaluated in the total-LHS context, so a bare-name LHS
+            // prints bit-identically to the pre-lvalue behavior.
+            let (staged, displayed) = eval::evaluate_lvalue_assignment(lvalue, rhs, session)?;
+            session.variables = staged;
+            Ok((displayed.canonical(), false))
         }
     }
 }

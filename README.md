@@ -284,8 +284,8 @@ This is final support target matrix, not means currently supported or implemente
                       | multiple_concatenation
                       | system_function_call
                       | string
-    - [ ] A.8.5 Expression left-side values
-      - [ ] variable_lvalue ::= variable_identifier [ { [ expression ] } [ range_expression ] ]
+    - [x] A.8.5 Expression left-side values
+      - [x] variable_lvalue ::= variable_identifier [ { [ expression ] } [ range_expression ] ]
                               | { variable_lvalue { , variable_lvalue } }
     - [ ] A.8.6 Operators
       - [ ] unary_operator ::= + | - | ! | ~ | & | ~& | | | ~| | ^ | ~^ | ^~
@@ -467,9 +467,66 @@ A declared reg can be sliced four ways (LRM 4.2.1 / 5.2.1 / 5.2.2):
 
 The select grammar only attaches to a declared identifier — `4'b1111[0]`
 does not parse, matching the LRM production
-`identifier [ { [ expression ] } [ range_expression ] ]`. LHS selects
-(`r[0] = 1'b1`) and the unpacked `{ dimension }` array form remain out
-of scope.
+`identifier [ { [ expression ] } [ range_expression ] ]`. The unpacked
+`{ dimension }` array form remains out of scope.
+
+The same four select forms are also accepted on the left-hand side of a
+blocking assignment, per LRM A.8.5 `variable_lvalue`:
+
+| LHS form                | Meaning                                |
+|-------------------------|----------------------------------------|
+| `r[expr] = ...`         | write a single bit                     |
+| `r[m:l] = ...`          | write a constant-bounded slice         |
+| `r[b +: w] = ...`       | write an upward indexed slice          |
+| `r[b -: w] = ...`       | write a downward indexed slice         |
+| `{a, b[3:0], ...} = ...`| distribute bits across a concatenation |
+
+Concatenations may nest arbitrarily (`{x, {y, z[1:0]}}`), and the leaves
+are flattened left-to-right with the leftmost leaf taking the most
+significant slice of the RHS. The RHS is evaluated in the
+total-LHS-width context (sum of leaf widths, unsigned, leftmost leaf's
+base), so the usual width / sign / base propagation rules apply.
+
+A few semantic rules worth pinning down:
+
+1. **Out-of-range / x-z LHS select positions are silently dropped.**
+   LRM 4.2.1 says "no assignment shall be performed" for such a
+   position. So `reg [3:0] r = 4'h0; r[5:2] = 4'b1111` writes only the
+   in-range positions and leaves `r` as `4'b1100`; an x/z bit-select
+   index drops the whole write but is not an error.
+2. **Duplicate-bit writes in a concat LHS are implementation-defined.**
+   IEEE 1364-2005 does not specify what happens when a target bit
+   appears more than once on the LHS (`{a[0], a[0]} = ...`, or
+   `{a, a[0]} = ...` where the `a` leaf and the `a[0]` leaf both
+   address bit 0). vcal does not reject this; the natural right-to-left
+   distribution lets the leaf closer to the MSB end of the concat write
+   last, so it wins. So `reg [3:0] a = 4'h0; {a[0], a[0]} = 2'b10`
+   ends with `a` as `4'b0001` — the MSB-side `a[0]` receives the RHS
+   MSB (1).
+
+   A subtler case where the duplicate-bit rule interacts with the echo
+   rule: given `reg [3:0] a`, the line `{a, a[0]} = 8'b000_01xz_x`
+   prints `5'b01xzx` (the echo: 8-bit RHS truncated to the 5-bit total
+   LHS context per rule #4) but leaves `a` as `4'b01xz`. The two
+   differ in the LSB. Distribution walks leaves right-to-left, so the
+   rightmost `a[0]` leaf writes first (taking the RHS LSB `x` →
+   `a[0] = x`), then the leftmost `a` leaf writes its 4 bits over
+   `a[3:0]` — and *its* position 0 (the RHS bit `z`) overwrites the
+   earlier `x`. So `a[0]` ends as `z`, not the `x` you'd guess from
+   the echo's rightmost bit. The echo reflects "what the RHS becomes
+   in the LHS context"; the reg state reflects "what survived the
+   duplicate-write resolution".
+3. **All-or-nothing commit.** Structural validation (direction
+   mismatch, undeclared leaf, scalar-with-select, x/z in a constant
+   endpoint, zero indexed width) runs before the RHS is evaluated and
+   before any reg is mutated. So `{a, b_undeclared} = ...` leaves `a`
+   untouched.
+4. **Echo policy.** `Out[n]:` prints the RHS evaluated in the total-LHS
+   context. For bare-name LHS this is bit-identical to the pre-lvalue
+   behavior (reg's stored width / signedness / base); for a select LHS
+   it prints the slice at the select width and the reg's base; for a
+   concat LHS it prints the joined value at the sum-width with the
+   leftmost leaf's base.
 
 Per LRM 5.2.1, "A bit-select or part-select of a scalar … shall be
 illegal." A reg declared without a range is a scalar even when its
