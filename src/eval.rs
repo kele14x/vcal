@@ -350,10 +350,14 @@ fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> 
                 // IEEE 754 bit pattern, so we require an exactly 64-bit
                 // self-determined width — narrower operands (e.g. 32-bit
                 // unsized literals) and wider ones both get rejected to
-                // avoid silent zero-extension or truncation. Real operand
-                // has no defined bit-cast here, so reject it too.
+                // avoid silent zero-extension or truncation. The
+                // "argument cannot be real" rejection lives in the
+                // validator (`validate_expr_structure` BitsToReal arm),
+                // so a real arg cannot reach here.
                 if expression_is_real(arg) {
-                    return Err("$bitstoreal argument cannot be real".to_string());
+                    unreachable!(
+                        "validator rejects real $bitstoreal arg before evaluation"
+                    );
                 }
                 let arg_meta = infer_expr_meta(arg, session)?;
                 if arg_meta.width != 64 {
@@ -1119,10 +1123,13 @@ fn evaluate_unary_expr(
             | UnaryOp::ReductionNor
             | UnaryOp::ReductionXor
             | UnaryOp::ReductionXnor => {
-                return Err(format!(
-                    "operator {} not allowed on real operand",
+                // Per LRM Table 5-3, the validator
+                // (`validate_expr_structure` Unary arm) rejects these
+                // operators on a real operand before evaluation runs.
+                unreachable!(
+                    "validator rejects real operand of {} before evaluation",
                     unary_op_name(op)
-                ));
+                );
             }
             UnaryOp::Plus | UnaryOp::Minus => {
                 unreachable!("unary +/- on real is handled by the real path")
@@ -1241,10 +1248,13 @@ fn evaluate_binary_expr(
             | BinaryOp::LogicalShiftRight
             | BinaryOp::ArithmeticShiftLeft
             | BinaryOp::ArithmeticShiftRight => {
-                return Err(format!(
-                    "operator {} not allowed on real operand",
+                // Per LRM Table 5-3, the validator
+                // (`validate_expr_structure` Binary arm) rejects these
+                // operators on a real operand before evaluation runs.
+                unreachable!(
+                    "validator rejects real operand of {} before evaluation",
                     binary_op_name(op)
-                ));
+                );
             }
             BinaryOp::LessThan
             | BinaryOp::GreaterThan
@@ -2129,12 +2139,14 @@ fn evaluate_sign_cast_expr(
 ) -> Result<IntegerValue, String> {
     // $signed/$unsigned are integer-only — applying them to a real value
     // has no meaning under §5.5 (signedness is a property of the integer
-    // value set, not the floating-point one).
+    // value set, not the floating-point one). The validator
+    // (`validate_expr_structure` SignCast arm) rejects a real arg before
+    // evaluation, so a real arg cannot reach here.
     if expression_is_real(arg) {
-        return Err(format!(
-            "{} argument cannot be real",
+        unreachable!(
+            "validator rejects real {} arg before evaluation",
             if signed { "$signed" } else { "$unsigned" }
-        ));
+        );
     }
     let arg_value = evaluate_expr_in_context(arg, None, session)?;
     let cast_value = IntegerValue::computed(
@@ -2159,11 +2171,13 @@ fn evaluate_base_cast_expr(
     context: Option<ExprMeta>,
     session: &Session,
 ) -> Result<IntegerValue, String> {
+    // The validator (`validate_expr_structure` BaseCast arm) rejects a
+    // real arg before evaluation, so a real arg cannot reach here.
     if expression_is_real(arg) {
-        return Err(format!(
-            "{} argument cannot be real",
+        unreachable!(
+            "validator rejects real {} arg before evaluation",
             base_cast_name(base)
-        ));
+        );
     }
     let arg_value = evaluate_expr_in_context(arg, None, session)?;
     let cast_value = IntegerValue::computed(
@@ -2675,8 +2689,10 @@ fn evaluate_array_element_select(
             ));
         }
     };
+    // The validator (`infer_select_meta` for RHS, `lvalue_meta` for LHS)
+    // rejects a real array-element index before evaluation.
     if expression_is_real(index) {
-        return Err("array element index cannot be real".to_string());
+        unreachable!("validator rejects real array-element index before evaluation");
     }
     // Every element shares the packed-range shape, so the OOB / x-z
     // fallback can read its width/signed/base off any one of them. The
@@ -2732,8 +2748,10 @@ fn evaluate_array_chained_select(
             ));
         }
     };
+    // The validator (`infer_select_meta` for RHS, `lvalue_meta` for LHS)
+    // rejects a real array-element index before evaluation.
     if expression_is_real(index) {
-        return Err("array element index cannot be real".to_string());
+        unreachable!("validator rejects real array-element index before evaluation");
     }
     // A bit-/part-select on the chosen element requires the element to
     // have a packed range — scalar array elements have no bits to
@@ -2768,8 +2786,11 @@ fn evaluate_bit_select(
     result_base: Base,
     session: &Session,
 ) -> Result<IntegerValue, String> {
+    // The validator (`select_meta_width` via
+    // `validate_select_expr_structure`) rejects a real bit-select index
+    // before evaluation.
     if expression_is_real(index) {
-        return Err("bit-select index cannot be real".to_string());
+        unreachable!("validator rejects real bit-select index before evaluation");
     }
     let index_value = evaluate_expr_in_context(index, None, session)?;
     if index_value.has_unknown_bits() {
@@ -2817,8 +2838,11 @@ fn evaluate_part_indexed_select(
     is_up: bool,
 ) -> Result<IntegerValue, String> {
     let width = evaluate_indexed_select_width(width_expr, session)?;
+    // The validator (`select_meta_width` via
+    // `validate_select_expr_structure`) rejects a real indexed-base
+    // before evaluation.
     if expression_is_real(base_expr) {
-        return Err("indexed part-select base cannot be real".to_string());
+        unreachable!("validator rejects real indexed part-select base before evaluation");
     }
     let base_value = evaluate_expr_in_context(base_expr, None, session)?;
     if base_value.has_unknown_bits() {
