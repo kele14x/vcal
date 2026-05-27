@@ -162,16 +162,18 @@ pub(crate) enum Stmt {
     // LRM A.2.1.3 variable declarations. `kind` distinguishes which
     // keyword introduced the decl — `reg` allows `[signed] [range]` and
     // an optional per-name unpacked dimension; `integer` and `real` per
-    // LRM 4.8 take none of those (integer is fixed at signed 32-bit,
-    // real is IEEE 754 binary64) and the parser rejects any attempt to
-    // attach them. Each item in the identifier list may still carry an
-    // optional `= constant_expression` init; an integer init runs
-    // through the same blocking-assignment context the reg form does
-    // (real → integer per §3.5.3, width/sign/base propagation), while a
-    // real init is evaluated as a real value. `range` is the packed
-    // range (constant-evaluated at apply time, reg-only). Multi-dim
-    // arrays remain out of scope: only one trailing `[ … ]` after the
-    // name is accepted, and only on `reg` names.
+    // LRM 4.8 are fixed-shape (integer is signed 32-bit, real is IEEE
+    // 754 binary64) so the parser rejects `signed` and packed `[range]`
+    // on them, but each still accepts an optional per-name unpacked
+    // dimension (LRM A.2.2.1 `variable_type ::= … { dimension }`). Each
+    // item in the identifier list may also carry an optional
+    // `= constant_expression` init; an integer init runs through the
+    // same blocking-assignment context the reg form does (real → integer
+    // per §3.5.3, width/sign/base propagation), while a real init is
+    // evaluated as a real value. `range` is the packed range
+    // (constant-evaluated at apply time, reg-only). Multi-dim arrays
+    // remain out of scope: only one trailing `[ … ]` after the name is
+    // accepted.
     Decl {
         kind: DeclKind,
         signed: bool,
