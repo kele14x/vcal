@@ -159,19 +159,21 @@ pub(crate) enum SelectKind {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Stmt {
     Expr(Expr),
-    // LRM A.2.1.3: `reg [signed] [range] list_of_variable_identifiers ;`,
-    // where each item in the identifier list may carry either an
-    // optional `= constant_expression` init (the vector / scalar form) or
-    // an unpacked dimension `[ msb_expr : lsb_expr ]` (the 1-D array form
-    // per LRM A.2.2.1 `variable_type`). The two arms of `variable_type`
-    // are mutually exclusive in the LRM — an array variable has no init
-    // expression — and we enforce that at parse time. `range` is the
-    // packed range (constant-evaluated at apply time); each `init`'s
-    // evaluation reuses the same path as a blocking assignment so
-    // real→integer conversion (LRM §3.5.3) and width / sign / base
-    // context propagate identically. Multi-dim arrays remain out of
-    // scope: only one trailing `[ … ]` after the name is accepted.
+    // LRM A.2.1.3 variable declarations. `kind` distinguishes which
+    // keyword introduced the decl — `reg` allows `[signed] [range]` and
+    // an optional per-name unpacked dimension; `integer` and `real` per
+    // LRM 4.8 take none of those (integer is fixed at signed 32-bit,
+    // real is IEEE 754 binary64) and the parser rejects any attempt to
+    // attach them. Each item in the identifier list may still carry an
+    // optional `= constant_expression` init; an integer init runs
+    // through the same blocking-assignment context the reg form does
+    // (real → integer per §3.5.3, width/sign/base propagation), while a
+    // real init is evaluated as a real value. `range` is the packed
+    // range (constant-evaluated at apply time, reg-only). Multi-dim
+    // arrays remain out of scope: only one trailing `[ … ]` after the
+    // name is accepted, and only on `reg` names.
     Decl {
+        kind: DeclKind,
         signed: bool,
         range: Option<(Expr, Expr)>,
         names: Vec<DeclName>,
@@ -191,10 +193,35 @@ pub(crate) enum Stmt {
     Task(String),
 }
 
-// One entry in a `reg` decl's `list_of_variable_identifiers`. Exactly one
-// of `init` or `dim` may be present (the LRM `variable_type` grammar is
-// a strict `name [= expr]` | `name { dimension }` split); the parser
-// rejects an attempted combination up-front.
+// Which variable-decl keyword introduced this `Stmt::Decl`. LRM 4.8 lists
+// the three keywords vcal supports — `time` is named there too but is out
+// of scope. Carrying the keyword through to the apply pass means
+// `apply_stmt` can shape each kind's storage / default-init / display base
+// (32-bit signed all-x decimal for `integer`, 0.0 for `real`, bits-driven
+// vector for `reg`) without re-deciding it from `signed`/`range` shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeclKind {
+    Reg,
+    Integer,
+    Real,
+}
+
+impl DeclKind {
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            DeclKind::Reg => "reg",
+            DeclKind::Integer => "integer",
+            DeclKind::Real => "real",
+        }
+    }
+}
+
+// One entry in a decl's `list_of_variable_identifiers`. Exactly one of
+// `init` or `dim` may be present (the LRM `variable_type` grammar is a
+// strict `name [= expr]` | `name { dimension }` split); the parser
+// rejects an attempted combination up-front. `dim` is only ever populated
+// for `DeclKind::Reg`; the integer/real keyword paths reject a trailing
+// `[…]` at parse time.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DeclName {
     pub(crate) name: String,
@@ -444,9 +471,17 @@ impl<'a> Parser<'a> {
     // double parse. The leading-token gate keeps the existing
     // `$finish`/expression path undisturbed.
     fn parse_statement(&mut self) -> Result<Stmt, String> {
-        if matches!(self.peek(), Some(Token::Identifier(name)) if name == "reg") {
-            self.index += 1;
-            return self.parse_decl();
+        if let Some(Token::Identifier(name)) = self.peek() {
+            let kind = match name.as_str() {
+                "reg" => Some(DeclKind::Reg),
+                "integer" => Some(DeclKind::Integer),
+                "real" => Some(DeclKind::Real),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                self.index += 1;
+                return self.parse_decl(kind);
+            }
         }
 
         if matches!(self.peek(), Some(Token::Identifier(_) | Token::LBrace)) {
@@ -473,8 +508,19 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Expr(expr))
     }
 
-    fn parse_decl(&mut self) -> Result<Stmt, String> {
+    fn parse_decl(&mut self, kind: DeclKind) -> Result<Stmt, String> {
+        // LRM 4.8 `integer` is fixed at signed 32-bit and `real` is IEEE
+        // 754 binary64 — neither takes a `signed` qualifier or a packed
+        // `[range]`. Surface the rejection up front so a typo like
+        // `integer signed i` doesn't fall through into the identifier
+        // list and produce a confusing "expected identifier" message.
         let signed = if matches!(self.peek(), Some(Token::Identifier(n)) if n == "signed") {
+            if !matches!(kind, DeclKind::Reg) {
+                return Err(format!(
+                    "`signed` qualifier is not allowed on {} declarations",
+                    kind.keyword()
+                ));
+            }
             self.index += 1;
             true
         } else {
@@ -482,6 +528,12 @@ impl<'a> Parser<'a> {
         };
 
         let range = if matches!(self.peek(), Some(Token::LBracket)) {
+            if !matches!(kind, DeclKind::Reg) {
+                return Err(format!(
+                    "packed range `[..]` is not allowed on {} declarations",
+                    kind.keyword()
+                ));
+            }
             self.index += 1;
             let msb = self.parse_expression()?;
             match self.next() {
@@ -507,27 +559,41 @@ impl<'a> Parser<'a> {
         // variable has no init expression — so each item is either
         // `name [ msb : lsb ]` or `name [= expr]`. We accept at most one
         // trailing dimension bracket (vcal's 1-D scope; multi-dim is
-        // deferred). The init expression is parsed with
-        // `parse_expression`; commas naturally bind to the outer list,
-        // never to the init RHS, since no expression-level operator
-        // consumes a bare `,`. Inits are evaluated sequentially at apply
-        // time so `reg [3:0] a = 1, b = a + 1` sees `a = 1` when binding
-        // `b`.
+        // deferred) and only for `reg` (integer/real arrays are out of
+        // scope). The init expression is parsed with `parse_expression`;
+        // commas naturally bind to the outer list, never to the init RHS,
+        // since no expression-level operator consumes a bare `,`. Inits
+        // are evaluated sequentially at apply time so
+        // `reg [3:0] a = 1, b = a + 1` sees `a = 1` when binding `b`.
         let mut names: Vec<DeclName> = Vec::new();
         loop {
             let name = match self.next() {
                 Some(Token::Identifier(n)) => n.clone(),
-                _ => return Err("expected identifier in reg declaration".to_string()),
+                _ => return Err(format!(
+                    "expected identifier in {} declaration",
+                    kind.keyword()
+                )),
             };
-            if matches!(name.as_str(), "reg" | "signed") {
-                return Err(format!("`{name}` cannot be used as a reg name"));
+            if matches!(name.as_str(), "reg" | "integer" | "real" | "signed") {
+                return Err(format!(
+                    "`{name}` cannot be used as a {} name",
+                    kind.keyword()
+                ));
             }
             if names.iter().any(|existing| existing.name == name) {
-                return Err(format!("duplicate name in reg declaration: {name}"));
+                return Err(format!(
+                    "duplicate name in {} declaration: {name}",
+                    kind.keyword()
+                ));
             }
             // Try the unpacked-dimension form first: a `[` immediately
             // after the name is always an array dimension here, not a
-            // select (selects don't appear at decl position).
+            // select (selects don't appear at decl position). Per LRM
+            // A.2.1.3 / A.2.3 the dimension is legal on all three
+            // declared kinds — `reg [3:0] a [0:7]` is a vector array,
+            // `integer a [0:3]` is an integer array, `real r [0:3]` is
+            // a real array. Only the multi-dim form is out of scope
+            // (rejected just below).
             let dim = if matches!(self.peek(), Some(Token::LBracket)) {
                 self.index += 1;
                 let msb = self.parse_expression()?;
@@ -570,6 +636,7 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Stmt::Decl {
+            kind,
             signed,
             range,
             names,

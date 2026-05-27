@@ -1,9 +1,12 @@
-# Variables: reg, blocking assignment, bit/part-select
+# Variables: reg / integer / real, blocking assignment, bit/part-select
 
-The only variable type vcal currently declares is `reg` (LRM A.2.1.3):
+vcal recognizes three variable kinds at the top of a decl: `reg`,
+`integer`, and `real` (LRM A.2.1.3 / 4.8). `time` is out of scope.
 
 ```text
 reg [signed] [range] name { , name }
+integer name [= init] { , name [= init] }
+real    name [= init] { , name [= init] }
 ```
 
 - The display base for a reg is binary, so a reg renders as
@@ -23,6 +26,47 @@ reg [signed] [range] name { , name }
 - A fresh reg is initialized to all `x`. The decl statement emits an empty
   `Out[n]:` line — the same convention `$finish` / `$stop` use for
   non-value statements.
+
+## `integer`
+
+An `integer` decl is a fixed-shape `reg` (LRM 4.8):
+
+- Signed 32-bit, decimal display base. `integer i` reads back as `32'sdx`
+  before any assignment; after `i = 5` it reads as `32'sd5`.
+- The `signed` qualifier and a packed `[range]` are rejected at parse
+  time — the element shape is fixed. Use `reg signed [31:0] i` if you
+  want a hand-rolled equivalent that can carry a non-decimal base or a
+  different width.
+- A single unpacked dimension is accepted (`integer a [0:3]`), and the
+  array follows the rules in [Unpacked arrays](#unpacked-arrays) below
+  — every element shares the fixed integer element template.
+  Multi-dimensional arrays remain out of scope.
+- Bit- and part-selects are the same as on a vector reg: `i[0]`, `i[3:0]`,
+  `i[b +: w]`, `i[b -: w]`. The select inherits the integer's decimal
+  base.
+- Per-name inits use the same `name = constant_expression` form as `reg`;
+  multi-name decls (`integer i = 1, j = 2, k`) follow the same
+  left-to-right rule (`j` can reference `i`). Array names cannot carry
+  an init expression.
+
+## `real`
+
+A `real` decl is an IEEE 754 binary64 slot (LRM 4.8 / 3.5.2):
+
+- No width, signedness, or display base — `real r` reads back as `0.0`
+  by default (LRM 4.8: reals are zero-initialized, not x-initialized).
+- The `signed` qualifier and packed `[range]` are rejected at parse
+  time, as is any bit-select on a scalar real reg.
+- A single unpacked dimension is accepted (`real r [0:3]`), giving a
+  1-D array of f64 slots. The element-select rules are restricted
+  (real elements have no bits to slice) — see [Unpacked arrays](#unpacked-arrays).
+  Multi-dimensional arrays remain out of scope.
+- Init / RHS may be a real-typed or integer-typed expression. Integer
+  RHS promotes to f64 via §5.1.7 / §3.5.3 (x/z bits → 0). NaN / ±∞ are
+  preserved in a `real` LHS, but assigning them to an integer LHS fills
+  with x bits (matching `$rtoi`'s "no defined integer" handling).
+- Per-name inits and the staged all-or-nothing commit work the same as
+  `reg` and `integer`. Array names cannot carry an init expression.
 
 ## Blocking assignment
 
@@ -179,28 +223,42 @@ known; a `width` of zero or negative is likewise rejected.
 
 ## Unpacked arrays
 
-A `reg` decl may add one unpacked dimension to declare a 1-D array
-(LRM 4.9):
+A `reg`, `integer`, or `real` decl may add one unpacked dimension to
+declare a 1-D array (LRM 4.9 / A.2.2.1):
 
 ```text
 reg [packed_range] name [unpacked_range] { , name [unpacked_range] }
+integer            name [unpacked_range] { , name [unpacked_range] }
+real               name [unpacked_range] { , name [unpacked_range] }
 ```
 
 For example, `reg [3:0] a [0:15]` declares 16 elements, each a 4-bit
-unsigned vector. The packed range governs each element's shape; the
-unpacked range governs how many elements exist and how they are
-addressed. Both endpoints follow the same constant-integer rule the
-packed range uses (no x/z, evaluated against the current session).
+unsigned vector; `integer a [0:3]` declares 4 elements, each a signed
+32-bit decimal slot; `real r [0:3]` declares 4 IEEE 754 binary64 slots.
+The packed range governs each element's shape (fixed for `integer`,
+absent for `real`); the unpacked range governs how many elements exist
+and how they are addressed. Both endpoints follow the same
+constant-integer rule the packed range uses (no x/z, evaluated against
+the current session).
 
 - Multi-dimensional arrays, packed-array-of-array forms, and array
   initializers are out of scope — only the single unpacked dimension
-  shown above is accepted.
+  shown above is accepted, regardless of the element type.
 - An array decl cannot carry an init expression: `reg [3:0] a [0:7] = ...`
-  is rejected. Every element starts at all-`x` of the packed shape.
+  / `integer a [0:3] = 5` / `real r [0:3] = 1.5` are all rejected. Each
+  element starts at the element type's default: all-`x` of the packed
+  shape for `reg` and `integer`, `0.0` for `real`.
 - The unpacked range may be reversed (`reg [3:0] a [15:0]`) or use
   negative endpoints (`reg [3:0] a [-2:1]`); the resolved index
   mapping uses `internal = |src - lsb_unpacked|`, the same formula
   the packed-range mapping uses.
+- A `real` array element is f64-typed, so it has no bits to address.
+  `r[i]` is the only legal element select on a real array — `r[m:l]`,
+  `r[b +: w]`, `r[b -: w]`, and the chained `r[i][...]` form are all
+  rejected. Reads / writes flow through the real pipeline (RHS integers
+  promote to f64 via §3.5.3); an OOB or x/z index reads as `0.0` and
+  drops the write per LRM 4.2.1. A real-array element cannot appear
+  inside an lvalue concat (concats are bit-based).
 
 The array name on its own is unreadable — `a` (where `a` is an array)
 errors with "array `a` cannot be used as a value". The only way to

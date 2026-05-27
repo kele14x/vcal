@@ -14,7 +14,7 @@ mod tests;
 
 pub use value::{Base, IntegerValue, LogicBit, Value};
 
-use parser::{DeclName, Expr, Stmt};
+use parser::{DeclKind, DeclName, Expr, LValue, SelectKind, Stmt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegRange {
@@ -22,70 +22,102 @@ pub(crate) struct RegRange {
     pub(crate) lsb: BigInt,
 }
 
-// A reg's payload. `Vector` is the existing scalar/vector reg; `Array` is
-// the new 1-D unpacked-array form (`reg [3:0] a [0:15]`). The packed
-// range (the `[3:0]` part) still lives in `RegValue::range`; `Array.dim`
-// holds the *unpacked* dimension (`[0:15]`). Each element is an
-// IntegerValue with the same width / signedness / base as a freshly
-// declared vector reg of that packed range, all-x at decl time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+// A reg's payload. `Vector` is the existing scalar/vector reg; `Array`
+// is the 1-D unpacked-array of vectors (`reg [3:0] a [0:15]` or
+// `integer a [0:3]` — both end up here, since an `integer` element is
+// just a 32-bit signed decimal vector); `Real` is the LRM 4.8 IEEE 754
+// binary64 form introduced by `real r`; `RealArray` is the 1-D
+// unpacked-array of reals (`real r [0:3]`). The packed range (the
+// `[3:0]` part of a vector array) still lives in `RegValue::range`;
+// `Array.dim` / `RealArray.dim` hold the *unpacked* dimension
+// (`[0:15]`). Vector-array elements are IntegerValues all-x at decl
+// time; real-array elements are f64 zeros at decl time (LRM 4.8:
+// reals init to 0). `Eq` can't be derived once `Real` / `RealArray`
+// are in the mix because `f64` has no equivalence relation
+// (NaN ≠ NaN); `PartialEq` is all the surrounding code needs.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RegStorage {
     Vector(IntegerValue),
     Array {
         dim: RegRange,
         elements: Vec<IntegerValue>,
     },
+    Real(f64),
+    RealArray {
+        dim: RegRange,
+        elements: Vec<f64>,
+    },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RegValue {
     pub(crate) range: Option<RegRange>,
     pub(crate) storage: RegStorage,
 }
 
 impl RegValue {
-    // True for the array form (`reg [3:0] a [0:15]`). Distinct from a
-    // vector reg because reading the bare name is illegal for an array
-    // and array-element access is illegal for a vector.
+    // True for the vector-array form (`reg [3:0] a [0:15]`,
+    // `integer a [0:3]`). Distinct from a vector reg because reading
+    // the bare name is illegal for an array and array-element access
+    // is illegal for a vector.
     pub(crate) fn is_array(&self) -> bool {
         matches!(self.storage, RegStorage::Array { .. })
     }
 
-    // Vector-only accessor used by every non-array codepath. Arrays
-    // surface as an error from the caller before this is reached, so
-    // panicking here would mask a missed dispatch in eval.
-    pub(crate) fn vector(&self) -> Option<&IntegerValue> {
-        match &self.storage {
-            RegStorage::Vector(value) => Some(value),
-            RegStorage::Array { .. } => None,
-        }
+    // True for the real-array form (`real r [0:3]`). Mirrors
+    // `is_array` but for the f64-element path — the two array storages
+    // share no read/write code, so eval dispatch needs to tell them
+    // apart up front.
+    pub(crate) fn is_real_array(&self) -> bool {
+        matches!(self.storage, RegStorage::RealArray { .. })
     }
 
-    // Same as `vector()` but errors with the canonical
-    // "array name cannot be used as a value" diagnostic when the reg is
-    // an array. Used everywhere a vector-only path resolves an
-    // identifier — it makes the array-name-as-primary rejection
-    // uniform without duplicating the error string at each callsite.
+    // True for the real form (`real r`). Distinct from a vector reg
+    // because every integer-pipeline accessor — `vector`, the validator's
+    // identifier arm, `lvalue_meta` for a bare-name LHS — has to peel off
+    // and route real-typed identifiers through the f64 path. Eval uses
+    // it to drive the result-type decision in `expression_is_real`.
+    pub(crate) fn is_real(&self) -> bool {
+        matches!(self.storage, RegStorage::Real(_))
+    }
+
+    // Vector-only accessor. Errors with the canonical "array name
+    // cannot be used as a value" / "real `r` cannot be used as an
+    // integer value" diagnostics when the reg is non-vector. Used
+    // everywhere a vector-only path resolves an identifier — it keeps
+    // the rejection uniform without duplicating the error strings at
+    // each callsite.
     pub(crate) fn require_vector(&self, name: &str) -> Result<&IntegerValue, String> {
-        self.vector()
-            .ok_or_else(|| format!("array `{name}` cannot be used as a value"))
+        match &self.storage {
+            RegStorage::Vector(value) => Ok(value),
+            RegStorage::Array { .. } | RegStorage::RealArray { .. } => {
+                Err(format!("array `{name}` cannot be used as a value"))
+            }
+            RegStorage::Real(_) => Err(format!(
+                "real `{name}` cannot be used as an integer value"
+            )),
+        }
     }
 
     pub(crate) fn vector_mut(&mut self) -> Option<&mut IntegerValue> {
         match &mut self.storage {
             RegStorage::Vector(value) => Some(value),
-            RegStorage::Array { .. } => None,
+            RegStorage::Array { .. }
+            | RegStorage::Real(_)
+            | RegStorage::RealArray { .. } => None,
         }
     }
 
-    // Array-only accessor. Mirrors `vector()`: returns the unpacked
-    // dimension and the element slice for an array, `None` for a
-    // vector. Keeps `RegStorage` private to lib.rs while letting eval
-    // dispatch on the storage kind via `is_array()` + `array()`.
+    // Vector-array accessor. Mirrors `vector()`: returns the unpacked
+    // dimension and the element slice for a vector array, `None`
+    // otherwise. Keeps `RegStorage` private to lib.rs while letting
+    // eval dispatch on the storage kind via `is_array()` + `array()`.
     pub(crate) fn array(&self) -> Option<(&RegRange, &[IntegerValue])> {
         match &self.storage {
             RegStorage::Array { dim, elements } => Some((dim, elements.as_slice())),
-            RegStorage::Vector(_) => None,
+            RegStorage::Vector(_)
+            | RegStorage::Real(_)
+            | RegStorage::RealArray { .. } => None,
         }
     }
 
@@ -96,7 +128,58 @@ impl RegValue {
     pub(crate) fn array_mut(&mut self) -> Option<(&RegRange, &mut [IntegerValue])> {
         match &mut self.storage {
             RegStorage::Array { dim, elements } => Some((dim, elements.as_mut_slice())),
-            RegStorage::Vector(_) => None,
+            RegStorage::Vector(_)
+            | RegStorage::Real(_)
+            | RegStorage::RealArray { .. } => None,
+        }
+    }
+
+    // Real-array accessor — sibling of `array()` for the f64-element
+    // form. Element selects on a `real r [0:3]` go through this so the
+    // f64 payload stays untouched by the integer pipeline.
+    pub(crate) fn real_array(&self) -> Option<(&RegRange, &[f64])> {
+        match &self.storage {
+            RegStorage::RealArray { dim, elements } => Some((dim, elements.as_slice())),
+            RegStorage::Vector(_)
+            | RegStorage::Array { .. }
+            | RegStorage::Real(_) => None,
+        }
+    }
+
+    // Mutable variant of `real_array()`. Used by the real-array
+    // element-write path so the chosen element's f64 can be overwritten
+    // in place on a staged map clone.
+    pub(crate) fn real_array_mut(&mut self) -> Option<(&RegRange, &mut [f64])> {
+        match &mut self.storage {
+            RegStorage::RealArray { dim, elements } => Some((dim, elements.as_mut_slice())),
+            RegStorage::Vector(_)
+            | RegStorage::Array { .. }
+            | RegStorage::Real(_) => None,
+        }
+    }
+
+    // Real-only accessor. Returns the f64 payload for a real reg,
+    // `None` for a vector or array. Used by the eval path's
+    // `expression_is_real` (to detect when an identifier feeds the real
+    // pipeline) and `evaluate_expr_as_real` (to load the value).
+    pub(crate) fn real(&self) -> Option<f64> {
+        match &self.storage {
+            RegStorage::Real(value) => Some(*value),
+            RegStorage::Vector(_)
+            | RegStorage::Array { .. }
+            | RegStorage::RealArray { .. } => None,
+        }
+    }
+
+    // Mutable variant of `real()`. Used by the real-LHS assignment path
+    // in `apply_stmt` so the staged-variable map's f64 can be overwritten
+    // in place without exposing `RegStorage` to eval.rs.
+    pub(crate) fn real_mut(&mut self) -> Option<&mut f64> {
+        match &mut self.storage {
+            RegStorage::Real(value) => Some(value),
+            RegStorage::Vector(_)
+            | RegStorage::Array { .. }
+            | RegStorage::RealArray { .. } => None,
         }
     }
 }
@@ -143,8 +226,36 @@ impl Session {
             RegStorage::Array { dim, elements } => {
                 Some((dim.msb.clone(), dim.lsb.clone(), elements.len()))
             }
-            RegStorage::Vector(_) => None,
+            RegStorage::Vector(_)
+            | RegStorage::Real(_)
+            | RegStorage::RealArray { .. } => None,
         })
+    }
+
+    // Test helper: returns (msb, lsb, element_count) for a real array,
+    // mirroring `lookup_reg_array` for the f64-element form.
+    #[cfg(test)]
+    pub(crate) fn lookup_reg_real_array(
+        &self,
+        name: &str,
+    ) -> Option<(BigInt, BigInt, usize)> {
+        self.lookup(name).and_then(|reg| match &reg.storage {
+            RegStorage::RealArray { dim, elements } => {
+                Some((dim.msb.clone(), dim.lsb.clone(), elements.len()))
+            }
+            RegStorage::Vector(_)
+            | RegStorage::Array { .. }
+            | RegStorage::Real(_) => None,
+        })
+    }
+
+    // Test helper: returns the f64 payload for a `real` reg, `None` for
+    // any other storage shape. Mirrors `lookup_reg_range` / `lookup_reg_array`
+    // so tests can assert the real-reg pipeline keeps a value through
+    // assignment / arithmetic without importing `RegStorage`.
+    #[cfg(test)]
+    pub(crate) fn lookup_reg_real(&self, name: &str) -> Option<f64> {
+        self.lookup(name).and_then(|reg| reg.real())
     }
 
     pub fn eval(&mut self, input: &str) -> Result<Evaluation, String> {
@@ -203,140 +314,334 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
         }
         Stmt::Task(_) => Ok((String::new(), true)),
         Stmt::Decl {
+            kind,
             signed,
             range,
             names,
-        } => {
-            let range = match range {
-                Some((msb_expr, lsb_expr)) => Some(evaluate_reg_range(msb_expr, lsb_expr, session)?),
+        } => apply_decl(session, *kind, *signed, range.as_ref(), names),
+        Stmt::Assign { lvalue, rhs } => apply_assign(session, lvalue, rhs),
+    }
+}
+
+// LRM A.2.1.3 variable declarations. `apply_decl` is the shared driver
+// for `reg`, `integer`, and `real` decls — each `DeclKind` decides the
+// per-name storage shape but the staging / atomic-commit / per-name
+// init / self-reference semantics are identical across all three. Per
+// LRM 4.8 an `integer` reg is fixed at signed 32-bit with decimal
+// display base; a `real` reg is IEEE 754 binary64 with no width or
+// base. Redeclaration replaces the previous binding outright (vcal is a
+// single-scope REPL), and the whole decl is committed all-or-nothing so
+// `integer i = 1, j = nope` leaves `i` untouched on failure (mirroring
+// `reg`'s prior behaviour).
+fn apply_decl(
+    session: &mut Session,
+    kind: DeclKind,
+    signed: bool,
+    range: Option<&(Expr, Expr)>,
+    names: &[DeclName],
+) -> Result<(String, bool), String> {
+    // `reg` evaluates its packed range up front so a malformed range
+    // aborts the whole decl before any name is committed. `integer`
+    // bakes a constant `[31:0]` range so bit-selects against the
+    // integer reg work identically to a `reg signed [31:0]` decl — the
+    // value is conceptually 32 bits. `real` has no bit range.
+    let (resolved_range, element_width, element_signed, element_base) = match kind {
+        DeclKind::Reg => {
+            let resolved = match range {
+                Some((msb_expr, lsb_expr)) => {
+                    Some(evaluate_reg_range(msb_expr, lsb_expr, session)?)
+                }
                 None => None,
             };
-            let width = match &range {
+            let width = match &resolved {
                 Some(range) => range.width()?,
                 None => 1,
             };
-            // Redeclaration replaces the previous binding outright. The
-            // calculator REPL is single-scope and a user iterating on a
-            // throwaway calculation expects `reg [3:0] a` to override an
-            // earlier `reg [7:0] a` rather than need a separate "drop"
-            // command. The new decl's width / signed / base / x-init all
-            // wipe the old reg's state.
-            //
-            // The whole decl is committed all-or-nothing: every init runs
-            // against a `staged` clone of the live variable map, and the
-            // live session only adopts the result if *all* names finish
-            // without error. This stops `reg [3:0] a = 1, b = nope` from
-            // silently binding `a` even though the statement errored.
-            //
-            // Within the staging area, names are processed left-to-right
-            // and each commit is visible to the next name's init, so
-            // `reg [3:0] a = 1, b = a + 1` still resolves `b` against the
-            // freshly-applied `a` (matching the textual order implied by
-            // LRM A.2.3 list_of_variable_identifiers).
-            //
-            // Each init expression evaluates *before* its own binding
-            // replaces the corresponding prior entry in the staging map,
-            // so a self-reference reads the prior value: with
-            // `reg [1:0] a = 2'b11` already in place, `reg a = a` sees the
-            // old 2-bit `a`, narrows it to the new 1-bit width via the
-            // assignment-RHS context, and stores `1'b1`. Names without an
-            // init still install x bits, so `reg a` (no init) wipes the
-            // prior binding cleanly.
-            //
-            // Reusing `evaluate_assignment_rhs` keeps real→integer
-            // conversion (LRM §3.5.3, NaN/±∞ → x bits) and width / sign /
-            // base context propagation identical to `name = expr`. To
-            // avoid cloning `staged` on every iteration, we
-            // `std::mem::take` the map into a throwaway `Session` view for
-            // the duration of the eval call, then move it back out.
-            let mut staged = session.variables.clone();
-            for DeclName { name, init, dim } in names {
-                // Build the element prototype: every reg (whether
-                // bare-name, vector, or array-of-vector) carries the
-                // same (width, signed, base = Binary) shape on each
-                // element. For an array we also evaluate the unpacked
-                // dimension here so a malformed dim aborts the whole
-                // decl before any name is committed.
-                let storage = if let Some((dim_msb_expr, dim_lsb_expr)) = dim {
-                    if init.is_some() {
-                        // Should already be caught by the parser, but
-                        // keep the runtime check tight in case the AST
-                        // is constructed by some other path later.
-                        return Err(format!(
-                            "array variable `{name}` cannot have an init expression"
-                        ));
-                    }
-                    let dim_range = {
-                        let view = Session {
-                            variables: std::mem::take(&mut staged),
-                        };
-                        let outcome = evaluate_reg_range(dim_msb_expr, dim_lsb_expr, &view);
-                        staged = view.variables;
-                        outcome?
-                    };
-                    let count = dim_range.width()?;
-                    let element_template = IntegerValue {
-                        width,
-                        signed: *signed,
-                        base: Base::Binary,
-                        bits: vec![LogicBit::X; width],
-                        unsized_literal: false,
-                    };
-                    RegStorage::Array {
-                        dim: dim_range,
-                        elements: vec![element_template; count],
-                    }
-                } else {
-                    let bits = match init {
-                        Some(init_expr) => {
-                            let view = Session {
-                                variables: std::mem::take(&mut staged),
-                            };
-                            let outcome = eval::evaluate_assignment_rhs(
-                                init_expr,
-                                width,
-                                *signed,
-                                Base::Binary,
-                                &view,
-                            );
-                            staged = view.variables;
-                            outcome?.bits
-                        }
-                        None => vec![LogicBit::X; width],
-                    };
-                    RegStorage::Vector(IntegerValue {
-                        width,
-                        signed: *signed,
-                        base: Base::Binary,
-                        bits,
-                        unsized_literal: false,
-                    })
-                };
-                staged.insert(
-                    name.clone(),
-                    RegValue {
-                        range: range.clone(),
-                        storage,
-                    },
-                );
-            }
-            session.variables = staged;
-            Ok((String::new(), false))
+            (resolved, width, signed, Base::Binary)
         }
-        Stmt::Assign { lvalue, rhs } => {
-            // LRM A.6.2 blocking assignment with the full A.8.5
-            // variable_lvalue form. All structural validation, RHS
-            // evaluation, and bit distribution happen inside
-            // `evaluate_lvalue_assignment`, which returns a staged copy
-            // of the variable map on success — we swap it in atomically
-            // so a multi-leaf concat LHS that fails partway leaves the
-            // live session untouched (mirroring `Stmt::Decl`'s
-            // all-or-nothing commit). The displayed value is the RHS
-            // evaluated in the total-LHS context, so a bare-name LHS
-            // prints bit-identically to the pre-lvalue behavior.
-            let (staged, displayed) = eval::evaluate_lvalue_assignment(lvalue, rhs, session)?;
-            session.variables = staged;
-            Ok((displayed.canonical(), false))
+        DeclKind::Integer => {
+            // LRM 4.8: `integer` is signed 32-bit. Decimal display base
+            // matches `integer i; i = 0;` round-tripping through the
+            // canonical printer as `32'sd0` — same as `$signed(0)` or
+            // `reg signed [31:0] i` would render once stored in decimal.
+            let range = RegRange {
+                msb: BigInt::from(31),
+                lsb: BigInt::from(0),
+            };
+            (Some(range), 32usize, true, Base::Decimal)
+        }
+        DeclKind::Real => (None, 0usize, false, Base::Binary),
+    };
+
+    // Staging area mirrors the prior reg-only path: every init runs
+    // against a `Session` view of `staged` so a self-reference reads
+    // the prior binding (`reg [1:0] a = 2'b11; reg a = a` narrows to
+    // 1 bit) and within the same statement each name sees the bindings
+    // of names earlier in the list (`integer i = 1, j = i + 1`). To
+    // avoid cloning on every iteration the map is moved into a
+    // throwaway `Session` for the eval call, then moved back out.
+    let mut staged = session.variables.clone();
+    for DeclName { name, init, dim } in names {
+        // Build per-kind storage. `apply_init_for` walks the same
+        // staged / view-Session dance the previous code used so init
+        // evaluation rules (width/sign/base context for integer-typed
+        // inits, §3.5.3 real→integer conversion, x-fill default) stay
+        // a single path.
+        let storage = match (kind, dim) {
+            // Vector array: `reg [3:0] a [0:15]` and `integer a [0:3]`
+            // share this path — the element template's
+            // (width, signed, base) comes from the per-kind context
+            // above. The parser rejects init on any array decl, so
+            // `init.is_some()` here is defended against AST construction
+            // from a hypothetical non-parser path.
+            (DeclKind::Reg | DeclKind::Integer, Some((dim_msb_expr, dim_lsb_expr))) => {
+                if init.is_some() {
+                    return Err(format!(
+                        "array variable `{name}` cannot have an init expression"
+                    ));
+                }
+                let dim_range = with_staged_session(&mut staged, |view| {
+                    evaluate_reg_range(dim_msb_expr, dim_lsb_expr, view)
+                })?;
+                let count = dim_range.width()?;
+                let element_template = IntegerValue {
+                    width: element_width,
+                    signed: element_signed,
+                    base: element_base,
+                    bits: vec![LogicBit::X; element_width],
+                    unsized_literal: false,
+                };
+                RegStorage::Array {
+                    dim: dim_range,
+                    elements: vec![element_template; count],
+                }
+            }
+            // Real array: `real r [0:3]`. Same parser-rejects-init
+            // rule, element default is 0.0 per LRM 4.8.
+            (DeclKind::Real, Some((dim_msb_expr, dim_lsb_expr))) => {
+                if init.is_some() {
+                    return Err(format!(
+                        "array variable `{name}` cannot have an init expression"
+                    ));
+                }
+                let dim_range = with_staged_session(&mut staged, |view| {
+                    evaluate_reg_range(dim_msb_expr, dim_lsb_expr, view)
+                })?;
+                let count = dim_range.width()?;
+                RegStorage::RealArray {
+                    dim: dim_range,
+                    elements: vec![0.0; count],
+                }
+            }
+            // Scalar / vector (non-array) reg or integer: integer-pipeline
+            // init evaluation with the per-kind context.
+            (DeclKind::Reg | DeclKind::Integer, None) => {
+                let bits = eval_init_bits(
+                    init.as_ref(),
+                    element_width,
+                    element_signed,
+                    element_base,
+                    &mut staged,
+                )?;
+                RegStorage::Vector(IntegerValue {
+                    width: element_width,
+                    signed: element_signed,
+                    base: element_base,
+                    bits,
+                    unsized_literal: false,
+                })
+            }
+            // Scalar real: LRM 4.8 zero-init, optional real-pipeline
+            // init (`evaluate_real_value` handles the §5.1.7 / §3.5.3
+            // promotion for integer-typed inits).
+            (DeclKind::Real, None) => {
+                let value = match init {
+                    Some(init_expr) => with_staged_session(&mut staged, |view| {
+                        evaluate_real_value(init_expr, view)
+                    })?,
+                    None => 0.0,
+                };
+                RegStorage::Real(value)
+            }
+        };
+        staged.insert(
+            name.clone(),
+            RegValue {
+                range: resolved_range.clone(),
+                storage,
+            },
+        );
+    }
+    session.variables = staged;
+    Ok((String::new(), false))
+}
+
+// Wraps an evaluator call that needs a `&Session` view over the staged
+// variable map. The map is moved out, lent to the closure, then moved
+// back in so the per-init loop doesn't have to clone on every
+// iteration. Mirrors the inlined pattern the previous reg-only path
+// used; lifting it out keeps the per-kind storage branches readable.
+fn with_staged_session<T, F>(
+    staged: &mut HashMap<String, RegValue>,
+    f: F,
+) -> Result<T, String>
+where
+    F: FnOnce(&Session) -> Result<T, String>,
+{
+    let view = Session {
+        variables: std::mem::take(staged),
+    };
+    let outcome = f(&view);
+    *staged = view.variables;
+    outcome
+}
+
+// Evaluates an optional init expression to a `Vec<LogicBit>` of the
+// given (width, signed, base) context. With no init, returns x bits at
+// the target width (LRM 4.8 default for reg / integer). With an init,
+// runs through `evaluate_assignment_rhs` so the same width / sign /
+// base context and real→integer §3.5.3 conversion semantics apply that
+// `name = expr` would use after the decl.
+fn eval_init_bits(
+    init: Option<&Expr>,
+    width: usize,
+    signed: bool,
+    base: Base,
+    staged: &mut HashMap<String, RegValue>,
+) -> Result<Vec<LogicBit>, String> {
+    match init {
+        Some(init_expr) => {
+            let result = with_staged_session(staged, |view| {
+                eval::evaluate_assignment_rhs(init_expr, width, signed, base, view)
+            })?;
+            Ok(result.bits)
+        }
+        None => Ok(vec![LogicBit::X; width]),
+    }
+}
+
+// LRM A.6.2 blocking assignment. For an integer LHS (vector reg,
+// integer reg, array element, bit/part-select, concatenation) the
+// existing `evaluate_lvalue_assignment` path is exact — width /
+// signed / base context is read off the LHS, RHS evaluates through
+// `evaluate_assignment_rhs` (real → integer per §3.5.3, x bits on
+// NaN/±∞), and the staged map swaps in atomically. A bare-name LHS
+// that resolves to a `real` reg routes through `apply_real_assign`
+// instead: real has no width / base / bits, so the LHS context that
+// `evaluate_lvalue_assignment` would otherwise build doesn't apply
+// here.
+fn apply_assign(
+    session: &mut Session,
+    lvalue: &LValue,
+    rhs: &Expr,
+) -> Result<(String, bool), String> {
+    if let LValue::Name(name) = lvalue {
+        if let Some(reg) = session.lookup(name) {
+            if reg.is_real() {
+                return apply_real_assign(session, name, rhs);
+            }
+        }
+    }
+    if let LValue::Select {
+        name,
+        kind: SelectKind::Bit { index },
+        inner: None,
+    } = lvalue
+    {
+        if let Some(reg) = session.lookup(name) {
+            if reg.is_real_array() {
+                return apply_real_array_element_assign(session, name, index, rhs);
+            }
+        }
+    }
+    let (staged, displayed) = eval::evaluate_lvalue_assignment(lvalue, rhs, session)?;
+    session.variables = staged;
+    Ok((displayed.canonical(), false))
+}
+
+// LRM 5.6 blocking assignment with a real LHS. Evaluates the RHS as a
+// real value (integer-typed RHS auto-promotes via §3.5.3, x/z bits → 0
+// inside `integer_value_to_f64`), stages a single-name update in a
+// clone of the variable map, then commits. Mirrors
+// `evaluate_lvalue_assignment`'s atomic-commit contract: the live
+// session only adopts the change if RHS evaluation succeeded.
+fn apply_real_assign(
+    session: &mut Session,
+    name: &str,
+    rhs: &Expr,
+) -> Result<(String, bool), String> {
+    let value = evaluate_real_value(rhs, session)?;
+    let mut staged = session.variables.clone();
+    let reg = staged
+        .get_mut(name)
+        .expect("caller verified the reg exists in this session");
+    let slot = reg
+        .real_mut()
+        .expect("caller verified the reg is a real reg");
+    *slot = value;
+    session.variables = staged;
+    Ok((Value::Real(value).canonical(), false))
+}
+
+// LRM 5.6 blocking assignment for a real-array element (`r[i] = expr`
+// where `r` is `real r [0:..]`). Sibling of `apply_real_assign`: the RHS
+// flows through the real pipeline (`evaluate_real_value` promotes
+// integer RHS via §3.5.3); the index is resolved against the unpacked
+// dimension. Per LRM 4.2.1, OOB index / x-z index drop the write — but
+// we still echo the RHS as if it had landed, mirroring how the bare
+// `apply_real_assign` always reports the RHS value. The index
+// expression is structurally validated up front (so e.g. `r[a + b]`
+// surfaces an undeclared-identifier error from `a`/`b` before RHS
+// evaluation).
+fn apply_real_array_element_assign(
+    session: &mut Session,
+    name: &str,
+    index: &Expr,
+    rhs: &Expr,
+) -> Result<(String, bool), String> {
+    eval::semantic_check(index, session)?;
+    if eval::expression_is_real(index, session) {
+        return Err("Semantic error: array element index cannot be real".to_string());
+    }
+    let value = evaluate_real_value(rhs, session)?;
+    let resolved = eval::resolve_real_array_element_index(name, index, session)?;
+    if let Some(internal) = resolved {
+        let mut staged = session.variables.clone();
+        let reg = staged
+            .get_mut(name)
+            .expect("caller verified the reg exists in this session");
+        let (_, elements) = reg
+            .real_array_mut()
+            .expect("caller verified the reg is a real array");
+        elements[internal] = value;
+        session.variables = staged;
+    }
+    Ok((Value::Real(value).canonical(), false))
+}
+
+// Evaluates an arbitrary expression as a real value, after the same
+// static-semantic pre-pass every public entry point runs. Routes
+// through `evaluate_expr` and pulls the f64 out of the resulting
+// `Value` — real-result expressions yield `Value::Real(f64)` directly,
+// while integer-result expressions yield `Value::Integer(...)` and
+// promote to f64 via the IEEE-conversion `to_f64()` (LRM §5.1.7 mixed
+// real / int operands; §3.5.3 x/z bits treated as zero). Errors carry
+// whichever `Syntax error: ` / `Semantic error: ` / runtime prefix
+// `evaluate_expr` produces.
+fn evaluate_real_value(expr: &Expr, session: &Session) -> Result<f64, String> {
+    let value = eval::evaluate_expr(expr, session)?;
+    match value {
+        Value::Real(f) => Ok(f),
+        Value::Integer(int_val) => {
+            use num_traits::ToPrimitive;
+            // LRM §5.1.7 + §3.5.3: an integer operand converts to its
+            // equivalent real value (x/z bits already folded to zero by
+            // `as_bigint`). `BigInt::to_f64` is total (saturates huge
+            // magnitudes to ±∞).
+            Ok(int_val
+                .as_bigint(int_val.signed)
+                .to_f64()
+                .expect("BigInt::to_f64 is total"))
         }
     }
 }
@@ -374,7 +679,7 @@ fn evaluate_range_endpoint(
     session: &Session,
     role: &str,
 ) -> Result<BigInt, String> {
-    if eval::expression_is_real(expr) {
+    if eval::expression_is_real(expr, session) {
         return Err(format!("Semantic error: reg range {role} cannot be real"));
     }
     // `evaluate_constant_expr` runs its own semantic_check and prefixes

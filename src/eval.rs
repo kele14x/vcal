@@ -36,7 +36,7 @@ pub(crate) fn semantic_check(expr: &Expr, session: &Session) -> Result<(), Strin
 
 pub(crate) fn evaluate_expr(expr: &Expr, session: &Session) -> Result<Value, String> {
     semantic_check(expr, session)?;
-    if expression_is_real(expr) {
+    if expression_is_real(expr, session) {
         evaluate_expr_as_real(expr, session).map(Value::Real)
     } else {
         evaluate_expr_in_context(expr, None, session).map(Value::Integer)
@@ -64,7 +64,7 @@ pub(crate) fn evaluate_assignment_rhs(
     session: &Session,
 ) -> Result<IntegerValue, String> {
     semantic_check(rhs, session)?;
-    if expression_is_real(rhs) {
+    if expression_is_real(rhs, session) {
         let real_val = evaluate_expr_as_real(rhs, session)?;
         return Ok(match real_to_integer_bigint(real_val) {
             Some(bigint) => IntegerValue::from_bigint(bigint, width, signed, base),
@@ -111,13 +111,13 @@ fn task_in_expression_error(name: &str) -> String {
     format!("{name}() is a system task, it cannot be called as a function.")
 }
 
-pub(crate) fn expression_is_real(expr: &Expr) -> bool {
+pub(crate) fn expression_is_real(expr: &Expr, session: &Session) -> bool {
     match expr {
         Expr::Literal(_) => false,
         Expr::RealLiteral(_) => true,
-        Expr::Grouped(inner) => expression_is_real(inner),
+        Expr::Grouped(inner) => expression_is_real(inner, session),
         Expr::Unary { op, expr } => match op {
-            UnaryOp::Plus | UnaryOp::Minus => expression_is_real(expr),
+            UnaryOp::Plus | UnaryOp::Minus => expression_is_real(expr, session),
             UnaryOp::BitwiseNot
             | UnaryOp::LogicalNot
             | UnaryOp::ReductionAnd
@@ -132,7 +132,9 @@ pub(crate) fn expression_is_real(expr: &Expr) -> bool {
             | BinaryOp::Subtract
             | BinaryOp::Multiply
             | BinaryOp::Divide
-            | BinaryOp::Power => expression_is_real(lhs) || expression_is_real(rhs),
+            | BinaryOp::Power => {
+                expression_is_real(lhs, session) || expression_is_real(rhs, session)
+            }
             BinaryOp::Modulus
             | BinaryOp::CaseEqual
             | BinaryOp::CaseNotEqual
@@ -157,7 +159,9 @@ pub(crate) fn expression_is_real(expr: &Expr) -> bool {
             then_expr,
             else_expr,
             ..
-        } => expression_is_real(then_expr) || expression_is_real(else_expr),
+        } => {
+            expression_is_real(then_expr, session) || expression_is_real(else_expr, session)
+        }
         Expr::Concatenation { .. }
         | Expr::Replication { .. }
         | Expr::SignCast { .. }
@@ -176,13 +180,30 @@ pub(crate) fn expression_is_real(expr: &Expr) -> bool {
         // "not real" routes the rejection through the integer pipeline,
         // which surfaces the task-in-expression diagnostic.
         Expr::SystemTask { .. } => false,
-        // Reg variables are integer-only — the only declarable type so
-        // far. The Session lookup happens later in the integer pipeline;
-        // here we only need the result-type, and that's always integer.
-        Expr::Identifier(_) => false,
-        // Bit-select / part-select on a reg is always integer-typed
-        // (LRM 4.7: part-select is unsigned).
-        Expr::Select { .. } => false,
+        // An identifier is real-typed iff it resolves to a `real` reg
+        // (LRM 4.8). Unknown names resolve to integer here so the
+        // downstream integer pipeline can surface the "undeclared
+        // identifier" diagnostic at its usual position; treating an
+        // unknown name as real would otherwise route the error through
+        // the real path and produce a less specific message.
+        Expr::Identifier(name) => session
+            .lookup(name)
+            .map(|reg| reg.is_real())
+            .unwrap_or(false),
+        // Bit-select / part-select on a vector reg is always
+        // integer-typed (LRM 4.7: part-select is unsigned). A select on
+        // a real-array reg is the one exception: `r[i]` yields a real
+        // element. Part-selects on a real array, chained inner selects
+        // on a real-array element, and selects on a scalar `real` reg
+        // are all structural errors caught by the validator, so they
+        // stay integer here too — the integer pipeline surfaces the
+        // diagnostic at its usual position.
+        Expr::Select { name, kind, inner } => match session.lookup(name) {
+            Some(reg) if reg.is_real_array() => {
+                matches!(kind, SelectKind::Bit { .. }) && inner.is_none()
+            }
+            _ => false,
+        },
     }
 }
 
@@ -238,7 +259,7 @@ fn logical_value_of_real(value: f64) -> LogicBit {
 // meaning a real operand reached them; the integer pipeline rejects
 // the same operators when the operand is *directly* real.
 fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> {
-    if !expression_is_real(expr) {
+    if !expression_is_real(expr, session) {
         return Ok(integer_value_to_f64(&evaluate_expr_in_context(
             expr, None, session,
         )?));
@@ -324,7 +345,7 @@ fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> 
                 // here. When the magnitude exceeds f64 range,
                 // `integer_value_to_f64` saturates to ±∞ — that's the
                 // value the conversion is supposed to surface.
-                if expression_is_real(arg) {
+                if expression_is_real(arg, session) {
                     unreachable!(
                         "validator rejects real $itor arg before evaluation"
                     );
@@ -341,7 +362,7 @@ fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> 
                 // "argument cannot be real" rejection lives in the
                 // validator (`validate_expr_structure` BitsToReal arm),
                 // so a real arg cannot reach here.
-                if expression_is_real(arg) {
+                if expression_is_real(arg, session) {
                     unreachable!(
                         "validator rejects real $bitstoreal arg before evaluation"
                     );
@@ -374,12 +395,25 @@ fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> 
             evaluate_real_math_function(*kind, args, session)
         }
         Expr::SystemTask { name } => Err(task_in_expression_error(name)),
-        // A reg is integer-only, so the integer fast-path at the top of
-        // this function would have routed any identifier through
-        // `evaluate_expr_in_context`. Reaching this branch means the
-        // dispatch missed an integer leaf in a real-result expression.
-        Expr::Identifier(_) => unreachable!("identifier always has integer result type"),
-        Expr::Select { .. } => unreachable!("select always has integer result type"),
+        // Only real-typed identifiers reach this arm; integer regs and
+        // selects flow through the integer fast-path at the top of the
+        // function.
+        Expr::Identifier(name) => session
+            .lookup(name)
+            .and_then(|reg| reg.real())
+            .ok_or_else(|| format!("unknown real variable `{name}`")),
+        // Real-typed selects are always real-array element selects
+        // (`r[i]` where `r` is `real r [0:3]`). The validator rejected
+        // non-Bit kinds and any inner select before this point, so
+        // `kind` here is always `SelectKind::Bit` and `inner` is None.
+        Expr::Select { name, kind, inner } => {
+            debug_assert!(inner.is_none(), "validator drops chained selects on real array");
+            let index = match kind {
+                SelectKind::Bit { index } => index,
+                _ => unreachable!("validator rejects part-select on real array"),
+            };
+            evaluate_real_array_element_select(name, index, session)
+        }
     }
 }
 
@@ -433,7 +467,7 @@ fn evaluate_real_math_function(
 // logical value. Used by ?: cond on both pipelines and by &&/|| operands
 // when at least one operand is real.
 fn logical_value_of_expr(expr: &Expr, session: &Session) -> Result<LogicBit, String> {
-    if expression_is_real(expr) {
+    if expression_is_real(expr, session) {
         Ok(logical_value_of_real(evaluate_expr_as_real(expr, session)?))
     } else {
         Ok(logical_value(&evaluate_expr_in_context(expr, None, session)?))
@@ -491,7 +525,7 @@ fn validate_replication_structure(
     session: &Session,
 ) -> Result<(), String> {
     validate_expr_structure(count, session)?;
-    if expression_is_real(count) {
+    if expression_is_real(count, session) {
         return Err("replication count cannot be real".to_string());
     }
     for item in items {
@@ -522,7 +556,7 @@ fn validate_concat_list_item(
         );
     }
     validate_expr_structure(item, session)?;
-    if expression_is_real(item) {
+    if expression_is_real(item, session) {
         return Err(format!("{role} operand cannot be real"));
     }
     Ok(())
@@ -534,7 +568,7 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
         Expr::Grouped(inner) => validate_expr_structure(inner, session),
         Expr::Unary { op, expr } => {
             validate_expr_structure(expr, session)?;
-            if expression_is_real(expr)
+            if expression_is_real(expr, session)
                 && matches!(
                     op,
                     UnaryOp::BitwiseNot
@@ -556,7 +590,7 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
         Expr::Binary { op, lhs, rhs } => {
             validate_expr_structure(lhs, session)?;
             validate_expr_structure(rhs, session)?;
-            if expression_is_real(lhs) || expression_is_real(rhs) {
+            if expression_is_real(lhs, session) || expression_is_real(rhs, session) {
                 match op {
                     BinaryOp::Add
                     | BinaryOp::Subtract
@@ -605,7 +639,7 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
         ),
         Expr::SignCast { signed, arg } => {
             validate_expr_structure(arg, session)?;
-            if expression_is_real(arg) {
+            if expression_is_real(arg, session) {
                 return Err(format!(
                     "{} argument cannot be real",
                     if *signed { "$signed" } else { "$unsigned" }
@@ -615,7 +649,7 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
         }
         Expr::BaseCast { base, arg } => {
             validate_expr_structure(arg, session)?;
-            if expression_is_real(arg) {
+            if expression_is_real(arg, session) {
                 return Err(format!("{} argument cannot be real", base_cast_name(*base)));
             }
             Ok(())
@@ -632,13 +666,13 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
                     // interpretation. Reject up front — the result type is
                     // already real, so a real-typed argument is also
                     // semantically pointless.
-                    if expression_is_real(arg) {
+                    if expression_is_real(arg, session) {
                         return Err("$itor argument cannot be real".to_string());
                     }
                     Ok(())
                 }
                 RealConversionKind::BitsToReal => {
-                    if expression_is_real(arg) {
+                    if expression_is_real(arg, session) {
                         return Err("$bitstoreal argument cannot be real".to_string());
                     }
                     let arg_meta = infer_expr_meta(arg, session)?;
@@ -663,7 +697,7 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
                 // an arbitrary sized vector value" — real is not listed.
                 // Mirrors the $itor rejection above: reject up front rather
                 // than rely on an implicit §3.5.3 round to integer.
-                if expression_is_real(&args[0]) {
+                if expression_is_real(&args[0], session) {
                     return Err(format!("{} argument cannot be real", kind.name()));
                 }
                 let _ = infer_expr_meta(expr, session)?;
@@ -675,8 +709,16 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
             let reg = session
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-            let _ = reg.require_vector(name)?;
-            Ok(())
+            // Real identifiers route through the f64 pipeline, so the
+            // vector-only check would wrongly reject them here. Arrays
+            // are still rejected because their value-as-a-whole has no
+            // numeric type (LRM 4.9 only allows element selects).
+            if reg.is_real() {
+                Ok(())
+            } else {
+                let _ = reg.require_vector(name)?;
+                Ok(())
+            }
         }
         Expr::Select { name, kind, inner } => {
             validate_select_expr_structure(name, kind, inner.as_deref(), session)
@@ -993,6 +1035,40 @@ fn infer_select_meta(
     let reg = session
         .lookup(name)
         .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+    if reg.is_real_array() {
+        // Real-array element select: only `r[i]` is legal — part-selects
+        // and chained inner selects have no LRM meaning on a real
+        // element (no bits to slice). The validator runs through here
+        // for structural checks; the actual value path goes through
+        // `evaluate_expr_as_real`'s `Expr::Select` arm. The returned
+        // meta is a placeholder (width 0) that never reaches a width
+        // / sign / base consumer because real-typed selects don't
+        // participate in integer context propagation.
+        match kind {
+            SelectKind::Bit { index } => {
+                if expression_is_real(index, session) {
+                    return Err("array element index cannot be real".to_string());
+                }
+            }
+            SelectKind::PartConst { .. }
+            | SelectKind::PartIndexedUp { .. }
+            | SelectKind::PartIndexedDown { .. } => {
+                return Err(format!(
+                    "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
+                ));
+            }
+        }
+        if inner.is_some() {
+            return Err(format!(
+                "bit-select or part-select on real-array element `{name}` is illegal"
+            ));
+        }
+        return Ok(ExprMeta {
+            width: 0,
+            signed: false,
+            base: crate::Base::Binary,
+        });
+    }
     if reg.is_array() {
         let index = match kind {
             SelectKind::Bit { index } => index,
@@ -1004,7 +1080,7 @@ fn infer_select_meta(
                 ));
             }
         };
-        if expression_is_real(index) {
+        if expression_is_real(index, session) {
             return Err("array element index cannot be real".to_string());
         }
         let (_, elements) = reg
@@ -1107,7 +1183,7 @@ fn evaluate_unary_expr(
     // real path), so a real operand to + or - here is a structural
     // surprise and we reject it consistently with the operator-name
     // diagnostic shape used elsewhere.
-    if expression_is_real(expr) {
+    if expression_is_real(expr, session) {
         match op {
             UnaryOp::LogicalNot => {
                 let value = evaluate_expr_as_real(expr, session)?;
@@ -1233,7 +1309,7 @@ fn evaluate_binary_expr(
     // the real path before reaching this evaluator. Relational, equality,
     // and logical ops are 1-bit-integer-typed even with real operands, so
     // they branch into a real-comparison path inside their helpers.
-    if expression_is_real(lhs) || expression_is_real(rhs) {
+    if expression_is_real(lhs, session) || expression_is_real(rhs, session) {
         match op {
             BinaryOp::Add
             | BinaryOp::Subtract
@@ -1831,7 +1907,7 @@ fn evaluate_conditional_expr(
     context: Option<ExprMeta>,
     session: &Session,
 ) -> Result<IntegerValue, String> {
-    if expression_is_real(then_expr) || expression_is_real(else_expr) {
+    if expression_is_real(then_expr, session) || expression_is_real(else_expr, session) {
         unreachable!("real-typed conditional should be handled by the real path")
     }
     let then_meta = infer_expr_meta(then_expr, session)?;
@@ -2147,7 +2223,7 @@ fn evaluate_sign_cast_expr(
     // value set, not the floating-point one). The validator
     // (`validate_expr_structure` SignCast arm) rejects a real arg before
     // evaluation, so a real arg cannot reach here.
-    if expression_is_real(arg) {
+    if expression_is_real(arg, session) {
         unreachable!(
             "validator rejects real {} arg before evaluation",
             if signed { "$signed" } else { "$unsigned" }
@@ -2178,7 +2254,7 @@ fn evaluate_base_cast_expr(
 ) -> Result<IntegerValue, String> {
     // The validator (`validate_expr_structure` BaseCast arm) rejects a
     // real arg before evaluation, so a real arg cannot reach here.
-    if expression_is_real(arg) {
+    if expression_is_real(arg, session) {
         unreachable!(
             "validator rejects real {} arg before evaluation",
             base_cast_name(base)
@@ -2280,7 +2356,7 @@ fn evaluate_math_function_expr(
 // unsigned interpretation is the operand's natural width, so
 // $clog2(64'hFFFF…F) is 64.
 fn evaluate_clog2(arg: &Expr, session: &Session) -> Result<IntegerValue, String> {
-    if expression_is_real(arg) {
+    if expression_is_real(arg, session) {
         unreachable!("validator rejects real $clog2 arg before evaluation");
     }
 
@@ -2595,6 +2671,17 @@ fn evaluate_select(
             }
         };
     }
+    if reg.is_real_array() {
+        // A real-array element select is real-typed (handled by
+        // `evaluate_expr_as_real`); reaching here means the surrounding
+        // expression expected an integer but got the real result. The
+        // validator catches invalid select shapes (part-select, chained
+        // inner) before this point, so the only legal-shape case is a
+        // bare `r[i]` flowing into an integer-only consumer.
+        return Err(format!(
+            "real-array element `{name}[..]` cannot be used as an integer value"
+        ));
+    }
     if inner.is_some() {
         return Err(format!(
             "chained select on `{name}` is illegal: `{name}` is not an array"
@@ -2644,6 +2731,58 @@ fn apply_select_kind(
     }
 }
 
+// Real-array element select — sibling of `evaluate_array_element_select`
+// for the f64-element form (`real r [0:3]`). The validator rejects
+// non-Bit kinds and chained inner selects before this point, so the
+// only legal shape is `r[i]`. x/z in the index or an OOB index falls
+// back to 0.0 — LRM 4.2.1 says OOB array reads return x for vector
+// elements, but a real has no x state, and `0.0` is the LRM 4.8 init
+// value for an unwritten real slot, so it is the closest analog.
+fn evaluate_real_array_element_select(
+    name: &str,
+    index: &Expr,
+    session: &Session,
+) -> Result<f64, String> {
+    let reg = session
+        .lookup(name)
+        .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+    let (_, elements) = reg
+        .real_array()
+        .expect("evaluate_real_array_element_select called on a non-real-array reg");
+    Ok(match resolve_real_array_element_index(name, index, session)? {
+        Some(internal) => elements[internal],
+        None => 0.0,
+    })
+}
+
+// Resolves the unpacked-dim index for a real-array element access. Shared
+// by the RHS read path (`evaluate_real_array_element_select`) and the
+// LHS write path (`lib::apply_real_array_element_assign`). Returns
+// `Some(internal_index)` for an in-range integer index, `None` for x/z
+// in the index or an OOB index — both cases the caller treats as
+// "no slot": reads fall back to 0.0; writes drop silently per LRM 4.2.1.
+pub(crate) fn resolve_real_array_element_index(
+    name: &str,
+    index: &Expr,
+    session: &Session,
+) -> Result<Option<usize>, String> {
+    let reg = session
+        .lookup(name)
+        .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+    let (dim, _) = reg
+        .real_array()
+        .expect("resolve_real_array_element_index called on a non-real-array reg");
+    if expression_is_real(index, session) {
+        unreachable!("validator rejects real array-element index before evaluation");
+    }
+    let index_value = evaluate_expr_in_context(index, None, session)?;
+    if index_value.has_unknown_bits() {
+        return Ok(None);
+    }
+    let src_index = index_value.as_bigint(index_value.signed);
+    Ok(resolve_reg_index(dim, &src_index))
+}
+
 // LRM 4.9 unpacked-array element select. `a[i]` resolves `i` against
 // the declared unpacked dimension (`a [msb:lsb]`) and returns the
 // whole packed-vector element at that position. The element's
@@ -2683,7 +2822,7 @@ fn evaluate_array_element_select(
     };
     // The validator (`infer_select_meta` for RHS, `lvalue_meta` for LHS)
     // rejects a real array-element index before evaluation.
-    if expression_is_real(index) {
+    if expression_is_real(index, session) {
         unreachable!("validator rejects real array-element index before evaluation");
     }
     // Every element shares the packed-range shape, so the OOB / x-z
@@ -2742,7 +2881,7 @@ fn evaluate_array_chained_select(
     };
     // The validator (`infer_select_meta` for RHS, `lvalue_meta` for LHS)
     // rejects a real array-element index before evaluation.
-    if expression_is_real(index) {
+    if expression_is_real(index, session) {
         unreachable!("validator rejects real array-element index before evaluation");
     }
     // A bit-/part-select on the chosen element requires the element to
@@ -2781,7 +2920,7 @@ fn evaluate_bit_select(
     // The validator (`select_meta_width` via
     // `validate_select_expr_structure`) rejects a real bit-select index
     // before evaluation.
-    if expression_is_real(index) {
+    if expression_is_real(index, session) {
         unreachable!("validator rejects real bit-select index before evaluation");
     }
     let index_value = evaluate_expr_in_context(index, None, session)?;
@@ -2833,7 +2972,7 @@ fn evaluate_part_indexed_select(
     // The validator (`select_meta_width` via
     // `validate_select_expr_structure`) rejects a real indexed-base
     // before evaluation.
-    if expression_is_real(base_expr) {
+    if expression_is_real(base_expr, session) {
         unreachable!("validator rejects real indexed part-select base before evaluation");
     }
     let base_value = evaluate_expr_in_context(base_expr, None, session)?;
@@ -2915,7 +3054,7 @@ fn evaluate_constant_range_endpoint(
     session: &Session,
     role: &str,
 ) -> Result<BigInt, String> {
-    if expression_is_real(expr) {
+    if expression_is_real(expr, session) {
         return Err(format!("part-select {role} cannot be real"));
     }
     let value = evaluate_constant_expr(expr, session)?;
@@ -2930,7 +3069,7 @@ fn evaluate_constant_range_endpoint(
 // real, x/z, zero, and negative values up front so the materialise
 // step can assume a usize-fitting positive count.
 fn evaluate_indexed_select_width(expr: &Expr, session: &Session) -> Result<usize, String> {
-    if expression_is_real(expr) {
+    if expression_is_real(expr, session) {
         return Err("indexed part-select width cannot be real".to_string());
     }
     let value = evaluate_constant_expr(expr, session)?;
@@ -2995,7 +3134,7 @@ fn select_meta_width(
 ) -> Result<usize, String> {
     match kind {
         SelectKind::Bit { index } => {
-            if expression_is_real(index) {
+            if expression_is_real(index, session) {
                 return Err("bit-select index cannot be real".to_string());
             }
             Ok(1)
@@ -3008,7 +3147,7 @@ fn select_meta_width(
         }
         SelectKind::PartIndexedUp { base, width }
         | SelectKind::PartIndexedDown { base, width } => {
-            if expression_is_real(base) {
+            if expression_is_real(base, session) {
                 return Err("indexed part-select base cannot be real".to_string());
             }
             evaluate_indexed_select_width(width, session)
@@ -3099,6 +3238,39 @@ fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
             let reg = session
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            if reg.is_real_array() {
+                // Validate the shape exactly like `infer_select_meta`'s
+                // real-array branch: only `r[i]` is structurally legal.
+                // The legal `r[i] = expr` case is intercepted in
+                // `lib::apply_assign` and routed to the real pipeline
+                // before this validator runs, so reaching here means
+                // the element appears inside a vector context (a concat
+                // lvalue, etc.) — the integer-bits pipeline cannot
+                // consume an f64, so we reject with a context-aware
+                // diagnostic.
+                match kind {
+                    SelectKind::Bit { index } => {
+                        if expression_is_real(index, session) {
+                            return Err("array element index cannot be real".to_string());
+                        }
+                    }
+                    SelectKind::PartConst { .. }
+                    | SelectKind::PartIndexedUp { .. }
+                    | SelectKind::PartIndexedDown { .. } => {
+                        return Err(format!(
+                            "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
+                        ));
+                    }
+                }
+                if inner.is_some() {
+                    return Err(format!(
+                        "bit-select or part-select on real-array element `{name}` is illegal"
+                    ));
+                }
+                return Err(format!(
+                    "real-array element `{name}[..]` cannot appear in a vector lvalue"
+                ));
+            }
             if reg.is_array() {
                 // LRM 4.9: only `Bit` is legal as the outer select on an
                 // array name. `evaluate_array_element_select` enforces
@@ -3114,7 +3286,7 @@ fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
                         ));
                     }
                 };
-                if expression_is_real(index) {
+                if expression_is_real(index, session) {
                     return Err("array element index cannot be real".to_string());
                 }
                 // The chosen element's shape is the one every element

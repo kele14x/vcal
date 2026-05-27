@@ -22,7 +22,7 @@ For "what works *today*" vs "what is the long-term target", see [scope.md](scope
   - [x] 4.1 Value set
   - [x] 4.2 Nets and variables
     - [x] 4.2.1 Net declarations
-    - [x] 4.2.2 Variable declarations (reg only; integer/real/time deferred)
+    - [x] 4.2.2 Variable declarations (reg / integer / real; time deferred)
   - [x] 4.3 Vectors
   - [ ] 4.4 Strengths
   - [ ] 4.5 Implicit declarations
@@ -168,18 +168,22 @@ For "what works *today*" vs "what is the long-term target", see [scope.md](scope
 - [ ] A.2 Declarations
   - [ ] A.2.1 Declaration types
     - [ ] A.2.1.3 Type declarations
-      - [ ] integer_declaration ::= integer list_of_variable_identifiers ;
-      - [ ] real_declaration ::= real list_of_real_identifiers ;
+      - [x] integer_declaration ::= integer list_of_variable_identifiers ;
+      - [x] real_declaration ::= real list_of_real_identifiers ;
       - [x] reg_declaration ::= reg [ signed ] [ range ] list_of_variable_identifiers ;
       - [ ] time_declaration ::= time list_of_variable_identifiers ;
   - [ ] A.2.2 Declaration data types
     - [ ] A.2.2.1 Net and variable types
-      - [ ] real_type ::= real_identifier { dimension }
+      - [x] real_type ::= real_identifier { dimension }
                         | real_identifier = constant_expression
-      - [ ] variable_type ::= variable_identifier { dimension }
+                        (single unpacked dimension supported;
+                         multi-dim is out of scope)
+      - [x] variable_type ::= variable_identifier { dimension }
                             | variable_identifier = constant_expression
+                            (single unpacked dimension supported;
+                             multi-dim is out of scope)
   - [ ] A.2.3 Declaration lists
-    - [ ] list_of_real_identifiers ::= real_type { , real_type }
+    - [x] list_of_real_identifiers ::= real_type { , real_type }
     - [x] list_of_variable_identifiers ::= variable_type { , variable_type }
   - [ ] A.2.5 Declaration ranges
     - [ ] dimension ::= [ dimension_constant_expression : dimension_constant_expression ]
@@ -297,7 +301,7 @@ For "what works *today*" vs "what is the long-term target", see [scope.md](scope
 
 ## Supported keywords
 
-- [ ] integer
-- [ ] real
+- [x] integer
+- [x] real
 - [x] reg
 - [x] signed
