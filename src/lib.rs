@@ -169,7 +169,7 @@ fn evaluate_input_with_session(
         });
     }
 
-    let statements = parser::parse_statements(input)?;
+    let statements = parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
 
     let mut outputs = Vec::new();
     for stmt in &statements {
@@ -356,7 +356,7 @@ fn evaluate_reg_range(
     let msb = evaluate_range_endpoint(msb_expr, session, "msb")?;
     let lsb = evaluate_range_endpoint(lsb_expr, session, "lsb")?;
     let range = RegRange { msb, lsb };
-    let _ = range.width()?;
+    let _ = range.width().map_err(|e| format!("Semantic error: {e}"))?;
     Ok(range)
 }
 
@@ -375,11 +375,14 @@ fn evaluate_range_endpoint(
     role: &str,
 ) -> Result<BigInt, String> {
     if eval::expression_is_real(expr) {
-        return Err(format!("reg range {role} cannot be real"));
+        return Err(format!("Semantic error: reg range {role} cannot be real"));
     }
+    // `evaluate_constant_expr` runs its own semantic_check and prefixes
+    // structural errors itself; the constant-must-not-contain-x check below
+    // is also a static-semantic rule, so it carries the same prefix.
     let value = eval::evaluate_constant_expr(expr, session)?;
     if value.has_unknown_bits() {
-        return Err(format!("reg range {role} contains unknown bits"));
+        return Err(format!("Semantic error: reg range {role} contains unknown bits"));
     }
     Ok(value.as_bigint(value.signed))
 }

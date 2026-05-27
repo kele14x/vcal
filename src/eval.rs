@@ -22,7 +22,20 @@ struct ExprMeta {
     base: Base,
 }
 
+// Static-semantics pre-pass. Every public expression-evaluation entry point
+// runs `semantic_check` before touching the evaluator, so structural errors
+// like real-typed select indices, $bitstoreal width mismatches, or invalid
+// system-task uses surface here — *before* runtime behaviour like short-circuit
+// branch choice, zero-rep collapse, or x-bit propagation could hide them.
+// Errors raised here carry the "Semantic error: " prefix so the rejection
+// stage is visible to the user, paralleling the "Syntax error: " prefix that
+// `parse_statements`'s call site adds to lexer/parser errors.
+pub(crate) fn semantic_check(expr: &Expr, session: &Session) -> Result<(), String> {
+    validate_expr_structure(expr, session).map_err(|e| format!("Semantic error: {e}"))
+}
+
 pub(crate) fn evaluate_expr(expr: &Expr, session: &Session) -> Result<Value, String> {
+    semantic_check(expr, session)?;
     if expression_is_real(expr) {
         evaluate_expr_as_real(expr, session).map(Value::Real)
     } else {
@@ -50,6 +63,7 @@ pub(crate) fn evaluate_assignment_rhs(
     base: Base,
     session: &Session,
 ) -> Result<IntegerValue, String> {
+    semantic_check(rhs, session)?;
     if expression_is_real(rhs) {
         let real_val = evaluate_expr_as_real(rhs, session)?;
         return Ok(match real_to_integer_bigint(real_val) {
@@ -73,6 +87,7 @@ pub(crate) fn evaluate_constant_expr(
     expr: &Expr,
     session: &Session,
 ) -> Result<IntegerValue, String> {
+    semantic_check(expr, session)?;
     evaluate_expr_in_context(expr, None, session)
 }
 
@@ -271,9 +286,6 @@ fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> 
             then_expr,
             else_expr,
         } => {
-            validate_expr_structure(cond, session)?;
-            validate_expr_structure(then_expr, session)?;
-            validate_expr_structure(else_expr, session)?;
             let cond_logical = logical_value_of_expr(cond, session)?;
             match cond_logical {
                 LogicBit::One => evaluate_expr_as_real(then_expr, session),
@@ -437,39 +449,91 @@ fn logical_value_of_expr(expr: &Expr, session: &Session) -> Result<LogicBit, Str
     }
 }
 
+fn validate_select_kind_structure(kind: &SelectKind, session: &Session) -> Result<(), String> {
+    match kind {
+        SelectKind::Bit { index } => validate_expr_structure(index, session),
+        SelectKind::PartConst { msb, lsb } => {
+            validate_expr_structure(msb, session)?;
+            validate_expr_structure(lsb, session)
+        }
+        SelectKind::PartIndexedUp { base, width }
+        | SelectKind::PartIndexedDown { base, width } => {
+            validate_expr_structure(base, session)?;
+            validate_expr_structure(width, session)
+        }
+    }
+}
+
 fn validate_select_expr_structure(
     name: &str,
     kind: &SelectKind,
     inner: Option<&SelectKind>,
     session: &Session,
 ) -> Result<(), String> {
-    match kind {
-        SelectKind::Bit { index } => validate_expr_structure(index, session)?,
-        SelectKind::PartConst { msb, lsb } => {
-            validate_expr_structure(msb, session)?;
-            validate_expr_structure(lsb, session)?;
-        }
-        SelectKind::PartIndexedUp { base, width }
-        | SelectKind::PartIndexedDown { base, width } => {
-            validate_expr_structure(base, session)?;
-            validate_expr_structure(width, session)?;
-        }
-    }
+    validate_select_kind_structure(kind, session)?;
     if let Some(inner_kind) = inner {
-        match inner_kind {
-            SelectKind::Bit { index } => validate_expr_structure(index, session)?,
-            SelectKind::PartConst { msb, lsb } => {
-                validate_expr_structure(msb, session)?;
-                validate_expr_structure(lsb, session)?;
-            }
-            SelectKind::PartIndexedUp { base, width }
-            | SelectKind::PartIndexedDown { base, width } => {
-                validate_expr_structure(base, session)?;
-                validate_expr_structure(width, session)?;
-            }
-        }
+        validate_select_kind_structure(inner_kind, session)?;
     }
+    // `infer_select_meta` routes through `select_meta_width`, which is the
+    // shared select-validator used by both the RHS pre-pass and the LHS
+    // `lvalue_meta` path. Position-type rules (real-typed bit-select index,
+    // real-typed indexed-base, part-select direction match, etc.) live there
+    // so the LHS doesn't need its own copy.
     let _ = infer_select_meta(name, kind, inner, session)?;
+    Ok(())
+}
+
+// Structural validation for a Replication node. The position-sensitive
+// zero-count rule (LRM 5.1.14: zero allowed only when the rep is a direct
+// operand of a concatenation with at least one positive-size sibling) is
+// handed off through `count_check`: top-level calls pass
+// `evaluate_replication_count` (strict, rejects zero), and items that sit in
+// a concatenation list (either a Concatenation or a Replication's own inner
+// list, which is itself a concat list per LRM 5.1.14) pass
+// `evaluate_replication_count_allow_zero` (lenient). Everything else — real-
+// count / real-operand rejection, recursive structural walks into the count
+// and items — applies uniformly.
+fn validate_replication_structure(
+    count: &Expr,
+    items: &[Expr],
+    count_check: fn(&Expr, &Session) -> Result<usize, String>,
+    session: &Session,
+) -> Result<(), String> {
+    validate_expr_structure(count, session)?;
+    if expression_is_real(count) {
+        return Err("replication count cannot be real".to_string());
+    }
+    for item in items {
+        validate_concat_list_item(item, "replication", session)?;
+    }
+    let _ = count_check(count, session)?;
+    let _ = collect_concatenation_bits(items, session)?;
+    Ok(())
+}
+
+// Validate one entry in a concatenation list (the items of `{ ... }` or the
+// inner list of `{N{ ... }}`). Replication children get the lenient zero-
+// permission rule from LRM 5.1.14; all other expression kinds fall through
+// to the generic walker plus a real-position check. `role` distinguishes the
+// surrounding form ("concatenation" vs "replication") so the real-operand
+// diagnostic names whichever construct the user actually wrote.
+fn validate_concat_list_item(
+    item: &Expr,
+    role: &str,
+    session: &Session,
+) -> Result<(), String> {
+    if let Expr::Replication { count, items } = unwrap_grouped(item) {
+        return validate_replication_structure(
+            count,
+            items,
+            evaluate_replication_count_allow_zero,
+            session,
+        );
+    }
+    validate_expr_structure(item, session)?;
+    if expression_is_real(item) {
+        return Err(format!("{role} operand cannot be real"));
+    }
     Ok(())
 }
 
@@ -537,29 +601,17 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
         }
         Expr::Concatenation { items } => {
             for item in items {
-                validate_expr_structure(item, session)?;
-                if expression_is_real(item) {
-                    return Err("concatenation operand cannot be real".to_string());
-                }
+                validate_concat_list_item(item, "concatenation", session)?;
             }
             let _ = collect_concatenation_bits(items, session)?;
             Ok(())
         }
-        Expr::Replication { count, items } => {
-            validate_expr_structure(count, session)?;
-            if expression_is_real(count) {
-                return Err("replication count cannot be real".to_string());
-            }
-            for item in items {
-                validate_expr_structure(item, session)?;
-                if expression_is_real(item) {
-                    return Err("replication operand cannot be real".to_string());
-                }
-            }
-            let _ = evaluate_replication_count(count, session)?;
-            let _ = collect_concatenation_bits(items, session)?;
-            Ok(())
-        }
+        Expr::Replication { count, items } => validate_replication_structure(
+            count,
+            items,
+            evaluate_replication_count,
+            session,
+        ),
         Expr::SignCast { signed, arg } => {
             validate_expr_structure(arg, session)?;
             if expression_is_real(arg) {
@@ -1767,9 +1819,6 @@ fn evaluate_conditional_expr(
     if expression_is_real(then_expr) || expression_is_real(else_expr) {
         unreachable!("real-typed conditional should be handled by the real path")
     }
-    validate_expr_structure(cond, session)?;
-    validate_expr_structure(then_expr, session)?;
-    validate_expr_structure(else_expr, session)?;
     let then_meta = infer_expr_meta(then_expr, session)?;
     let else_meta = infer_expr_meta(else_expr, session)?;
     let meta = ExprMeta {
@@ -1955,14 +2004,8 @@ fn evaluate_concatenation_expr(
     context: Option<ExprMeta>,
     session: &Session,
 ) -> Result<IntegerValue, String> {
-    // LRM Table 5-3: concatenation is illegal on reals. Detect it here
-    // before `collect_concatenation_bits` would surface the less-helpful
-    // "indefinite width" error from `is_indefinite_width`.
-    for item in items {
-        if expression_is_real(item) {
-            return Err("concatenation operand cannot be real".to_string());
-        }
-    }
+    // LRM Table 5-3 rejection of real items is handled by `semantic_check`
+    // before evaluation begins.
     let bits = collect_concatenation_bits(items, session)?;
     let leftmost_base = infer_expr_meta(&items[0], session)?.base;
     let natural_width = bits.len();
@@ -1976,14 +2019,8 @@ fn evaluate_replication_expr(
     context: Option<ExprMeta>,
     session: &Session,
 ) -> Result<IntegerValue, String> {
-    if expression_is_real(count_expr) {
-        return Err("replication count cannot be real".to_string());
-    }
-    for item in items {
-        if expression_is_real(item) {
-            return Err("replication operand cannot be real".to_string());
-        }
-    }
+    // Real-count and real-item rejection is handled by `semantic_check`
+    // before evaluation begins.
     let count = evaluate_replication_count(count_expr, session)?;
     let inner_bits = collect_concatenation_bits(items, session)?;
     let leftmost_base = infer_expr_meta(&items[0], session)?.base;
@@ -2993,7 +3030,11 @@ pub(crate) fn evaluate_lvalue_assignment(
     rhs: &Expr,
     session: &Session,
 ) -> Result<(HashMap<String, RegValue>, IntegerValue), String> {
-    let meta = lvalue_meta(lvalue, session)?;
+    // `lvalue_meta` plays the structural pre-pass role for LValues (the same
+    // job `validate_expr_structure` does for RValues), so its errors carry
+    // the "Semantic error: " stage prefix to stay consistent with the RHS
+    // path. The RHS is prefixed via `evaluate_assignment_rhs` -> `semantic_check`.
+    let meta = lvalue_meta(lvalue, session).map_err(|e| format!("Semantic error: {e}"))?;
     let mut leaves: Vec<&LValue> = Vec::new();
     flatten_lvalue_leaves(lvalue, &mut leaves);
     let rhs_value = evaluate_assignment_rhs(rhs, meta.width, meta.signed, meta.base, session)?;

@@ -62,9 +62,9 @@ fn rejects_spaces_inside_base_token() {
     let split_signed_base =
         evaluate_input("8 's d 6").expect_err("space between s and base should be rejected");
 
-    assert_eq!(missing_base, "missing base after apostrophe");
-    assert_eq!(split_signed, "missing base after apostrophe");
-    assert_eq!(split_signed_base, "missing base after signed marker");
+    assert_eq!(missing_base, "Syntax error: missing base after apostrophe");
+    assert_eq!(split_signed, "Syntax error: missing base after apostrophe");
+    assert_eq!(split_signed_base, "Syntax error: missing base after signed marker");
 }
 
 #[test]
@@ -579,9 +579,35 @@ fn repl_emits_error_lines_and_continues_to_next_prompt() {
     assert_eq!(
         output,
         "In[0]: Out[0]: \n\
-         Error: unexpected end of expression\n\
+         Error: Syntax error: unexpected end of expression\n\
          In[1]: Out[1]: 32'sd42\n\
          In[2]: Out[2]: \n",
+    );
+}
+
+// Stage-prefix sanity: the `Syntax error:` / `Semantic error:` prefixes
+// tell the user which phase rejected their input. Parser/lexer errors get
+// the syntax prefix; validator errors get the semantic prefix. Genuine
+// runtime conditions (division by zero, out-of-range bit-select, etc.)
+// are absorbed into x bits per LRM and never surface as Err, so there is
+// no third "no-prefix" case worth pinning down with a test.
+#[test]
+fn syntax_error_prefix_distinguishes_stage() {
+    let err = evaluate_input("1 +").expect_err("trailing operator");
+    assert!(
+        err.starts_with("Syntax error:"),
+        "parser errors should carry the Syntax error prefix, got: {err}"
+    );
+}
+
+#[test]
+fn semantic_error_prefix_distinguishes_stage() {
+    // `$bitstoreal(1'b0)` parses cleanly; the rejection is the static
+    // "argument must be 64 bits wide" check that lives in the validator.
+    let err = evaluate_input("$bitstoreal(1'b0)").expect_err("wrong-width $bitstoreal");
+    assert!(
+        err.starts_with("Semantic error:"),
+        "validator errors should carry the Semantic error prefix, got: {err}"
     );
 }
 
@@ -1665,8 +1691,8 @@ fn reduction_nand_nor_rejected_as_binary() {
     let nand = evaluate_input("4'd1 ~& 4'd1").expect_err("binary ~& rejected");
     let nor = evaluate_input("4'd0 ~| 4'd0").expect_err("binary ~| rejected");
 
-    assert_eq!(nand, "unexpected token after end of statement");
-    assert_eq!(nor, "unexpected token after end of statement");
+    assert_eq!(nand, "Syntax error: unexpected token after end of statement");
+    assert_eq!(nor, "Syntax error: unexpected token after end of statement");
 }
 
 #[test]
@@ -2206,8 +2232,8 @@ fn shift_at_primary_position_is_rejected() {
     let lead_shl = evaluate_input("<< 4'd1").expect_err("leading <<");
     let lead_shr = evaluate_input(">> 4'd1").expect_err("leading >>");
 
-    assert_eq!(lead_shl, "expected expression operand");
-    assert_eq!(lead_shr, "expected expression operand");
+    assert_eq!(lead_shl, "Syntax error: expected expression operand");
+    assert_eq!(lead_shr, "Syntax error: expected expression operand");
 }
 
 #[test]
@@ -2499,7 +2525,7 @@ fn conditional_inherits_then_branch_base() {
 fn conditional_missing_colon_is_parse_error() {
     // A `?` without `:` should not silently parse as something else.
     let err = evaluate_input("1 ? 2").expect_err("missing colon");
-    assert_eq!(err, "expected `:` in conditional expression");
+    assert_eq!(err, "Syntax error: expected `:` in conditional expression");
 }
 
 #[test]
@@ -2601,7 +2627,7 @@ fn concatenation_rejects_bare_unsized_literal_operand() {
     // LRM 5.1.14: "Unsized constant numbers shall not be allowed in
     // concatenations."
     let err = evaluate_input("{1, 4'd2}").expect_err("indefinite");
-    assert_eq!(err, "concatenation operand has indefinite width");
+    assert_eq!(err, "Semantic error: concatenation operand has indefinite width");
 }
 
 #[test]
@@ -2609,7 +2635,7 @@ fn concatenation_rejects_arithmetic_with_unsized_operand() {
     // The indefinite-width flag propagates through context-determined
     // arithmetic: `4'd1 + 1` is indefinite because the `1` is unsized.
     let err = evaluate_input("{4'd1 + 1, 4'd2}").expect_err("indefinite");
-    assert_eq!(err, "concatenation operand has indefinite width");
+    assert_eq!(err, "Semantic error: concatenation operand has indefinite width");
 }
 
 #[test]
@@ -2635,7 +2661,7 @@ fn concatenation_rejects_shift_with_unsized_lhs() {
     // Shifts take their result width from the LHS only (LRM 5.1.12), so
     // an unsized LHS makes the whole expression indefinite.
     let err = evaluate_input("{1 << 1, 4'd2}").expect_err("indefinite");
-    assert_eq!(err, "concatenation operand has indefinite width");
+    assert_eq!(err, "Semantic error: concatenation operand has indefinite width");
 }
 
 #[test]
@@ -2643,7 +2669,7 @@ fn concatenation_rejects_conditional_with_unsized_branch() {
     // Conditional width is max(then, else) (LRM 5.1.13), so an unsized
     // branch makes the whole conditional indefinite.
     let err = evaluate_input("{1'b1 ? 1 : 4'd2, 4'd2}").expect_err("indefinite");
-    assert_eq!(err, "concatenation operand has indefinite width");
+    assert_eq!(err, "Semantic error: concatenation operand has indefinite width");
 }
 
 #[test]
@@ -2652,7 +2678,7 @@ fn concatenation_rejects_power_with_unsized_lhs() {
     // shape as shifts), so an unsized LHS makes the whole expression
     // indefinite even when the RHS is sized.
     let err = evaluate_input("{2 ** 4'd3, 4'd2}").expect_err("indefinite");
-    assert_eq!(err, "concatenation operand has indefinite width");
+    assert_eq!(err, "Semantic error: concatenation operand has indefinite width");
 }
 
 #[test]
@@ -2671,7 +2697,7 @@ fn top_level_replication_rejects_zero_count() {
     // concatenation with at least one positive-size operand; a top-level
     // `{0{...}}` (no enclosing concat) is rejected.
     let err = evaluate_input("{0{1'b1}}").expect_err("zero count");
-    assert_eq!(err, "replication count must be positive in this context");
+    assert_eq!(err, "Semantic error: replication count must be positive in this context");
 }
 
 #[test]
@@ -2722,15 +2748,15 @@ fn concatenation_of_only_zero_replication_is_rejected() {
         evaluate_input("{2{ {0{1'b1}} }}").expect_err("outer rep over zero-only inner");
     assert_eq!(
         solo,
-        "concatenation must have at least one operand with positive size"
+        "Semantic error: concatenation must have at least one operand with positive size"
     );
     assert_eq!(
         pair,
-        "concatenation must have at least one operand with positive size"
+        "Semantic error: concatenation must have at least one operand with positive size"
     );
     assert_eq!(
         nested,
-        "concatenation must have at least one operand with positive size"
+        "Semantic error: concatenation must have at least one operand with positive size"
     );
 }
 
@@ -2738,7 +2764,35 @@ fn concatenation_of_only_zero_replication_is_rejected() {
 fn replication_rejects_negative_count() {
     // `-1` is signed-negative — read as a math integer, sign() = Minus.
     let err = evaluate_input("{-1{1'b1}}").expect_err("negative count");
-    assert_eq!(err, "replication count must be non-negative");
+    assert_eq!(err, "Semantic error: replication count must be non-negative");
+}
+
+// The validator runs as a pre-pass on the whole expression tree, so a
+// structural error inside a zero-count replication is caught even though
+// the runtime would short-circuit before walking the inner items. These
+// three positions used to surface differently:
+//   leftmost  — caught by the leftmost-base inference path
+//   rightmost — NOT caught (the bug fixed by the pre-pass)
+//   middle    — NOT caught (same bug)
+// All three now produce the same `Semantic error:` diagnostic.
+#[test]
+fn zero_replication_inner_items_validated_in_every_position() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] r").expect("decl");
+
+    let leftmost = session
+        .eval("{ {0{r[1.0]}}, 1'b1 }")
+        .expect_err("leftmost zero-rep with real index");
+    let rightmost = session
+        .eval("{ 1'b1, {0{r[1.0]}} }")
+        .expect_err("rightmost zero-rep with real index");
+    let middle = session
+        .eval("{ 1'b1, {0{r[1.0]}}, 1'b0 }")
+        .expect_err("middle zero-rep with real index");
+
+    assert_eq!(leftmost, "Semantic error: bit-select index cannot be real");
+    assert_eq!(rightmost, "Semantic error: bit-select index cannot be real");
+    assert_eq!(middle, "Semantic error: bit-select index cannot be real");
 }
 
 #[test]
@@ -2746,20 +2800,20 @@ fn replication_rejects_unknown_count() {
     // A count with any x or z bit is rejected — per LRM 5.1.14 the count
     // must be "a constant expression that is non-negative, non-x, non-z".
     let err = evaluate_input("{1'bx{1'b1}}").expect_err("unknown count");
-    assert_eq!(err, "replication count contains unknown bits");
+    assert_eq!(err, "Semantic error: replication count contains unknown bits");
 }
 
 #[test]
 fn empty_braces_is_a_parse_error() {
     // `{}` — no expressions inside; LRM grammar requires at least one.
     let err = evaluate_input("{}").expect_err("empty");
-    assert_eq!(err, "expected expression operand");
+    assert_eq!(err, "Syntax error: expected expression operand");
 }
 
 #[test]
 fn unclosed_concatenation_is_a_parse_error() {
     let err = evaluate_input("{4'd1, 4'd2").expect_err("unclosed");
-    assert_eq!(err, "missing closing brace in concatenation");
+    assert_eq!(err, "Syntax error: missing closing brace in concatenation");
 }
 
 #[test]
@@ -2867,7 +2921,7 @@ fn sign_cast_propagates_unknown_bits() {
 #[test]
 fn rejects_unknown_system_function() {
     let err = evaluate_input("$bogus(1)").expect_err("unknown $-function should error");
-    assert_eq!(err, "unsupported system function: $bogus");
+    assert_eq!(err, "Syntax error: unsupported system function: $bogus");
 }
 
 #[test]
@@ -2875,8 +2929,8 @@ fn rejects_sign_cast_missing_parenthesis() {
     let missing_open = evaluate_input("$signed 1").expect_err("missing `(` should error");
     let missing_close = evaluate_input("$signed(1").expect_err("missing `)` should error");
 
-    assert_eq!(missing_open, "expected `(` after $signed");
-    assert_eq!(missing_close, "expected `)` after $signed argument");
+    assert_eq!(missing_open, "Syntax error: expected `(` after $signed");
+    assert_eq!(missing_close, "Syntax error: expected `)` after $signed argument");
 }
 
 // vcal-specific display-base casts: `$bin` / `$oct` / `$dec` / `$hex` change
@@ -2960,10 +3014,10 @@ fn base_cast_locks_in_width_so_concatenation_accepts_unsized_arg() {
 #[test]
 fn rejects_base_cast_on_real() {
     let err = evaluate_input("$bin(1.5)").expect_err("real arg");
-    assert_eq!(err, "$bin argument cannot be real");
+    assert_eq!(err, "Semantic error: $bin argument cannot be real");
 
     let err = evaluate_input("$hex(2.0)").expect_err("real arg");
-    assert_eq!(err, "$hex argument cannot be real");
+    assert_eq!(err, "Semantic error: $hex argument cannot be real");
 }
 
 #[test]
@@ -2971,8 +3025,8 @@ fn rejects_base_cast_missing_parenthesis() {
     let missing_open = evaluate_input("$bin 1").expect_err("missing `(` should error");
     let missing_close = evaluate_input("$bin(1").expect_err("missing `)` should error");
 
-    assert_eq!(missing_open, "expected `(` after $bin");
-    assert_eq!(missing_close, "expected `)` after $bin argument");
+    assert_eq!(missing_open, "Syntax error: expected `(` after $bin");
+    assert_eq!(missing_close, "Syntax error: expected `)` after $bin argument");
 }
 
 // LRM §3.5.2 examples — accepted real-number forms.
@@ -3145,18 +3199,18 @@ fn conditional_promotes_branches_to_real() {
 #[test]
 fn rejects_modulus_on_real() {
     let err = evaluate_input("1.0 % 2.0").expect_err("modulus on real");
-    assert_eq!(err, "operator % not allowed on real operand");
+    assert_eq!(err, "Semantic error: operator % not allowed on real operand");
 }
 
 #[test]
 fn rejects_case_equality_on_real() {
     assert_eq!(
         evaluate_input("1.0 === 1.0").expect_err("=== on real"),
-        "operator === not allowed on real operand"
+        "Semantic error: operator === not allowed on real operand"
     );
     assert_eq!(
         evaluate_input("1.0 !== 1.0").expect_err("!== on real"),
-        "operator !== not allowed on real operand"
+        "Semantic error: operator !== not allowed on real operand"
     );
 }
 
@@ -3164,15 +3218,15 @@ fn rejects_case_equality_on_real() {
 fn rejects_bitwise_on_real() {
     assert_eq!(
         evaluate_input("1.0 & 2.0").expect_err("& on real"),
-        "operator & not allowed on real operand"
+        "Semantic error: operator & not allowed on real operand"
     );
     assert_eq!(
         evaluate_input("1.0 | 2.0").expect_err("| on real"),
-        "operator | not allowed on real operand"
+        "Semantic error: operator | not allowed on real operand"
     );
     assert_eq!(
         evaluate_input("~1.0").expect_err("~ on real"),
-        "operator ~ not allowed on real operand"
+        "Semantic error: operator ~ not allowed on real operand"
     );
 }
 
@@ -3180,11 +3234,11 @@ fn rejects_bitwise_on_real() {
 fn rejects_reductions_on_real() {
     assert_eq!(
         evaluate_input("&1.0").expect_err("& reduction on real"),
-        "operator & not allowed on real operand"
+        "Semantic error: operator & not allowed on real operand"
     );
     assert_eq!(
         evaluate_input("~|1.0").expect_err("~| reduction on real"),
-        "operator ~| not allowed on real operand"
+        "Semantic error: operator ~| not allowed on real operand"
     );
 }
 
@@ -3192,11 +3246,11 @@ fn rejects_reductions_on_real() {
 fn rejects_shifts_on_real() {
     assert_eq!(
         evaluate_input("1.0 << 1").expect_err("<< on real"),
-        "operator << not allowed on real operand"
+        "Semantic error: operator << not allowed on real operand"
     );
     assert_eq!(
         evaluate_input("1.0 >>> 1").expect_err(">>> on real"),
-        "operator >>> not allowed on real operand"
+        "Semantic error: operator >>> not allowed on real operand"
     );
 }
 
@@ -3204,11 +3258,11 @@ fn rejects_shifts_on_real() {
 fn rejects_concatenation_with_real() {
     assert_eq!(
         evaluate_input("{1.0, 2.0}").expect_err("concat with real"),
-        "concatenation operand cannot be real"
+        "Semantic error: concatenation operand cannot be real"
     );
     assert_eq!(
         evaluate_input("{2{1.0}}").expect_err("replication with real"),
-        "replication operand cannot be real"
+        "Semantic error: replication operand cannot be real"
     );
 }
 
@@ -3216,11 +3270,11 @@ fn rejects_concatenation_with_real() {
 fn rejects_sign_cast_on_real() {
     assert_eq!(
         evaluate_input("$signed(1.0)").expect_err("$signed real"),
-        "$signed argument cannot be real"
+        "Semantic error: $signed argument cannot be real"
     );
     assert_eq!(
         evaluate_input("$unsigned(2.0)").expect_err("$unsigned real"),
-        "$unsigned argument cannot be real"
+        "Semantic error: $unsigned argument cannot be real"
     );
 }
 
@@ -3256,19 +3310,19 @@ fn real_propagates_through_chained_arithmetic() {
 fn rejects_underscore_leading_exponent() {
     assert_eq!(
         evaluate_input("5.0e_3").expect_err("underscore-leading exponent"),
-        "missing exponent digits in real literal"
+        "Syntax error: missing exponent digits in real literal"
     );
     assert_eq!(
         evaluate_input("5.0e+_3").expect_err("underscore-leading after sign"),
-        "missing exponent digits in real literal"
+        "Syntax error: missing exponent digits in real literal"
     );
     assert_eq!(
         evaluate_input("1e_3").expect_err("bare-exponent underscore-leading"),
-        "missing exponent digits in real literal"
+        "Syntax error: missing exponent digits in real literal"
     );
     assert_eq!(
         evaluate_input("1e").expect_err("bare exponent without digits"),
-        "missing exponent digits in real literal"
+        "Syntax error: missing exponent digits in real literal"
     );
 }
 
@@ -3348,12 +3402,12 @@ fn nan_comparisons_follow_ieee_754() {
 fn rejects_real_replication_count() {
     assert_eq!(
         evaluate_input("{2.0{1'b1}}").expect_err("real replication count"),
-        "replication count cannot be real"
+        "Semantic error: replication count cannot be real"
     );
     assert_eq!(
         evaluate_input("{(1.5 + 0.5){1'b1}}")
             .expect_err("real-typed expression as count"),
-        "replication count cannot be real"
+        "Semantic error: replication count cannot be real"
     );
 }
 
@@ -3428,19 +3482,19 @@ fn real_format_window_boundaries() {
 fn rejects_leading_underscore_in_number_literals() {
     assert_eq!(
         evaluate_input("8'b_101").expect_err("binary value"),
-        "number cannot start with underscore: _101"
+        "Syntax error: number cannot start with underscore: _101"
     );
     assert_eq!(
         evaluate_input("8'h_a").expect_err("hex value"),
-        "number cannot start with underscore: _a"
+        "Syntax error: number cannot start with underscore: _a"
     );
     assert_eq!(
         evaluate_input("8'd_5").expect_err("decimal value"),
-        "number cannot start with underscore: _5"
+        "Syntax error: number cannot start with underscore: _5"
     );
     assert_eq!(
         evaluate_input("'d_x").expect_err("decimal x form"),
-        "number cannot start with underscore: _x"
+        "Syntax error: number cannot start with underscore: _x"
     );
 }
 
@@ -3826,7 +3880,7 @@ fn realtobits_bitstoreal_round_trip_preserves_nan_payload() {
 fn bitstoreal_rejects_real_argument() {
     assert_eq!(
         evaluate_input("$bitstoreal(1.0)").expect_err("$bitstoreal real"),
-        "$bitstoreal argument cannot be real"
+        "Semantic error: $bitstoreal argument cannot be real"
     );
 }
 
@@ -3840,19 +3894,19 @@ fn bitstoreal_rejects_real_argument() {
 fn bitstoreal_rejects_non_64_bit_argument() {
     assert_eq!(
         evaluate_input("$bitstoreal(1)").expect_err("32-bit unsized"),
-        "$bitstoreal argument must be 64 bits wide, got 32"
+        "Semantic error: $bitstoreal argument must be 64 bits wide, got 32"
     );
     assert_eq!(
         evaluate_input("$bitstoreal(1'b0)").expect_err("1-bit"),
-        "$bitstoreal argument must be 64 bits wide, got 1"
+        "Semantic error: $bitstoreal argument must be 64 bits wide, got 1"
     );
     assert_eq!(
         evaluate_input("$bitstoreal(63'h0)").expect_err("63-bit"),
-        "$bitstoreal argument must be 64 bits wide, got 63"
+        "Semantic error: $bitstoreal argument must be 64 bits wide, got 63"
     );
     assert_eq!(
         evaluate_input("$bitstoreal(65'h0)").expect_err("65-bit"),
-        "$bitstoreal argument must be 64 bits wide, got 65"
+        "Semantic error: $bitstoreal argument must be 64 bits wide, got 65"
     );
 }
 
@@ -3916,11 +3970,11 @@ fn real_conversions_widen_per_outer_context() {
 fn rejects_real_conversion_missing_parenthesis() {
     assert_eq!(
         evaluate_input("$rtoi 1.0").expect_err("missing `(`"),
-        "expected `(` after $rtoi"
+        "Syntax error: expected `(` after $rtoi"
     );
     assert_eq!(
         evaluate_input("$itor(1").expect_err("missing `)`"),
-        "expected `)` after $itor argument"
+        "Syntax error: expected `)` after $itor argument"
     );
 }
 
@@ -4219,23 +4273,23 @@ fn real_math_nan_and_infinity_propagate() {
 fn math_function_parser_errors() {
     assert_eq!(
         evaluate_input("$sqrt 4.0").expect_err("missing `(`"),
-        "expected `(` after $sqrt"
+        "Syntax error: expected `(` after $sqrt"
     );
     assert_eq!(
         evaluate_input("$pow(2.0").expect_err("missing `)`"),
-        "expected `)` after $pow argument"
+        "Syntax error: expected `)` after $pow argument"
     );
     assert_eq!(
         evaluate_input("$pow(1.0)").expect_err("$pow 1 arg"),
-        "$pow expects 2 arguments, got 1"
+        "Syntax error: $pow expects 2 arguments, got 1"
     );
     assert_eq!(
         evaluate_input("$sqrt(1.0, 2.0)").expect_err("$sqrt 2 args"),
-        "$sqrt expects 1 argument, got 2"
+        "Syntax error: $sqrt expects 1 argument, got 2"
     );
     assert_eq!(
         evaluate_input("$clog2(1, 2)").expect_err("$clog2 2 args"),
-        "$clog2 expects 1 argument, got 2"
+        "Syntax error: $clog2 expects 1 argument, got 2"
     );
 }
 
@@ -4497,7 +4551,7 @@ fn reading_undeclared_identifier_is_an_error() {
     let err = session
         .eval("b + 1")
         .expect_err("undeclared identifier should be rejected");
-    assert_eq!(err, "undeclared identifier: b");
+    assert_eq!(err, "Semantic error: undeclared identifier: b");
 }
 
 #[test]
@@ -4506,7 +4560,7 @@ fn assigning_to_undeclared_identifier_is_an_error() {
     let err = session
         .eval("b = 1")
         .expect_err("assignment to undeclared should be rejected");
-    assert_eq!(err, "undeclared identifier: b");
+    assert_eq!(err, "Semantic error: undeclared identifier: b");
 }
 
 #[test]
@@ -4554,7 +4608,7 @@ fn reg_decl_rejects_x_range_endpoint() {
 fn reg_decl_rejects_range_width_that_overflows_usize() {
     let input = format!("reg [{}:0] a", usize::MAX);
     let err = evaluate_input(&input).expect_err("overflowing width should be rejected");
-    assert_eq!(err, "reg range width too large");
+    assert_eq!(err, "Semantic error: reg range width too large");
 }
 
 #[test]
@@ -4682,7 +4736,7 @@ fn reg_decl_self_referencing_init_without_prior_binding_errors() {
     // normal expression.
     let err = evaluate_input("reg a = a")
         .expect_err("self-init without prior binding errors");
-    assert_eq!(err, "undeclared identifier: a");
+    assert_eq!(err, "Semantic error: undeclared identifier: a");
 }
 
 #[test]
@@ -4713,7 +4767,7 @@ fn reg_decl_init_propagates_rhs_evaluation_error() {
     // rather than silently leaving the new reg at x.
     let err = evaluate_input("reg [3:0] a = nope")
         .expect_err("undeclared identifier in init");
-    assert_eq!(err, "undeclared identifier: nope");
+    assert_eq!(err, "Semantic error: undeclared identifier: nope");
 }
 
 #[test]
@@ -4725,7 +4779,7 @@ fn reg_decl_failed_init_in_multi_name_decl_leaves_no_partial_state() {
     let err = session
         .eval("reg [3:0] a = 1, b = nope")
         .expect_err("undeclared identifier in init");
-    assert_eq!(err, "undeclared identifier: nope");
+    assert_eq!(err, "Semantic error: undeclared identifier: nope");
     assert!(session.lookup("a").is_none(), "a should not be bound");
     assert!(session.lookup("b").is_none(), "b should not be bound");
 }
@@ -4740,7 +4794,7 @@ fn reg_decl_failed_init_preserves_prior_binding_for_redeclared_name() {
     let err = session
         .eval("reg [3:0] a = 1, b = nope")
         .expect_err("undeclared identifier in init");
-    assert_eq!(err, "undeclared identifier: nope");
+    assert_eq!(err, "Semantic error: undeclared identifier: nope");
     assert_eq!(session.eval("a").expect("read a").output, "4'b0111");
     assert!(session.lookup("b").is_none(), "b should not be bound");
 }
@@ -5354,7 +5408,7 @@ fn lhs_undeclared_identifier_rejected() {
     let err = session
         .eval("nope = 1'b1")
         .expect_err("undeclared name rejected");
-    assert_eq!(err, "undeclared identifier: nope");
+    assert_eq!(err, "Semantic error: undeclared identifier: nope");
 }
 
 #[test]
@@ -5382,7 +5436,7 @@ fn lhs_bit_select_real_index_runs_before_rhs_eval() {
     let err = session
         .eval("r[1.5] = undeclared_rhs")
         .expect_err("real index rejected");
-    assert_eq!(err, "bit-select index cannot be real");
+    assert_eq!(err, "Semantic error: bit-select index cannot be real");
     assert_eq!(session.eval("r").expect("read r").output, "4'b0000");
 }
 
@@ -5395,7 +5449,7 @@ fn lhs_indexed_part_select_real_base_runs_before_rhs_eval() {
     let err = session
         .eval("r[1.5 +: 2] = undeclared_rhs")
         .expect_err("real base rejected");
-    assert_eq!(err, "indexed part-select base cannot be real");
+    assert_eq!(err, "Semantic error: indexed part-select base cannot be real");
     assert_eq!(session.eval("r").expect("read r").output, "4'b0000");
 }
 
@@ -5408,7 +5462,7 @@ fn lhs_undeclared_in_concat_rejected_all_or_nothing() {
     let err = session
         .eval("{a, b} = 8'hFF")
         .expect_err("undeclared b rejected");
-    assert_eq!(err, "undeclared identifier: b");
+    assert_eq!(err, "Semantic error: undeclared identifier: b");
     assert_eq!(session.eval("a").expect("read a").output, "4'b0000");
 }
 
