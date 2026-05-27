@@ -193,14 +193,18 @@ pub(crate) fn expression_is_real(expr: &Expr, session: &Session) -> bool {
         // Bit-select / part-select on a vector reg is always
         // integer-typed (LRM 4.7: part-select is unsigned). A select on
         // a real-array reg is the one exception: `r[i]` yields a real
-        // element. Part-selects on a real array, chained inner selects
-        // on a real-array element, and selects on a scalar `real` reg
-        // are all structural errors caught by the validator, so they
-        // stay integer here too — the integer pipeline surfaces the
-        // diagnostic at its usual position.
+        // element. Selects on a scalar `real` are prohibited per LRM
+        // 4.8.1 and the validator (`infer_select_meta`) rejects them
+        // before this function runs, so reaching here with a scalar
+        // real is a missed validator wiring.
         Expr::Select { name, kind, inner } => match session.lookup(name) {
             Some(reg) if reg.is_real_array() => {
                 matches!(kind, SelectKind::Bit { .. }) && inner.is_none()
+            }
+            Some(reg) if reg.is_real() => {
+                unreachable!(
+                    "validator rejects select on scalar real `{name}` before evaluation (LRM 4.8.1)"
+                );
             }
             _ => false,
         },
@@ -1103,6 +1107,15 @@ fn infer_select_meta(
             signed: template.signed,
             base: template.base,
         });
+    }
+    if reg.is_real() {
+        // LRM 4.8.1: "Bit-select or part-select references of variables
+        // declared as real … is prohibited." The scalar `real` has no
+        // packed bits, so no select kind is meaningful — reject outright
+        // regardless of the select shape.
+        return Err(format!(
+            "bit-select or part-select on real variable `{name}` is not allowed"
+        ));
     }
     if inner.is_some() {
         return Err(format!(
@@ -2682,6 +2695,13 @@ fn evaluate_select(
             "real-array element `{name}[..]` cannot be used as an integer value"
         ));
     }
+    if reg.is_real() {
+        // The validator (`infer_select_meta`) rejects any select on a
+        // scalar `real` per LRM 4.8.1 before evaluation runs.
+        unreachable!(
+            "validator rejects select on scalar real `{name}` before evaluation"
+        );
+    }
     if inner.is_some() {
         return Err(format!(
             "chained select on `{name}` is illegal: `{name}` is not an array"
@@ -3323,6 +3343,14 @@ fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
                     })
                 }
             } else {
+                if reg.is_real() {
+                    // LRM 4.8.1: select on a scalar real is prohibited,
+                    // mirroring the `infer_select_meta` rejection on the
+                    // RHS path.
+                    return Err(format!(
+                        "bit-select or part-select on real variable `{name}` is not allowed"
+                    ));
+                }
                 if inner.is_some() {
                     // Same diagnostic as the RHS chained-select-on-vector
                     // rejection (`evaluate_select`).

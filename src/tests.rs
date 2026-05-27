@@ -7074,12 +7074,40 @@ fn reg_keyword_rejected_as_variable_name_in_integer_decl() {
 
 #[test]
 fn real_reg_rejected_in_bit_select() {
-    // A bit-select on a real reg is structurally invalid (LRM 4.7
-    // only applies to packed vectors). The validator catches it.
+    // LRM 4.8.1: "Bit-select or part-select references of variables
+    // declared as real … is prohibited." The validator catches it.
     let mut session = Session::new();
     session.eval("real r = 1.5").expect("decl");
-    let err = session.eval("r[0]").expect_err("select banned");
-    assert!(err.contains("real"));
+    let err = session.eval("r[0]").expect_err("bit-select banned");
+    assert_eq!(
+        err,
+        "Semantic error: bit-select or part-select on real variable `r` is not allowed"
+    );
+}
+
+#[test]
+fn real_reg_rejected_in_part_select() {
+    // Same LRM 4.8.1 rule applies to part-selects on a scalar real.
+    let mut session = Session::new();
+    session.eval("real r = 1.5").expect("decl");
+    let err = session.eval("r[1:0]").expect_err("part-select banned");
+    assert_eq!(
+        err,
+        "Semantic error: bit-select or part-select on real variable `r` is not allowed"
+    );
+}
+
+#[test]
+fn real_reg_rejected_in_lhs_bit_select() {
+    // LRM 4.8.1 applies to the LHS path as well — `r[0] = 1` is
+    // prohibited when `r` is a scalar `real`.
+    let mut session = Session::new();
+    session.eval("real r = 1.5").expect("decl");
+    let err = session.eval("r[0] = 1").expect_err("lhs select banned");
+    assert_eq!(
+        err,
+        "Semantic error: bit-select or part-select on real variable `r` is not allowed"
+    );
 }
 
 #[test]
