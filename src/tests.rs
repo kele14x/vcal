@@ -567,9 +567,11 @@ fn runs_repl_until_exit_command() {
 #[test]
 fn repl_emits_error_lines_and_continues_to_next_prompt() {
     // On evaluation failure the REPL prints an empty `Out[N]: ` followed
-    // by a separate `Error: <message>` line, then advances the index and
-    // prompts for the next input — it does not abort or skip the index.
-    // Sequence: bad input → error, then valid input → result, then exit.
+    // by the message on its own line (the message already carries a
+    // stage prefix like `Syntax error:` / `Semantic error:` when one
+    // applies), then advances the index and prompts for the next input
+    // — it does not abort or skip the index. Sequence: bad input →
+    // error, then valid input → result, then exit.
     let mut input = Cursor::new("1 +\n42\n$finish\n");
     let mut output = Vec::new();
 
@@ -579,7 +581,7 @@ fn repl_emits_error_lines_and_continues_to_next_prompt() {
     assert_eq!(
         output,
         "In[0]: Out[0]: \n\
-         Error: Syntax error: unexpected end of expression\n\
+         Syntax error: unexpected end of expression\n\
          In[1]: Out[1]: 32'sd42\n\
          In[2]: Out[2]: \n",
     );

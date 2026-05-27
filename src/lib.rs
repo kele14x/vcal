@@ -410,7 +410,7 @@ pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Res
             }
             Err(message) => {
                 writeln!(writer, "Out[{index}]: ")?;
-                writeln!(writer, "Error: {message}")?;
+                writeln!(writer, "{message}")?;
             }
         }
 
@@ -448,7 +448,7 @@ pub fn run_interactive() -> io::Result<()> {
             }
             Err(message) => {
                 println!("Out[{index}]: ");
-                println!("Error: {message}");
+                println!("{message}");
             }
         }
 
