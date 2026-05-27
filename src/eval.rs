@@ -52,10 +52,10 @@ pub(crate) fn evaluate_expr(expr: &Expr, session: &Session) -> Result<Value, Str
 // reg's stored base on the result.
 //
 // A real RHS is implicitly converted per LRM §3.5.3: round to nearest
-// with ties away from zero (the same rule `$itor`'s internal real→int
-// step uses). NaN / ±∞ have no integer image, so the lvalue is filled
-// with x bits at its declared width — matching how `$rtoi` surfaces
-// "no defined integer" rather than silently mapping to zero.
+// with ties away from zero (distinct from `$rtoi`'s truncate-toward-zero
+// rule). NaN / ±∞ have no integer image, so the lvalue is filled with x
+// bits at its declared width — matching how `$rtoi` surfaces "no defined
+// integer" rather than silently mapping to zero.
 pub(crate) fn evaluate_assignment_rhs(
     rhs: &Expr,
     width: usize,
@@ -318,32 +318,19 @@ fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> 
         }
         Expr::RealConversion { kind, arg } => match kind {
             RealConversionKind::IntegerToReal => {
-                // LRM 17.8 + §3.5.3: a real operand goes through implicit
-                // real→integer→real. The implicit real→integer step rounds
-                // to nearest with ties away from zero (§3.5.3), so e.g.
-                // $itor(-2.6) is -3.0, not -2.0 (which is what $rtoi's
-                // truncation gives). NaN / ±∞ have no integer image, so
-                // `real_to_integer_bigint` returns `None` — matching the
-                // rule $rtoi already documents. §3.5.3's int→real then maps
-                // every x bit to 0, so the chain collapses to 0.0, keeping
-                // $itor self-consistent with $rtoi.
-                //
-                // An integer-typed operand must skip that round-trip: when
-                // the magnitude exceeds f64 range, `integer_value_to_f64`
-                // saturates to ±∞ (BigInt::to_f64's documented behavior),
-                // and routing that ±∞ back through real→integer would
-                // collapse it to 0.0 — destroying the value the conversion
-                // was supposed to surface.
+                // LRM 17.8: $itor's argument type is `int_val`. The
+                // validator (`validate_expr_structure` IntegerToReal arm)
+                // rejects a real argument, so only the integer path runs
+                // here. When the magnitude exceeds f64 range,
+                // `integer_value_to_f64` saturates to ±∞ — that's the
+                // value the conversion is supposed to surface.
                 if expression_is_real(arg) {
-                    let real_val = evaluate_expr_as_real(arg, session)?;
-                    match real_to_integer_bigint(real_val) {
-                        Some(bigint) => Ok(bigint.to_f64().expect("BigInt::to_f64 is total")),
-                        None => Ok(0.0),
-                    }
-                } else {
-                    let int_val = evaluate_expr_in_context(arg, None, session)?;
-                    Ok(integer_value_to_f64(&int_val))
+                    unreachable!(
+                        "validator rejects real $itor arg before evaluation"
+                    );
                 }
+                let int_val = evaluate_expr_in_context(arg, None, session)?;
+                Ok(integer_value_to_f64(&int_val))
             }
             RealConversionKind::BitsToReal => {
                 // LRM 17.8: reverse of $realtobits. Argument is the 64-bit
@@ -636,9 +623,20 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
         Expr::RealConversion { kind, arg } => {
             validate_expr_structure(arg, session)?;
             match kind {
-                RealConversionKind::IntegerToReal
-                | RealConversionKind::RealToInteger
-                | RealConversionKind::RealToBits => Ok(()),
+                RealConversionKind::RealToInteger | RealConversionKind::RealToBits => Ok(()),
+                RealConversionKind::IntegerToReal => {
+                    // LRM 17.8 types the $itor argument as `int_val`, and
+                    // simulators diverge on real input (iverilog rounds via
+                    // §3.5.3, vcs/xsim pass through unchanged), so accepting
+                    // a real argument would silently pick one vendor's
+                    // interpretation. Reject up front — the result type is
+                    // already real, so a real-typed argument is also
+                    // semantically pointless.
+                    if expression_is_real(arg) {
+                        return Err("$itor argument cannot be real".to_string());
+                    }
+                    Ok(())
+                }
                 RealConversionKind::BitsToReal => {
                     if expression_is_real(arg) {
                         return Err("$bitstoreal argument cannot be real".to_string());
@@ -661,6 +659,13 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
             if kind.is_real_result() {
                 Ok(())
             } else {
+                // LRM 17.11.1 says $clog2's argument "can be an integer or
+                // an arbitrary sized vector value" — real is not listed.
+                // Mirrors the $itor rejection above: reject up front rather
+                // than rely on an implicit §3.5.3 round to integer.
+                if expression_is_real(&args[0]) {
+                    return Err(format!("{} argument cannot be real", kind.name()));
+                }
                 let _ = infer_expr_meta(expr, session)?;
                 Ok(())
             }
@@ -2264,32 +2269,19 @@ fn evaluate_math_function_expr(
     Ok(extend_cast_to_outer_context(result, context))
 }
 
-// LRM 17.11: $clog2 returns the ceiling of log base 2 of the unsigned
-// argument; $clog2(0) is defined to be 0.
+// LRM 17.11.1: $clog2 returns the ceiling of log base 2 of the unsigned
+// argument; $clog2(0) is defined to be 0. The argument is integer or
+// vector — real arguments are rejected by the validator
+// (`validate_expr_structure` MathFunction arm).
 //
-// Argument typing follows the user's "implicit type conversion" rule:
-//   - real argument: rounded to integer via §3.5.3 (round half away from
-//     zero). NaN/±∞ has no integer image, so the result is 32 bits of x —
-//     mirroring the $rtoi NaN/±∞ rule. Finite reals wrap mod 2^32 to
-//     match $rtoi's "implicit integer data type is 32 bits signed"
-//     behavior, then are interpreted as unsigned per LRM.
-//   - integer argument: bits with x/z anywhere collapse the result to
-//     32'sdx. The LRM is silent on x/z in $clog2; vcal surfaces "no
-//     defined image" rather than silently mapping x/z → 0, matching the
-//     $rtoi NaN/±∞ rule. The width used for the unsigned interpretation
-//     is the operand's natural width, so $clog2(64'hFFFF…F) is 64.
+// Bits with x/z anywhere collapse the result to 32'sdx. The LRM is silent
+// on x/z in $clog2; vcal surfaces "no defined image" rather than silently
+// mapping x/z → 0, matching the $rtoi NaN/±∞ rule. The width used for the
+// unsigned interpretation is the operand's natural width, so
+// $clog2(64'hFFFF…F) is 64.
 fn evaluate_clog2(arg: &Expr, session: &Session) -> Result<IntegerValue, String> {
     if expression_is_real(arg) {
-        let real_val = evaluate_expr_as_real(arg, session)?;
-        let Some(bigint) = real_to_integer_bigint(real_val) else {
-            return Ok(IntegerValue::all_x(32, true, Base::Decimal));
-        };
-        // Wrap to a 32-bit pattern, matching $rtoi's truncation domain;
-        // the resulting IntegerValue's bits are then interpreted as the
-        // unsigned 32-bit value the LRM requires.
-        let wrapped = IntegerValue::from_bigint(bigint, 32, true, Base::Decimal);
-        let unsigned = bits_to_biguint(&wrapped.bits);
-        return Ok(clog2_result_value(unsigned));
+        unreachable!("validator rejects real $clog2 arg before evaluation");
     }
 
     let value = evaluate_expr_in_context(arg, None, session)?;

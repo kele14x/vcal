@@ -234,7 +234,9 @@ pub(crate) enum LValue {
 pub(crate) enum RealConversionKind {
     // `$rtoi(real)` — truncates toward zero, returns 32-bit signed integer.
     RealToInteger,
-    // `$itor(int)` — converts integer to real per §3.5.3 (x/z → 0).
+    // `$itor(int)` — converts integer to real per §3.5.3 (x/z → 0). Real
+    // arguments are rejected by the validator (simulators diverge on this
+    // case and the LRM types the argument as `int_val`).
     IntegerToReal,
     // `$realtobits(real)` — bitcast to 64-bit unsigned vector (IEEE 754).
     RealToBits,
@@ -245,8 +247,8 @@ pub(crate) enum RealConversionKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MathFunctionKind {
-    // Integer-result. Argument is integer-typed; a real argument
-    // implicitly rounds via §3.5.3.
+    // Integer-result. LRM 17.11.1: argument is integer or vector; real is
+    // rejected by the validator.
     Clog2,
     // Real-result, 1 arg. Argument is real-typed; an integer argument
     // implicitly promotes via §3.5.3 (x/z → 0).

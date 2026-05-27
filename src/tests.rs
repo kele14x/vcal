@@ -3630,62 +3630,25 @@ fn itor_converts_integer_to_real() {
     );
 }
 
-// LRM §3.5.3 carries through to $itor with a real argument: the implicit
-// real→integer step rounds to the nearest integer with ties away from
-// zero, then the integer→real step is exact. So $itor differs from $rtoi
-// on non-integer reals — $rtoi truncates toward zero while $itor rounds.
+// LRM 17.8 types the $itor argument as `int_val`. Simulators diverge on
+// real input (iverilog rounds via §3.5.3 to 1.0, vcs/xsim pass 1.1
+// through), and the result type is already real — a real argument is
+// either non-portable or pointless, so the validator rejects it.
 #[test]
-fn itor_real_argument_rounds_half_away_from_zero() {
-    // -2.6 rounds to -3, not -2: ties-away-from-zero takes the larger
-    // magnitude. Distinct from $rtoi(-2.6) which truncates to -2.
+fn itor_rejects_real_argument() {
     assert_eq!(
-        evaluate_input("$itor(-2.6)")
-            .expect("$itor with real rounds")
-            .output,
-        "-3.0"
-    );
-    // 2.6 → 3.0 (mirror of -2.6).
-    assert_eq!(
-        evaluate_input("$itor(2.6)").expect("$itor positive").output,
-        "3.0"
-    );
-    // Half-cases round away from zero per §3.5.3, not banker's rounding.
-    assert_eq!(
-        evaluate_input("$itor(2.5)").expect("$itor +0.5 tie").output,
-        "3.0"
+        evaluate_input("$itor(1.1)").expect_err("$itor real literal"),
+        "Semantic error: $itor argument cannot be real"
     );
     assert_eq!(
-        evaluate_input("$itor(-2.5)").expect("$itor -0.5 tie").output,
-        "-3.0"
+        evaluate_input("$itor(-2.6)").expect_err("$itor negative real"),
+        "Semantic error: $itor argument cannot be real"
     );
-    // Already-integer reals round to themselves.
+    // Real-result expressions (NaN/±∞ from real arithmetic) take the same
+    // path — there's nothing real-specific about the rejection.
     assert_eq!(
-        evaluate_input("$itor(5.0)")
-            .expect("$itor integer-valued real")
-            .output,
-        "5.0"
-    );
-}
-
-// $itor with a real argument goes through implicit real→integer→real.
-// NaN/±∞ have no integer image, so the implicit real→int step yields x
-// (matching $rtoi(NaN/±∞) → 32'sdx), and §3.5.3's int→real then maps each
-// x bit to 0 — so the whole chain collapses to 0.0.
-#[test]
-fn itor_nan_and_infinity_collapse_to_zero() {
-    assert_eq!(
-        evaluate_input("$itor(0.0 / 0.0)").expect("$itor NaN").output,
-        "0.0"
-    );
-    assert_eq!(
-        evaluate_input("$itor(1.0 / 0.0)").expect("$itor +inf").output,
-        "0.0"
-    );
-    assert_eq!(
-        evaluate_input("$itor(-1.0 / 0.0)")
-            .expect("$itor -inf")
-            .output,
-        "0.0"
+        evaluate_input("$itor(0.0 / 0.0)").expect_err("$itor NaN"),
+        "Semantic error: $itor argument cannot be real"
     );
 }
 
@@ -4057,49 +4020,23 @@ fn clog2_xz_bits_collapse_to_x_result() {
     );
 }
 
-// Real argument promotes via §3.5.3 (round half away from zero), then is
-// interpreted as unsigned per LRM. Mirrors $rtoi's NaN/±∞ → 32'sdx rule
-// for non-finite reals.
+// LRM 17.11.1: $clog2's argument "can be an integer or an arbitrary sized
+// vector value" — real is not listed. The validator rejects it for the
+// same reason $itor does: an implicit real→integer round would silently
+// pick one vendor's interpretation.
 #[test]
-fn clog2_accepts_real_argument() {
+fn clog2_rejects_real_argument() {
     assert_eq!(
-        evaluate_input("$clog2(8.0)").expect("$clog2 real").output,
-        "32'sd3"
+        evaluate_input("$clog2(8.0)").expect_err("$clog2 real literal"),
+        "Semantic error: $clog2 argument cannot be real"
     );
     assert_eq!(
-        evaluate_input("$clog2(7.5)")
-            .expect("$clog2 round up")
-            .output,
-        "32'sd3"
-    );
-    // -2.5 rounds to -3 → 32-bit pattern 0xFFFF_FFFD → unsigned huge → 32.
-    assert_eq!(
-        evaluate_input("$clog2(-2.5)")
-            .expect("$clog2 negative real")
-            .output,
-        "32'sd32"
-    );
-}
-
-#[test]
-fn clog2_nan_and_infinity_yield_x() {
-    assert_eq!(
-        evaluate_input("$clog2(0.0 / 0.0)")
-            .expect("$clog2 NaN")
-            .output,
-        "32'sdx"
+        evaluate_input("$clog2(-2.5)").expect_err("$clog2 negative real"),
+        "Semantic error: $clog2 argument cannot be real"
     );
     assert_eq!(
-        evaluate_input("$clog2(1.0 / 0.0)")
-            .expect("$clog2 +inf")
-            .output,
-        "32'sdx"
-    );
-    assert_eq!(
-        evaluate_input("$clog2(-1.0 / 0.0)")
-            .expect("$clog2 -inf")
-            .output,
-        "32'sdx"
+        evaluate_input("$clog2(0.0 / 0.0)").expect_err("$clog2 NaN"),
+        "Semantic error: $clog2 argument cannot be real"
     );
 }
 
@@ -4511,9 +4448,9 @@ fn reg_value_participates_in_later_expression_with_its_own_base() {
 
 #[test]
 fn assignment_of_real_value_implicitly_converts_per_lrm_3_5_3() {
-    // LRM §3.5.3: implicit real→integer conversion rounds to nearest with
-    // ties away from zero — same rule `$itor`'s internal real→int step
-    // uses. So `1.5` rounds to 2, not truncates to 1.
+    // LRM §3.5.3: implicit real→integer conversion rounds to nearest
+    // with ties away from zero (distinct from `$rtoi`'s truncation). So
+    // `1.5` rounds to 2, not truncates to 1.
     let mut session = Session::new();
     session.eval("reg [7:0] a").expect("decl");
     assert_eq!(
