@@ -22,6 +22,461 @@ struct ExprMeta {
     base: Base,
 }
 
+// Annotated AST: a parallel tree built from `Expr` in a single bottom-up pass.
+// Each node caches its result-type meta and its real/integer dispatch flag, so
+// validators and evaluators can read those in O(1) instead of re-walking the
+// subtree at every Binary node (which made the integer pipeline O(N²) on a
+// long left-leaning chain like `1+1+...+1`).
+//
+// `meta` is `None` for nodes whose result type is real (the f64 pipeline) or
+// whose result has no well-defined integer interpretation (`SystemTask`,
+// which the validator rejects as an expression). The integer pipeline's
+// `meta()` accessor unwraps with a panic — by the time evaluation reaches an
+// integer helper, the dispatch in `evaluate_expr` has already routed real
+// expressions to the real pipeline, so a panic here is a real bug.
+//
+// `expr` keeps a back-reference to the original `Expr` so leaves (`Literal`,
+// `Identifier`, `Select`, …) and primitive operator data (`UnaryOp`,
+// `BinaryOp`, `MathFunctionKind`, …) can be read directly from `expr` rather
+// than duplicated into `kind`. `kind` only mirrors the structural children
+// the evaluators need to recurse into.
+#[derive(Debug)]
+pub(crate) struct Annotated<'a> {
+    expr: &'a Expr,
+    meta: Option<ExprMeta>,
+    kind: AnnotatedKind<'a>,
+}
+
+#[derive(Debug)]
+enum AnnotatedKind<'a> {
+    // `Literal`, `RealLiteral`, `Identifier`, `SystemTask`, `Select`. The
+    // evaluator reads sub-data from `Annotated::expr` directly.
+    Leaf,
+    Grouped(Box<Annotated<'a>>),
+    Unary(Box<Annotated<'a>>),
+    Binary {
+        lhs: Box<Annotated<'a>>,
+        rhs: Box<Annotated<'a>>,
+    },
+    Conditional {
+        cond: Box<Annotated<'a>>,
+        then_arm: Box<Annotated<'a>>,
+        else_arm: Box<Annotated<'a>>,
+    },
+    Concatenation(Vec<Annotated<'a>>),
+    Replication {
+        count: Box<Annotated<'a>>,
+        items: Vec<Annotated<'a>>,
+    },
+    SignCast(Box<Annotated<'a>>),
+    BaseCast(Box<Annotated<'a>>),
+    RealConversion(Box<Annotated<'a>>),
+    MathFunction(Vec<Annotated<'a>>),
+}
+
+impl<'a> Annotated<'a> {
+    pub(crate) fn is_real(&self) -> bool {
+        self.meta.is_none()
+    }
+
+    fn meta(&self) -> ExprMeta {
+        self.meta
+            .expect("integer meta queried on real-typed or non-expression node")
+    }
+}
+
+// Annotate the expression tree once, bottom-up. Returns structural errors
+// (undeclared identifier, array used as value, system task in an expression
+// position) in unprefixed form — the entry-point caller wraps them with
+// "Semantic error: " when they surface during the static-semantic phase, and
+// passes them through unprefixed when they surface at evaluation time, both
+// matching today's error-prefix convention.
+//
+// Real-result branches store `meta = None`; integer branches store
+// `Some(meta)` computed from the children's metas using the same combination
+// rules `infer_expr_meta` previously walked the tree for. The Select arm
+// stays a leaf in the annotated tree — its index / range sub-expressions are
+// short, self-determined, and outside the chain spine, so re-walking them in
+// the legacy helpers is a non-issue for the O(N²) regression.
+fn annotate<'a>(expr: &'a Expr, session: &Session) -> Result<Annotated<'a>, String> {
+    match expr {
+        Expr::Literal(value) => Ok(Annotated {
+            expr,
+            meta: Some(ExprMeta {
+                width: value.width,
+                signed: value.signed,
+                base: value.base,
+            }),
+            kind: AnnotatedKind::Leaf,
+        }),
+        Expr::RealLiteral(_) => Ok(Annotated {
+            expr,
+            meta: None,
+            kind: AnnotatedKind::Leaf,
+        }),
+        Expr::Grouped(inner) => {
+            let inner_annot = annotate(inner, session)?;
+            Ok(Annotated {
+                expr,
+                meta: inner_annot.meta,
+                kind: AnnotatedKind::Grouped(Box::new(inner_annot)),
+            })
+        }
+        Expr::Unary { op, expr: operand } => {
+            let operand_annot = annotate(operand, session)?;
+            let meta = match op {
+                // LRM 5.1.5: unary `+` / `-` preserve operand's type and
+                // are real iff the operand is real.
+                UnaryOp::Plus | UnaryOp::Minus => operand_annot.meta,
+                // `~` only legal on integer; preserve operand's meta.
+                UnaryOp::BitwiseNot => operand_annot.meta,
+                // Logical / reduction → 1-bit unsigned binary, regardless
+                // of operand type. Real operand validity is enforced by
+                // the validator, not the meta path.
+                UnaryOp::LogicalNot
+                | UnaryOp::ReductionAnd
+                | UnaryOp::ReductionNand
+                | UnaryOp::ReductionOr
+                | UnaryOp::ReductionNor
+                | UnaryOp::ReductionXor
+                | UnaryOp::ReductionXnor => Some(ExprMeta {
+                    width: 1,
+                    signed: false,
+                    base: Base::Binary,
+                }),
+            };
+            Ok(Annotated {
+                expr,
+                meta,
+                kind: AnnotatedKind::Unary(Box::new(operand_annot)),
+            })
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let lhs_annot = annotate(lhs, session)?;
+            let rhs_annot = annotate(rhs, session)?;
+            let meta = binary_result_meta(*op, &lhs_annot, &rhs_annot);
+            Ok(Annotated {
+                expr,
+                meta,
+                kind: AnnotatedKind::Binary {
+                    lhs: Box::new(lhs_annot),
+                    rhs: Box::new(rhs_annot),
+                },
+            })
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            let cond_annot = annotate(cond, session)?;
+            let then_annot = annotate(then_expr, session)?;
+            let else_annot = annotate(else_expr, session)?;
+            // LRM 5.1.13: result type is real iff either branch is real.
+            // Cond contributes nothing to result meta. For integer branches
+            // we combine widths (max) and signedness (any unsigned →
+            // unsigned) using the same rule `infer_expr_meta` used.
+            let meta = if then_annot.is_real() || else_annot.is_real() {
+                None
+            } else {
+                let then_meta = then_annot.meta();
+                let else_meta = else_annot.meta();
+                Some(ExprMeta {
+                    width: usize::max(then_meta.width, else_meta.width),
+                    signed: then_meta.signed && else_meta.signed,
+                    base: then_meta.base,
+                })
+            };
+            Ok(Annotated {
+                expr,
+                meta,
+                kind: AnnotatedKind::Conditional {
+                    cond: Box::new(cond_annot),
+                    then_arm: Box::new(then_annot),
+                    else_arm: Box::new(else_annot),
+                },
+            })
+        }
+        Expr::Concatenation { items } => {
+            let mut item_annots = Vec::with_capacity(items.len());
+            for item in items {
+                item_annots.push(annotate(item, session)?);
+            }
+            // LRM 5.1.14: width = sum of operand widths, always unsigned,
+            // base from leftmost item. Real items are rejected by the
+            // validator (concat requires definite bit widths); the meta
+            // built here is only consumed if validation passes.
+            let mut total_width = 0usize;
+            let mut leftmost_base = Base::Binary;
+            for (idx, item) in item_annots.iter().enumerate() {
+                if let Some(item_meta) = item.meta {
+                    total_width = total_width.saturating_add(item_meta.width);
+                    if idx == 0 {
+                        leftmost_base = item_meta.base;
+                    }
+                }
+            }
+            Ok(Annotated {
+                expr,
+                meta: Some(ExprMeta {
+                    width: total_width,
+                    signed: false,
+                    base: leftmost_base,
+                }),
+                kind: AnnotatedKind::Concatenation(item_annots),
+            })
+        }
+        Expr::Replication { count, items } => {
+            let count_annot = annotate(count, session)?;
+            let mut item_annots = Vec::with_capacity(items.len());
+            for item in items {
+                item_annots.push(annotate(item, session)?);
+            }
+            // Width depends on the count's evaluated value. Skip the
+            // eager evaluation here when the count is real-typed —
+            // validation surfaces "replication count cannot be real" with
+            // the correct framing, and trying to evaluate as an integer
+            // first would only swap that for the integer-pipeline's
+            // "real value cannot be used as an integer expression here".
+            // For the same reason we skip evaluation when the items
+            // themselves are real-typed: the validator rejects them with
+            // a clearer "replication operand cannot be real" message.
+            let count_value = if count_annot.is_real()
+                || item_annots.iter().any(|item| item.is_real())
+            {
+                None
+            } else {
+                Some(evaluate_replication_count_allow_zero(count, session)?)
+            };
+            let mut inner_width = 0usize;
+            let mut leftmost_base = Base::Binary;
+            for (idx, item) in item_annots.iter().enumerate() {
+                if let Some(item_meta) = item.meta {
+                    inner_width = inner_width.saturating_add(item_meta.width);
+                    if idx == 0 {
+                        leftmost_base = item_meta.base;
+                    }
+                }
+            }
+            let total_width =
+                count_value.map_or(0, |c| inner_width.saturating_mul(c));
+            Ok(Annotated {
+                expr,
+                meta: Some(ExprMeta {
+                    width: total_width,
+                    signed: false,
+                    base: leftmost_base,
+                }),
+                kind: AnnotatedKind::Replication {
+                    count: Box::new(count_annot),
+                    items: item_annots,
+                },
+            })
+        }
+        Expr::SignCast { signed, arg } => {
+            let arg_annot = annotate(arg, session)?;
+            // LRM 5.5: width / base from arg, signedness from cast.
+            // Real arg rejected by validator; meta computed here is
+            // a no-op for real cases (validator surfaces the error
+            // before any consumer reads this meta).
+            let meta = arg_annot.meta.map(|arg_meta| ExprMeta {
+                width: arg_meta.width,
+                signed: *signed,
+                base: arg_meta.base,
+            });
+            Ok(Annotated {
+                expr,
+                meta,
+                kind: AnnotatedKind::SignCast(Box::new(arg_annot)),
+            })
+        }
+        Expr::BaseCast { base, arg } => {
+            let arg_annot = annotate(arg, session)?;
+            let meta = arg_annot.meta.map(|arg_meta| ExprMeta {
+                width: arg_meta.width,
+                signed: arg_meta.signed,
+                base: *base,
+            });
+            Ok(Annotated {
+                expr,
+                meta,
+                kind: AnnotatedKind::BaseCast(Box::new(arg_annot)),
+            })
+        }
+        Expr::RealConversion { kind: rkind, arg } => {
+            let arg_annot = annotate(arg, session)?;
+            // LRM 17.8: $rtoi is 32-bit signed decimal; $realtobits is
+            // 64-bit unsigned hex; $itor and $bitstoreal are real-typed.
+            let meta = match rkind {
+                RealConversionKind::RealToInteger => Some(ExprMeta {
+                    width: 32,
+                    signed: true,
+                    base: Base::Decimal,
+                }),
+                RealConversionKind::RealToBits => Some(ExprMeta {
+                    width: 64,
+                    signed: false,
+                    base: Base::Hex,
+                }),
+                RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => None,
+            };
+            Ok(Annotated {
+                expr,
+                meta,
+                kind: AnnotatedKind::RealConversion(Box::new(arg_annot)),
+            })
+        }
+        Expr::MathFunction { kind: mkind, args } => {
+            let mut arg_annots = Vec::with_capacity(args.len());
+            for arg in args {
+                arg_annots.push(annotate(arg, session)?);
+            }
+            // LRM 17.11: $clog2 → 32-bit signed decimal; the rest yield real.
+            let meta = if mkind.is_real_result() {
+                None
+            } else {
+                Some(ExprMeta {
+                    width: 32,
+                    signed: true,
+                    base: Base::Decimal,
+                })
+            };
+            Ok(Annotated {
+                expr,
+                meta,
+                kind: AnnotatedKind::MathFunction(arg_annots),
+            })
+        }
+        // SystemTask is not really an expression; the validator rejects it
+        // at any nested expression position. We annotate as a Leaf with
+        // None meta so the validator can read `is_real` without
+        // distinguishing the case.
+        Expr::SystemTask { .. } => Ok(Annotated {
+            expr,
+            meta: None,
+            kind: AnnotatedKind::Leaf,
+        }),
+        Expr::Identifier(name) => {
+            let reg = session
+                .lookup(name)
+                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            // Real reg → None meta (real pipeline); integer reg → Some.
+            // Array regs have no value as a whole — validator surfaces the
+            // diagnostic; we stamp a placeholder meta of None here so the
+            // structural validator runs first and produces the friendlier
+            // error before any consumer touches the meta.
+            let meta = if reg.is_real() {
+                None
+            } else if reg.is_array() {
+                None
+            } else {
+                let value = reg.require_vector(name)?;
+                Some(ExprMeta {
+                    width: value.width,
+                    signed: value.signed,
+                    base: value.base,
+                })
+            };
+            Ok(Annotated {
+                expr,
+                meta,
+                kind: AnnotatedKind::Leaf,
+            })
+        }
+        Expr::Select { name, kind, inner } => {
+            // Inner index / range sub-expressions stay un-annotated for
+            // now — they're self-determined, short, and not in the chain
+            // spine that drove the O(N²) regression. The legacy helpers
+            // still handle them.
+            //
+            // Real-typed selects (real-array element via `r[i]`, no inner
+            // select) carry `meta = None` to route through the f64
+            // pipeline; the validator surfaces the structural diagnostic
+            // for the illegal forms (part-select on real-array, inner
+            // select on real-array, …) before any meta consumer runs.
+            let is_real_select = matches!(session.lookup(name), Some(reg) if reg.is_real_array())
+                && matches!(kind, SelectKind::Bit { .. })
+                && inner.is_none();
+            let meta = if is_real_select {
+                None
+            } else {
+                Some(infer_select_meta(name, kind, inner.as_deref(), session)?)
+            };
+            Ok(Annotated {
+                expr,
+                meta,
+                kind: AnnotatedKind::Leaf,
+            })
+        }
+    }
+}
+
+// Compute the integer result-type meta for a binary op given annotated
+// children. Returns `None` when the result type is real (LRM 5.1.5: arithmetic
+// with at least one real operand), matching `expression_is_real`'s rules.
+fn binary_result_meta(
+    op: BinaryOp,
+    lhs: &Annotated<'_>,
+    rhs: &Annotated<'_>,
+) -> Option<ExprMeta> {
+    match op {
+        BinaryOp::Add
+        | BinaryOp::Subtract
+        | BinaryOp::Multiply
+        | BinaryOp::Divide
+        | BinaryOp::Power => {
+            if lhs.is_real() || rhs.is_real() {
+                None
+            } else {
+                Some(combine_binary_meta(op, lhs.meta(), rhs.meta()))
+            }
+        }
+        // Modulus, ===, !==, bitwise, shift: rejected on real by validator;
+        // result type is integer in any case it's allowed.
+        BinaryOp::Modulus
+        | BinaryOp::CaseEqual
+        | BinaryOp::CaseNotEqual
+        | BinaryOp::BitwiseAnd
+        | BinaryOp::BitwiseOr
+        | BinaryOp::BitwiseXor
+        | BinaryOp::BitwiseXnor
+        | BinaryOp::LogicalShiftLeft
+        | BinaryOp::LogicalShiftRight
+        | BinaryOp::ArithmeticShiftLeft
+        | BinaryOp::ArithmeticShiftRight => {
+            // Use the children's metas only when both are integer-typed;
+            // for the operators above this is always the validated case.
+            // Real-tainted operands hit the validator before any consumer
+            // reads this meta, so a placeholder integer meta is harmless.
+            let lhs_meta = lhs.meta.unwrap_or(ExprMeta {
+                width: 1,
+                signed: false,
+                base: Base::Binary,
+            });
+            let rhs_meta = rhs.meta.unwrap_or(ExprMeta {
+                width: 1,
+                signed: false,
+                base: Base::Binary,
+            });
+            Some(combine_binary_meta(op, lhs_meta, rhs_meta))
+        }
+        // Relational / equality / logical → 1-bit unsigned binary,
+        // regardless of operand types.
+        BinaryOp::LessThan
+        | BinaryOp::GreaterThan
+        | BinaryOp::LessThanOrEqual
+        | BinaryOp::GreaterThanOrEqual
+        | BinaryOp::Equal
+        | BinaryOp::NotEqual
+        | BinaryOp::LogicalAnd
+        | BinaryOp::LogicalOr => Some(ExprMeta {
+            width: 1,
+            signed: false,
+            base: Base::Binary,
+        }),
+    }
+}
+
 // Static-semantics pre-pass. Every public expression-evaluation entry point
 // runs `semantic_check` before touching the evaluator, so structural errors
 // like real-typed select indices, $bitstoreal width mismatches, or invalid
@@ -31,15 +486,21 @@ struct ExprMeta {
 // stage is visible to the user, paralleling the "Syntax error: " prefix that
 // `parse_statements`'s call site adds to lexer/parser errors.
 pub(crate) fn semantic_check(expr: &Expr, session: &Session) -> Result<(), String> {
-    validate_expr_structure(expr, session).map_err(|e| format!("Semantic error: {e}"))
+    let annotated = annotate(expr, session).map_err(|e| format!("Semantic error: {e}"))?;
+    validate_annotated(&annotated, session).map_err(|e| format!("Semantic error: {e}"))
 }
 
 pub(crate) fn evaluate_expr(expr: &Expr, session: &Session) -> Result<Value, String> {
-    semantic_check(expr, session)?;
-    if expression_is_real(expr, session) {
+    let annotated = annotate(expr, session).map_err(|e| format!("Semantic error: {e}"))?;
+    validate_annotated(&annotated, session).map_err(|e| format!("Semantic error: {e}"))?;
+    if annotated.is_real() {
+        // Real path stays on the legacy &Expr walker — it's already O(N) and
+        // not on the chain hot path. Long real chains aren't representative
+        // of typical inputs and would land in this branch only with explicit
+        // real arithmetic.
         evaluate_expr_as_real(expr, session).map(Value::Real)
     } else {
-        evaluate_expr_in_context(expr, None, session).map(Value::Integer)
+        evaluate_annotated(&annotated, None, session).map(Value::Integer)
     }
 }
 
@@ -63,8 +524,9 @@ pub(crate) fn evaluate_assignment_rhs(
     base: Base,
     session: &Session,
 ) -> Result<IntegerValue, String> {
-    semantic_check(rhs, session)?;
-    if expression_is_real(rhs, session) {
+    let annotated = annotate(rhs, session).map_err(|e| format!("Semantic error: {e}"))?;
+    validate_annotated(&annotated, session).map_err(|e| format!("Semantic error: {e}"))?;
+    if annotated.is_real() {
         let real_val = evaluate_expr_as_real(rhs, session)?;
         return Ok(match real_to_integer_bigint(real_val) {
             Some(bigint) => IntegerValue::from_bigint(bigint, width, signed, base),
@@ -76,7 +538,7 @@ pub(crate) fn evaluate_assignment_rhs(
         signed,
         base,
     };
-    evaluate_expr_in_context(rhs, Some(context), session)
+    evaluate_annotated(&annotated, Some(context), session)
 }
 
 // Self-determined evaluation of an integer-typed constant expression
@@ -87,8 +549,9 @@ pub(crate) fn evaluate_constant_expr(
     expr: &Expr,
     session: &Session,
 ) -> Result<IntegerValue, String> {
-    semantic_check(expr, session)?;
-    evaluate_expr_in_context(expr, None, session)
+    let annotated = annotate(expr, session).map_err(|e| format!("Semantic error: {e}"))?;
+    validate_annotated(&annotated, session).map_err(|e| format!("Semantic error: {e}"))?;
+    evaluate_annotated(&annotated, None, session)
 }
 
 
@@ -730,6 +1193,255 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
     }
 }
 
+// Annotated counterpart to `validate_expr_structure`. Reads `is_real()` and
+// `meta()` from precomputed annotations instead of re-walking every Binary
+// node's lhs/rhs to ask the same questions, dropping the old O(N²) helper-walk
+// pattern to O(N) on long chains. Sub-expressions that aren't annotated yet
+// (index / range expressions inside `SelectKind`) are still validated by the
+// legacy `validate_expr_structure` — those are short, self-determined, and
+// outside the chain spine that drove the regression.
+fn validate_annotated(annot: &Annotated, session: &Session) -> Result<(), String> {
+    match &annot.kind {
+        AnnotatedKind::Leaf => match annot.expr {
+            Expr::Literal(_) | Expr::RealLiteral(_) => Ok(()),
+            Expr::SystemTask { name } => Err(task_in_expression_error(name)),
+            Expr::Identifier(name) => {
+                let reg = session
+                    .lookup(name)
+                    .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+                if reg.is_real() {
+                    Ok(())
+                } else {
+                    let _ = reg.require_vector(name)?;
+                    Ok(())
+                }
+            }
+            Expr::Select { name, kind, inner } => {
+                validate_select_expr_structure(name, kind, inner.as_deref(), session)
+            }
+            _ => unreachable!("AnnotatedKind::Leaf only wraps leaf-shaped Expr variants"),
+        },
+        AnnotatedKind::Grouped(inner) => validate_annotated(inner, session),
+        AnnotatedKind::Unary(operand) => {
+            validate_annotated(operand, session)?;
+            let op = match annot.expr {
+                Expr::Unary { op, .. } => *op,
+                _ => unreachable!("AnnotatedKind::Unary only wraps Expr::Unary"),
+            };
+            if operand.is_real()
+                && matches!(
+                    op,
+                    UnaryOp::BitwiseNot
+                        | UnaryOp::ReductionAnd
+                        | UnaryOp::ReductionNand
+                        | UnaryOp::ReductionOr
+                        | UnaryOp::ReductionNor
+                        | UnaryOp::ReductionXor
+                        | UnaryOp::ReductionXnor
+                )
+            {
+                return Err(format!(
+                    "operator {} not allowed on real operand",
+                    unary_op_name(op)
+                ));
+            }
+            Ok(())
+        }
+        AnnotatedKind::Binary { lhs, rhs } => {
+            validate_annotated(lhs, session)?;
+            validate_annotated(rhs, session)?;
+            let op = match annot.expr {
+                Expr::Binary { op, .. } => *op,
+                _ => unreachable!("AnnotatedKind::Binary only wraps Expr::Binary"),
+            };
+            if lhs.is_real() || rhs.is_real() {
+                match op {
+                    BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Power
+                    | BinaryOp::LessThan
+                    | BinaryOp::GreaterThan
+                    | BinaryOp::LessThanOrEqual
+                    | BinaryOp::GreaterThanOrEqual
+                    | BinaryOp::Equal
+                    | BinaryOp::NotEqual
+                    | BinaryOp::LogicalAnd
+                    | BinaryOp::LogicalOr => {}
+                    _ => {
+                        return Err(format!(
+                            "operator {} not allowed on real operand",
+                            binary_op_name(op)
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+        AnnotatedKind::Conditional {
+            cond,
+            then_arm,
+            else_arm,
+        } => {
+            validate_annotated(cond, session)?;
+            validate_annotated(then_arm, session)?;
+            validate_annotated(else_arm, session)
+        }
+        AnnotatedKind::Concatenation(items) => {
+            for item in items {
+                validate_annotated_concat_item(item, "concatenation", session)?;
+            }
+            // Bit-collection check still operates on raw Exprs because
+            // `collect_concatenation_bits` evaluates each item; we have the
+            // raw children on `annot.expr`.
+            if let Expr::Concatenation { items: raw_items } = annot.expr {
+                let _ = collect_concatenation_bits(raw_items, session)?;
+            }
+            Ok(())
+        }
+        AnnotatedKind::Replication { count, items } => {
+            let raw_items = match annot.expr {
+                Expr::Replication { items: raw_items, .. } => raw_items.as_slice(),
+                _ => unreachable!(),
+            };
+            validate_annotated_replication(
+                count,
+                items,
+                raw_items,
+                evaluate_replication_count,
+                session,
+            )
+        }
+        AnnotatedKind::SignCast(arg) => {
+            validate_annotated(arg, session)?;
+            let signed = match annot.expr {
+                Expr::SignCast { signed, .. } => *signed,
+                _ => unreachable!(),
+            };
+            if arg.is_real() {
+                return Err(format!(
+                    "{} argument cannot be real",
+                    if signed { "$signed" } else { "$unsigned" }
+                ));
+            }
+            Ok(())
+        }
+        AnnotatedKind::BaseCast(arg) => {
+            validate_annotated(arg, session)?;
+            let base = match annot.expr {
+                Expr::BaseCast { base, .. } => *base,
+                _ => unreachable!(),
+            };
+            if arg.is_real() {
+                return Err(format!("{} argument cannot be real", base_cast_name(base)));
+            }
+            Ok(())
+        }
+        AnnotatedKind::RealConversion(arg) => {
+            validate_annotated(arg, session)?;
+            let kind = match annot.expr {
+                Expr::RealConversion { kind, .. } => *kind,
+                _ => unreachable!(),
+            };
+            match kind {
+                RealConversionKind::RealToInteger | RealConversionKind::RealToBits => Ok(()),
+                RealConversionKind::IntegerToReal => {
+                    if arg.is_real() {
+                        return Err("$itor argument cannot be real".to_string());
+                    }
+                    Ok(())
+                }
+                RealConversionKind::BitsToReal => {
+                    if arg.is_real() {
+                        return Err("$bitstoreal argument cannot be real".to_string());
+                    }
+                    let arg_meta = arg.meta();
+                    if arg_meta.width != 64 {
+                        return Err(format!(
+                            "$bitstoreal argument must be 64 bits wide, got {}",
+                            arg_meta.width
+                        ));
+                    }
+                    Ok(())
+                }
+            }
+        }
+        AnnotatedKind::MathFunction(args) => {
+            for arg in args {
+                validate_annotated(arg, session)?;
+            }
+            let kind = match annot.expr {
+                Expr::MathFunction { kind, .. } => *kind,
+                _ => unreachable!(),
+            };
+            if kind.is_real_result() {
+                Ok(())
+            } else {
+                if args[0].is_real() {
+                    return Err(format!("{} argument cannot be real", kind.name()));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn validate_annotated_concat_item(
+    item: &Annotated,
+    role: &str,
+    session: &Session,
+) -> Result<(), String> {
+    // A direct `{N{...}}` operand of a concat list takes the lenient
+    // zero-permission rule from LRM 5.1.14. Grouped wrappers must be
+    // unwrapped first to match the shape `unwrap_grouped` looks for.
+    let unwrapped = unwrap_grouped_annotated(item);
+    if let AnnotatedKind::Replication { count, items } = &unwrapped.kind {
+        let raw_items = match unwrapped.expr {
+            Expr::Replication { items: raw_items, .. } => raw_items.as_slice(),
+            _ => unreachable!(),
+        };
+        return validate_annotated_replication(
+            count,
+            items,
+            raw_items,
+            evaluate_replication_count_allow_zero,
+            session,
+        );
+    }
+    validate_annotated(item, session)?;
+    if item.is_real() {
+        return Err(format!("{role} operand cannot be real"));
+    }
+    Ok(())
+}
+
+fn validate_annotated_replication(
+    count: &Annotated,
+    items: &[Annotated],
+    raw_items: &[Expr],
+    count_check: fn(&Expr, &Session) -> Result<usize, String>,
+    session: &Session,
+) -> Result<(), String> {
+    validate_annotated(count, session)?;
+    if count.is_real() {
+        return Err("replication count cannot be real".to_string());
+    }
+    for item in items {
+        validate_annotated_concat_item(item, "replication", session)?;
+    }
+    let _ = count_check(count.expr, session)?;
+    let _ = collect_concatenation_bits(raw_items, session)?;
+    Ok(())
+}
+
+fn unwrap_grouped_annotated<'a, 'b>(annot: &'b Annotated<'a>) -> &'b Annotated<'a> {
+    match &annot.kind {
+        AnnotatedKind::Grouped(inner) => unwrap_grouped_annotated(inner),
+        _ => annot,
+    }
+}
+
 fn unary_op_name(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Plus => "+",
@@ -843,6 +1555,256 @@ fn evaluate_expr_in_context(
                 None => value,
             })
         }
+    }
+}
+
+// Annotated-tree evaluator. Reuses the legacy `evaluate_expr_in_context` for
+// non-Binary nodes (which aren't in the chain spine that drove the O(N²)
+// regression) and routes Binary through `evaluate_binary_annotated`. Keeping
+// the dispatch function tiny (no inlined Binary body) and the helper
+// separate keeps each chain-level stack frame small in debug builds, where
+// a single match arm with the full Binary code would force the prologue to
+// reserve space for every locally-named value across every arm.
+fn evaluate_annotated(
+    annot: &Annotated,
+    context: Option<ExprMeta>,
+    session: &Session,
+) -> Result<IntegerValue, String> {
+    match &annot.kind {
+        AnnotatedKind::Binary { lhs, rhs } => {
+            let op = match annot.expr {
+                Expr::Binary { op, .. } => *op,
+                _ => unreachable!("AnnotatedKind::Binary only wraps Expr::Binary"),
+            };
+            evaluate_binary_annotated(op, lhs, rhs, context, session)
+        }
+        // Grouped is transparent — pass through to the inner annotation so
+        // a `(((a+b)))` chain stays on the Annotated path.
+        AnnotatedKind::Grouped(inner) => evaluate_annotated(inner, context, session),
+        // Every other shape falls back to the legacy &Expr-based dispatch.
+        // These aren't in the chain hot path, so their internal helper walks
+        // remain O(subtree size) — fine for everything that isn't a chain.
+        _ => evaluate_expr_in_context(annot.expr, context, session),
+    }
+}
+
+// Binary evaluation off the annotated tree. The structural rules match
+// `evaluate_binary_expr`; the only difference is that lhs/rhs metas and
+// real-typed flags come from `Annotated` (O(1) reads) instead of fresh
+// recursive walks of the subtrees.
+fn evaluate_binary_annotated(
+    op: BinaryOp,
+    lhs: &Annotated,
+    rhs: &Annotated,
+    context: Option<ExprMeta>,
+    session: &Session,
+) -> Result<IntegerValue, String> {
+    // LRM Table 5-3: real-operand routing into the relational / equality /
+    // logical helpers, mirroring the head of `evaluate_binary_expr`.
+    if lhs.is_real() || rhs.is_real() {
+        match op {
+            BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Divide
+            | BinaryOp::Power => {
+                unreachable!("real arithmetic should be handled by the real path")
+            }
+            BinaryOp::Modulus
+            | BinaryOp::CaseEqual
+            | BinaryOp::CaseNotEqual
+            | BinaryOp::BitwiseAnd
+            | BinaryOp::BitwiseOr
+            | BinaryOp::BitwiseXor
+            | BinaryOp::BitwiseXnor
+            | BinaryOp::LogicalShiftLeft
+            | BinaryOp::LogicalShiftRight
+            | BinaryOp::ArithmeticShiftLeft
+            | BinaryOp::ArithmeticShiftRight => {
+                unreachable!(
+                    "validator rejects real operand of {} before evaluation",
+                    binary_op_name(op)
+                );
+            }
+            BinaryOp::LessThan
+            | BinaryOp::GreaterThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThanOrEqual => {
+                return evaluate_real_relational_expr(op, lhs.expr, rhs.expr, context, session);
+            }
+            BinaryOp::Equal | BinaryOp::NotEqual => {
+                return evaluate_real_equality_expr(op, lhs.expr, rhs.expr, context, session);
+            }
+            BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
+                return evaluate_real_logical_expr(op, lhs.expr, rhs.expr, context, session);
+            }
+        }
+    }
+
+    let lhs_meta = lhs.meta();
+    let rhs_meta = rhs.meta();
+
+    if matches!(
+        op,
+        BinaryOp::LessThan
+            | BinaryOp::GreaterThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThanOrEqual
+    ) {
+        return evaluate_relational_expr(
+            op, lhs.expr, rhs.expr, lhs_meta, rhs_meta, context, session,
+        );
+    }
+
+    if matches!(
+        op,
+        BinaryOp::Equal | BinaryOp::NotEqual | BinaryOp::CaseEqual | BinaryOp::CaseNotEqual
+    ) {
+        return evaluate_equality_expr(
+            op, lhs.expr, rhs.expr, lhs_meta, rhs_meta, context, session,
+        );
+    }
+
+    if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
+        return evaluate_logical_expr(op, lhs.expr, rhs.expr, context, session);
+    }
+
+    if matches!(
+        op,
+        BinaryOp::LogicalShiftLeft
+            | BinaryOp::LogicalShiftRight
+            | BinaryOp::ArithmeticShiftLeft
+            | BinaryOp::ArithmeticShiftRight
+    ) {
+        return evaluate_shift_expr(op, lhs.expr, rhs.expr, lhs_meta, context, session);
+    }
+
+    let meta = combine_binary_meta(op, lhs_meta, rhs_meta);
+    let effective_meta = ExprMeta {
+        width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
+        signed: meta.signed,
+        base: meta.base,
+    };
+
+    match op {
+        BinaryOp::Add
+        | BinaryOp::Subtract
+        | BinaryOp::Multiply
+        | BinaryOp::Divide
+        | BinaryOp::Modulus => {
+            // Recurse on the Annotated children — keeps the chain spine on
+            // the O(1)-per-level path.
+            let lhs_value = evaluate_annotated(lhs, Some(effective_meta), session)?;
+            let rhs_value = evaluate_annotated(rhs, Some(effective_meta), session)?;
+
+            if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
+                return Ok(IntegerValue::all_x(
+                    effective_meta.width,
+                    meta.signed,
+                    meta.base,
+                ));
+            }
+
+            let lhs_int = lhs_value.as_bigint(meta.signed);
+            let rhs_int = rhs_value.as_bigint(meta.signed);
+            let result = match op {
+                BinaryOp::Add => lhs_int + rhs_int,
+                BinaryOp::Subtract => lhs_int - rhs_int,
+                BinaryOp::Multiply => lhs_int * rhs_int,
+                BinaryOp::Divide => {
+                    if rhs_int.is_zero() {
+                        return Ok(IntegerValue::all_x(
+                            effective_meta.width,
+                            meta.signed,
+                            meta.base,
+                        ));
+                    }
+                    lhs_int / rhs_int
+                }
+                BinaryOp::Modulus => {
+                    if rhs_int.is_zero() {
+                        return Ok(IntegerValue::all_x(
+                            effective_meta.width,
+                            meta.signed,
+                            meta.base,
+                        ));
+                    }
+                    lhs_int % rhs_int
+                }
+                _ => unreachable!("handled by outer match"),
+            };
+
+            Ok(IntegerValue::from_bigint(
+                result,
+                effective_meta.width,
+                meta.signed,
+                meta.base,
+            ))
+        }
+        BinaryOp::Power => {
+            let lhs_context = ExprMeta {
+                width: effective_meta.width,
+                signed: lhs_meta.signed,
+                base: lhs_meta.base,
+            };
+            let lhs_value = evaluate_annotated(lhs, Some(lhs_context), session)?;
+            let rhs_value = evaluate_annotated(rhs, Some(rhs_meta), session)?;
+
+            if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
+                return Ok(IntegerValue::all_x(
+                    effective_meta.width,
+                    lhs_meta.signed,
+                    lhs_meta.base,
+                ));
+            }
+
+            let base_value = lhs_value.as_bigint(lhs_meta.signed);
+            let exponent_value = evaluate_expr_as_math_bigint(rhs.expr, session)?;
+            let result = match evaluate_power(base_value, exponent_value) {
+                Ok(result) => result,
+                Err(_) => {
+                    return Ok(IntegerValue::all_x(
+                        effective_meta.width,
+                        lhs_meta.signed,
+                        lhs_meta.base,
+                    ));
+                }
+            };
+
+            Ok(IntegerValue::from_bigint(
+                result,
+                effective_meta.width,
+                lhs_meta.signed,
+                lhs_meta.base,
+            ))
+        }
+        BinaryOp::BitwiseAnd | BinaryOp::BitwiseOr | BinaryOp::BitwiseXor | BinaryOp::BitwiseXnor => {
+            let lhs_value = evaluate_annotated(lhs, Some(effective_meta), session)?;
+            let rhs_value = evaluate_annotated(rhs, Some(effective_meta), session)?;
+
+            let combine = match op {
+                BinaryOp::BitwiseAnd => bitwise_and_bits,
+                BinaryOp::BitwiseOr => bitwise_or_bits,
+                BinaryOp::BitwiseXor => bitwise_xor_bits,
+                BinaryOp::BitwiseXnor => bitwise_xnor_bits,
+                _ => unreachable!("guarded by outer match"),
+            };
+
+            let bits: Vec<LogicBit> = lhs_value
+                .bits
+                .iter()
+                .zip(rhs_value.bits.iter())
+                .map(|(l, r)| combine(*l, *r))
+                .collect();
+
+            Ok(IntegerValue::computed(
+                effective_meta.width,
+                effective_meta.signed,
+                effective_meta.base,
+                bits,
+            ))
+        }
+        _ => unreachable!("non-arith / non-bitwise / non-power Binary handled above"),
     }
 }
 

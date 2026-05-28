@@ -7181,3 +7181,32 @@ fn real_decl_failed_init_leaves_session_untouched() {
     let err = session.eval("r").expect_err("r never committed");
     assert!(err.contains("undeclared"));
 }
+
+#[test]
+fn long_addition_chain_evaluates_without_quadratic_blowup() {
+    // Regression for the O(N²) helper-walk pattern: validation and
+    // evaluation used to call `expression_is_real` and `infer_expr_meta`
+    // on lhs/rhs at every Binary node, each one a fresh recursive
+    // subtree walk. The annotated-AST refactor caches both up front so
+    // each chain level is O(1).
+    //
+    // Run on a dedicated thread with a 16 MB stack so the test exercises
+    // a chain depth (N=2000) the recursive walker survives but where the
+    // pre-fix O(N²) work would have shown obvious super-linear slowdown
+    // — this size also exceeded the pre-fix debug-build stack threshold
+    // (~1500-2000 frames), so the test would have crashed under the old
+    // code. cargo test's default 2 MB test-thread stack is too small for
+    // even the post-fix walker at this depth, hence the spawn.
+    let handle = std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            let chain: String = std::iter::once("1".to_string())
+                .chain(std::iter::repeat("+1".to_string()).take(2000))
+                .collect();
+            let evaluation =
+                evaluate_input(&chain).expect("2001-term chain should evaluate");
+            assert_eq!(evaluation.output, "32'sd2001");
+        })
+        .expect("spawn worker thread");
+    handle.join().expect("chain test thread panicked");
+}
