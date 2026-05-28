@@ -1090,6 +1090,7 @@ fn infer_select_meta(
         let (_, elements) = reg
             .array()
             .expect("is_array() => array() returns Some");
+        debug_assert!(!elements.is_empty());
         let template = &elements[0];
         if let Some(inner_kind) = inner {
             let element_range = reg.range.as_ref().ok_or_else(|| {
@@ -2849,6 +2850,7 @@ fn evaluate_array_element_select(
     // fallback can read its width/signed/base off any one of them. The
     // dim's width is always >= 1 (RegRange::width enforces that at
     // decl time), so `elements[0]` always exists.
+    debug_assert!(!elements.is_empty());
     let template = &elements[0];
     let index_value = evaluate_expr_in_context(index, None, session)?;
     if index_value.has_unknown_bits() {
@@ -2910,6 +2912,7 @@ fn evaluate_array_chained_select(
     let range = reg.range.as_ref().ok_or_else(|| {
         format!("bit-select or part-select on scalar array element `{name}` is illegal")
     })?;
+    debug_assert!(!elements.is_empty());
     let template = &elements[0];
     let element = {
         let index_value = evaluate_expr_in_context(index, None, session)?;
@@ -3317,6 +3320,7 @@ fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
                 let (_, elements) = reg
                     .array()
                     .expect("is_array() => array() returns Some");
+                debug_assert!(!elements.is_empty());
                 let template = &elements[0];
                 if let Some(inner_kind) = inner {
                     // `a[i][...]` — inner select runs against the
@@ -3598,6 +3602,7 @@ fn leaf_target(leaf: &LValue, session: &Session) -> Result<LeafTarget, String> {
                 } else {
                     // Whole-element write — every internal bit is
                     // present (LSB-first).
+                    debug_assert!(!elements.is_empty());
                     let template = &elements[0];
                     (0..template.width).map(Some).collect()
                 };

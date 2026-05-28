@@ -535,24 +535,21 @@ fn apply_assign(
     lvalue: &LValue,
     rhs: &Expr,
 ) -> Result<(String, bool), String> {
-    if let LValue::Name(name) = lvalue {
-        if let Some(reg) = session.lookup(name) {
-            if reg.is_real() {
-                return apply_real_assign(session, name, rhs);
-            }
-        }
+    if let LValue::Name(name) = lvalue
+        && let Some(reg) = session.lookup(name)
+        && reg.is_real()
+    {
+        return apply_real_assign(session, name, rhs);
     }
     if let LValue::Select {
         name,
         kind: SelectKind::Bit { index },
         inner: None,
     } = lvalue
+        && let Some(reg) = session.lookup(name)
+        && reg.is_real_array()
     {
-        if let Some(reg) = session.lookup(name) {
-            if reg.is_real_array() {
-                return apply_real_array_element_assign(session, name, index, rhs);
-            }
-        }
+        return apply_real_array_element_assign(session, name, index, rhs);
     }
     let (staged, displayed) = eval::evaluate_lvalue_assignment(lvalue, rhs, session)?;
     session.variables = staged;

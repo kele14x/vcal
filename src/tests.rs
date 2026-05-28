@@ -6568,6 +6568,33 @@ fn array_element_lhs_concat_with_two_array_element_leaves() {
 }
 
 #[test]
+fn array_element_lhs_concat_xz_index_drops_element_but_cursor_advances() {
+    // When an array-element leaf in a concat LHS has an x/z outer index,
+    // LRM 4.2.1 says "no assignment performed" — but the bit cursor must
+    // still advance by the leaf's nominal width so adjacent leaves receive
+    // the correct bits. Here `{a[1'bx], b} = 8'b11110000`: a[x] is
+    // dropped (4 bits consumed silently), and `b` receives the low nibble.
+    let mut session = Session::new();
+    session.eval("reg [3:0] a [0:3]").expect("decl a");
+    session.eval("reg [3:0] b").expect("decl b");
+    session.eval("a[0] = 4'b1010").expect("seed a[0]");
+    assert_eq!(
+        session
+            .eval("{a[1'bx], b} = 8'b11110000")
+            .expect("concat with x-index")
+            .output,
+        "8'b11110000"
+    );
+    // b receives the low nibble correctly despite the dropped leaf.
+    assert_eq!(session.eval("b").expect("b").output, "4'b0000");
+    // a[0] is untouched (the x-index doesn't accidentally hit it).
+    assert_eq!(session.eval("a[0]").expect("a[0] preserved").output, "4'b1010");
+    // All other array elements remain at their default x.
+    assert_eq!(session.eval("a[1]").expect("a[1]").output, "4'bxxxx");
+    assert_eq!(session.eval("a[2]").expect("a[2]").output, "4'bxxxx");
+}
+
+#[test]
 fn array_element_lhs_concat_atomic_failure_leaves_state_intact() {
     // A structural error on one concat leaf (here: chained select on a
     // non-array vector) must abort the whole assignment — even though
