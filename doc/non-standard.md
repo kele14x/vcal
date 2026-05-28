@@ -2,6 +2,10 @@
 
 vcal-specific divergences from IEEE 1364-2005. Full operator rules live in [operators.md](operators.md); variable rules in [variables.md](variables.md).
 
+## Top-level input
+
+The LRM defines `statement ::= blocking_assignment ; | system_task_enable` inside a module, with declarations at the module-item level (Annex A.2). vcal has no module wrapper and no separate elaboration stage, so the REPL accepts a flat top-level stream `{ statement | system_task_enable | declaration | expression }`. `declaration` (`reg`, `integer`, `real`) is hoisted from module-item level so users can introduce a variable without a module. `expression` lets a bare expression like `a + 1` evaluate and display its value — the calculator-mode behavior, which has no LRM counterpart.
+
 ## Trailing semicolons
 
 The Verilog LRM requires a trailing semicolon for each statement. This is annoying for a calculator app. vcal accepts an optional trailing semicolon. Users may use a trailing semicolon to explicitly end the input phase and force the app to evaluate the input (works together with multi-line edit).
