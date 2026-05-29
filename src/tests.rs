@@ -7190,25 +7190,13 @@ fn long_addition_chain_evaluates_without_quadratic_blowup() {
     // subtree walk. The annotated-AST refactor caches both up front so
     // each chain level is O(1).
     //
-    // Run on a dedicated thread with a 16 MB stack so the test exercises
-    // a chain depth (N=2000) the recursive walker survives but where the
-    // pre-fix O(N²) work would have shown obvious super-linear slowdown
-    // — this size also exceeded the pre-fix debug-build stack threshold
-    // (~1500-2000 frames), so the test would have crashed under the old
-    // code. cargo test's default 2 MB test-thread stack is too small for
-    // even the post-fix walker at this depth, hence the spawn.
-    let handle = std::thread::Builder::new()
-        .stack_size(64 * 1024 * 1024)
-        .spawn(|| {
-            let chain: String = std::iter::once("1".to_string())
-                .chain(std::iter::repeat("+1".to_string()).take(2000))
-                .collect();
-            let evaluation =
-                evaluate_input(&chain).expect("2001-term chain should evaluate");
-            assert_eq!(evaluation.output, "32'sd2001");
-        })
-        .expect("spawn worker thread");
-    handle.join().expect("chain test thread panicked");
+    // Now that `evaluate_annotated` is iterative (no Rust stack frame
+    // per chain level), this runs on the default 2 MB test thread.
+    let chain: String = std::iter::once("1".to_string())
+        .chain(std::iter::repeat_n("+1".to_string(), 2000))
+        .collect();
+    let evaluation = evaluate_input(&chain).expect("2001-term chain should evaluate");
+    assert_eq!(evaluation.output, "32'sd2001");
 }
 
 #[test]
@@ -7291,6 +7279,237 @@ fn drop_of_deep_binary_ast_does_not_overflow() {
         };
     }
     drop(e);
+}
+
+#[test]
+fn annotate_of_deep_grouped_does_not_overflow() {
+    // Pre-fix: `annotate` recursed on `Expr::Grouped(inner)` once per
+    // layer, so a 10^5-deep parens chain crashed before any
+    // validator/evaluator pass even started. The iterative CES driver
+    // bounds Rust stack to O(1) regardless of input depth, and `impl
+    // Drop for Annotated` keeps the resulting deep `Box<Annotated>`
+    // chain from crashing at end-of-scope. Runs on the default 2 MB
+    // test thread.
+    let mut e = Expr::Literal(parse_integer("1").expect("literal should parse"));
+    for _ in 0..100_000 {
+        e = Expr::Grouped(Box::new(e));
+    }
+    let session = Session::new();
+    let annotated = crate::eval::annotate(&e, &session).expect("deep grouped annotates");
+    drop(annotated);
+}
+
+#[test]
+fn annotate_of_deep_binary_does_not_overflow() {
+    // Same shape as the Grouped test, but exercising the Binary arm of
+    // the CES driver (one Combine + two child Visits per level).
+    let mut e = Expr::Literal(parse_integer("1").expect("literal should parse"));
+    for _ in 0..100_000 {
+        e = Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(e),
+            rhs: Box::new(Expr::Literal(parse_integer("1").expect("literal should parse"))),
+        };
+    }
+    let session = Session::new();
+    let annotated = crate::eval::annotate(&e, &session).expect("deep binary annotates");
+    drop(annotated);
+}
+
+#[test]
+fn annotate_of_deep_unary_does_not_overflow() {
+    // Exercises the Unary arm of the CES driver. `LogicalNot` keeps the
+    // result-type meta computation simple (always 1-bit unsigned) while
+    // still walking the same Visit/Combine path as the deeper unary
+    // ops.
+    let mut e = Expr::Literal(parse_integer("1").expect("literal should parse"));
+    for _ in 0..100_000 {
+        e = Expr::Unary {
+            op: UnaryOp::LogicalNot,
+            expr: Box::new(e),
+        };
+    }
+    let session = Session::new();
+    let annotated = crate::eval::annotate(&e, &session).expect("deep unary annotates");
+    drop(annotated);
+}
+
+#[test]
+fn semantic_check_of_deep_grouped_does_not_overflow() {
+    // semantic_check = annotate + validate_annotated. With both
+    // iterative, a 10^5-deep Grouped chain validates on the default
+    // 2 MB test thread. The evaluator is still recursive in this
+    // phase, so we can't go through evaluate_input here.
+    let mut e = Expr::Literal(parse_integer("1").expect("literal should parse"));
+    for _ in 0..100_000 {
+        e = Expr::Grouped(Box::new(e));
+    }
+    let session = Session::new();
+    crate::eval::semantic_check(&e, &session).expect("deep grouped semantic-checks");
+}
+
+#[test]
+fn semantic_check_of_deep_binary_does_not_overflow() {
+    // Exercises validate_annotated's Binary arm + the iterative
+    // expression_is_real / infer_expr_meta walks that fire for binary
+    // operators with real-rejection rules.
+    let mut e = Expr::Literal(parse_integer("1").expect("literal should parse"));
+    for _ in 0..100_000 {
+        e = Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(e),
+            rhs: Box::new(Expr::Literal(parse_integer("1").expect("literal should parse"))),
+        };
+    }
+    let session = Session::new();
+    crate::eval::semantic_check(&e, &session).expect("deep binary semantic-checks");
+}
+
+#[test]
+fn semantic_check_of_deep_conditional_does_not_overflow() {
+    // Right-recursive Conditional spine (else-arm chain) — the shape
+    // produced by `1?1:1?1:...0`. Exercises validate_annotated's
+    // Conditional arm at depth.
+    let mut e = Expr::Literal(parse_integer("0").expect("literal should parse"));
+    for _ in 0..100_000 {
+        e = Expr::Conditional {
+            cond: Box::new(Expr::Literal(parse_integer("1").expect("literal should parse"))),
+            then_expr: Box::new(Expr::Literal(parse_integer("1").expect("literal should parse"))),
+            else_expr: Box::new(e),
+        };
+    }
+    let session = Session::new();
+    crate::eval::semantic_check(&e, &session).expect("deep conditional semantic-checks");
+}
+
+// End-to-end deep-chain regression suite. Every test runs on the default
+// 2 MB cargo-test thread and exercises the full annotate → validate →
+// evaluate pipeline through `evaluate_input`. Pre-fix (depth ~2000), most
+// of these crashed with "fatal runtime error: stack overflow"; post-fix
+// they evaluate cleanly. Depth 10^5 matches the existing parser / Drop
+// suite at the top of this file.
+
+// End-to-end deep-chain tests run on cargo's 2 MB test thread. The depth
+// is set high enough to crash the pre-fix code (recursive walkers crashed
+// at ~1500-2000 levels) but low enough to fit comfortably under the 2 MB
+// budget in debug builds, where each parser/eval frame consumes ~80 bytes
+// of stack space. Release builds and direct-build tests (the
+// `*_does_not_overflow` suite above, which constructs Expr trees in
+// memory) handle 10^5 depths.
+const DEEP_CHAIN_DEPTH: usize = 10_000;
+
+#[test]
+fn deep_binary_integer_chain_evaluates() {
+    // `1+1+...+1` — left-associative integer chain. Hits the
+    // BinaryArith Combine in the CES driver.
+    let n = DEEP_CHAIN_DEPTH;
+    let chain: String = std::iter::once("1".to_string())
+        .chain(std::iter::repeat_n("+1".to_string(), n))
+        .collect();
+    let evaluation = evaluate_input(&chain).expect("deep + chain evaluates");
+    assert_eq!(evaluation.output, format!("32'sd{}", n + 1));
+}
+
+#[test]
+fn deep_grouped_chain_evaluates() {
+    // `((((...1...))))`. Hits the AnnotatedKind::Grouped pass-through
+    // in the CES driver and the iterative `Drop for Annotated`.
+    let n = DEEP_CHAIN_DEPTH;
+    let input: String = "(".repeat(n) + "1" + &")".repeat(n);
+    let evaluation = evaluate_input(&input).expect("deep grouped evaluates");
+    assert_eq!(evaluation.output, "32'sd1");
+}
+
+#[test]
+fn deep_unary_logical_not_chain_evaluates() {
+    // `!!!!...!1`. Hits the UnaryLogicalNot Combine in the CES driver.
+    // Even-depth chain reduces to `1`, odd-depth to `0` (each `!` flips).
+    let n = DEEP_CHAIN_DEPTH;
+    let input: String = "!".repeat(n) + "1";
+    let evaluation = evaluate_input(&input).expect("deep ! chain evaluates");
+    let expected = if n.is_multiple_of(2) { "1'b1" } else { "1'b0" };
+    assert_eq!(evaluation.output, expected);
+}
+
+#[test]
+fn deep_unary_minus_chain_evaluates() {
+    // `---...-1`. Hits the UnaryArith (Minus) Combine. Each `-` flips
+    // the sign; even-depth ⇒ original, odd-depth ⇒ negated.
+    let n = DEEP_CHAIN_DEPTH;
+    let input: String = "-".repeat(n) + "1";
+    let evaluation = evaluate_input(&input).expect("deep unary minus chain evaluates");
+    let expected = if n.is_multiple_of(2) { "32'sd1" } else { "-32'sd1" };
+    assert_eq!(evaluation.output, expected);
+}
+
+#[test]
+fn deep_conditional_else_chain_evaluates() {
+    // `1?1:1?1:...:0`. Right-recursive on the else arm. cond=1 at every
+    // level so the chosen branch is the leftmost `then` (1). Tests
+    // ConditionalChoose + ConditionalFinalize Combines.
+    let n = DEEP_CHAIN_DEPTH;
+    let mut input = String::with_capacity(n * 6);
+    for _ in 0..n {
+        input.push_str("1 ? 1 : ");
+    }
+    input.push('0');
+    let evaluation = evaluate_input(&input).expect("deep ?: chain evaluates");
+    assert_eq!(evaluation.output, "32'sd1");
+}
+
+#[test]
+fn deep_relational_chain_evaluates() {
+    // `1 < 1 < 1 < ... < 1`. Left-associative chain of `<`. The
+    // BinaryRelational Combine handles each level on the iterative path.
+    let n = DEEP_CHAIN_DEPTH;
+    let chain: String = std::iter::once("1".to_string())
+        .chain(std::iter::repeat_n("<1".to_string(), n))
+        .collect();
+    evaluate_input(&chain).expect("deep < chain evaluates");
+}
+
+#[test]
+fn deep_real_addition_chain_evaluates() {
+    // `1.0 + 1.0 + ... + 1.0`. Hits evaluate_expr_as_real's iterative
+    // CES driver with the BinaryArith real Combine.
+    let n = DEEP_CHAIN_DEPTH;
+    let chain: String = std::iter::once("1.0".to_string())
+        .chain(std::iter::repeat_n("+1.0".to_string(), n))
+        .collect();
+    let evaluation = evaluate_input(&chain).expect("deep real + chain evaluates");
+    let expected = format!("{:?}", (n + 1) as f64);
+    assert_eq!(evaluation.output, expected);
+}
+
+#[test]
+fn deep_power_exponent_chain_evaluates() {
+    // `2 ** (1+1+...+1)`. The exponent goes through
+    // evaluate_expr_as_math_bigint which is iterative as of P5.
+    let n = DEEP_CHAIN_DEPTH;
+    let inner: String = std::iter::once("1".to_string())
+        .chain(std::iter::repeat_n("+1".to_string(), n))
+        .collect();
+    let chain = format!("2 ** ({inner})");
+    evaluate_input(&chain).expect("deep power exponent evaluates");
+}
+
+#[test]
+fn deep_select_index_chain_evaluates() {
+    // `r[1+1+...+1]` — bit-select index is a deep chain. Hits the
+    // iterative `evaluate_select_subexpr` path that replaced the
+    // recursive `evaluate_expr_in_context` call inside
+    // `evaluate_bit_select`.
+    let n = DEEP_CHAIN_DEPTH;
+    let mut session = Session::new();
+    session.eval("reg [3:0] r").expect("decl");
+    let chain: String = std::iter::once("1".to_string())
+        .chain(std::iter::repeat_n("+1".to_string(), n))
+        .collect();
+    let outcome = session
+        .eval(&format!("r[{chain}]"))
+        .expect("deep select index evaluates");
+    // Index out of range → 1'bx (LRM 4.2.1).
+    assert_eq!(outcome.output, "1'bx");
 }
 
 #[test]
