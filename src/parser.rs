@@ -404,6 +404,56 @@ pub(crate) enum BinaryOp {
     ArithmeticShiftRight,
 }
 
+// Verilog binary-operator precedence per LRM Table 5-4. Higher binds
+// tighter; the `(lbp, rbp)` pair is the standard Pratt left/right
+// binding-power encoding — left-associative ops use `rbp = lbp + 1` (so a
+// same-precedence operator on the right doesn't bind onto the rhs),
+// right-associative ops use `rbp <= lbp`. `**` is left-associative here
+// to preserve the previous `parse_power` behavior (the LRM 1364-2005
+// Table 22 pins unary tighter than `**`, but does not mandate
+// associativity of `**` itself; iverilog evaluates left-to-right).
+//
+// Returns `None` for any token that isn't a binary operator — the Pratt
+// loop uses that as the signal to stop extending an expression.
+fn infix_binding_power(token: &Token) -> Option<(BinaryOp, u8, u8)> {
+    let (op, lbp, rbp) = match token {
+        Token::LogicalOr => (BinaryOp::LogicalOr, 20, 21),
+        Token::LogicalAnd => (BinaryOp::LogicalAnd, 30, 31),
+        Token::BitwiseOr => (BinaryOp::BitwiseOr, 40, 41),
+        Token::BitwiseXor => (BinaryOp::BitwiseXor, 50, 51),
+        Token::BitwiseXnor => (BinaryOp::BitwiseXnor, 50, 51),
+        Token::BitwiseAnd => (BinaryOp::BitwiseAnd, 60, 61),
+        Token::EqualEqual => (BinaryOp::Equal, 70, 71),
+        Token::NotEqual => (BinaryOp::NotEqual, 70, 71),
+        Token::CaseEqual => (BinaryOp::CaseEqual, 70, 71),
+        Token::CaseNotEqual => (BinaryOp::CaseNotEqual, 70, 71),
+        Token::Less => (BinaryOp::LessThan, 80, 81),
+        Token::Greater => (BinaryOp::GreaterThan, 80, 81),
+        Token::LessEqual => (BinaryOp::LessThanOrEqual, 80, 81),
+        Token::GreaterEqual => (BinaryOp::GreaterThanOrEqual, 80, 81),
+        Token::LogicalShiftLeft => (BinaryOp::LogicalShiftLeft, 90, 91),
+        Token::LogicalShiftRight => (BinaryOp::LogicalShiftRight, 90, 91),
+        Token::ArithmeticShiftLeft => (BinaryOp::ArithmeticShiftLeft, 90, 91),
+        Token::ArithmeticShiftRight => (BinaryOp::ArithmeticShiftRight, 90, 91),
+        Token::Plus => (BinaryOp::Add, 100, 101),
+        Token::Minus => (BinaryOp::Subtract, 100, 101),
+        Token::Star => (BinaryOp::Multiply, 110, 111),
+        Token::Slash => (BinaryOp::Divide, 110, 111),
+        Token::Percent => (BinaryOp::Modulus, 110, 111),
+        Token::Power => (BinaryOp::Power, 120, 121),
+        _ => return None,
+    };
+    Some((op, lbp, rbp))
+}
+
+// `?:` ternary precedence per LRM Table 5-4: sits below `||`, right-
+// associative. Special-cased in `parse_expr_bp` because the right-hand
+// side has two parts (then/else) instead of one. Right-associative
+// chaining (`a ? b : c ? d : e` → `a ? b : (c ? d : e)`) falls out of
+// recursing into the else branch with `min_bp = COND_RBP < COND_LBP`.
+const COND_LBP: u8 = 10;
+const COND_RBP: u8 = 9;
+
 struct Parser<'a> {
     tokens: &'a [Token],
     index: usize,
@@ -456,7 +506,62 @@ pub(crate) fn parse_statements(input: &str) -> Result<Vec<Stmt>, String> {
 
 impl<'a> Parser<'a> {
     fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_conditional()
+        self.parse_expr_bp(0)
+    }
+
+    // Pratt-style precedence climb: replaces the previous 12-function
+    // precedence ladder (parse_conditional → parse_logical_or → ... →
+    // parse_power) with one loop driven by `infix_binding_power`. Same parse
+    // tree as before — left-associativity, right-associative `?:`, and the
+    // historical left-to-right `**` are all preserved by the (lbp, rbp)
+    // table at the top of this module.
+    //
+    // `min_bp` is the lowest binding power this call will accept. An infix
+    // operator with `lbp < min_bp` is left for the caller to bind, which is
+    // how the precedence ordering and right-associativity emerge.
+    //
+    // The `?:` ternary is special-cased rather than table-driven because its
+    // right-hand side has two operand slots (`then` and `else`), separated
+    // by `:`. The middle parses at `min_bp = 0` (anchored by the upcoming
+    // `:`), and the else branch parses at `min_bp = COND_RBP` so chained
+    // `a ? b : c ? d : e` becomes `a ? b : (c ? d : e)`.
+    fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr, String> {
+        let mut lhs = self.parse_unary()?;
+
+        loop {
+            if matches!(self.peek(), Some(Token::Question)) && COND_LBP >= min_bp {
+                self.index += 1;
+                let then_expr = self.parse_expr_bp(0)?;
+                match self.next() {
+                    Some(Token::Colon) => {}
+                    _ => return Err("expected `:` in conditional expression".to_string()),
+                }
+                let else_expr = self.parse_expr_bp(COND_RBP)?;
+                lhs = Expr::Conditional {
+                    cond: Box::new(lhs),
+                    then_expr: Box::new(then_expr),
+                    else_expr: Box::new(else_expr),
+                };
+                continue;
+            }
+
+            let (op, lbp, rbp) = match self.peek().and_then(infix_binding_power) {
+                Some(triple) => triple,
+                None => break,
+            };
+            if lbp < min_bp {
+                break;
+            }
+            self.index += 1;
+            let rhs = self.parse_expr_bp(rbp)?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+
+        Ok(lhs)
     }
 
     // Statement-level dispatch (LRM A.2.1.3 reg decl / A.6.2 blocking
@@ -643,254 +748,6 @@ impl<'a> Parser<'a> {
             range,
             names,
         })
-    }
-
-    // LRM Table 5-4: `?:` sits below `||`, above the lowest level.
-    // Right-associative — the middle parses as a full expression so a
-    // nested `?:` in the middle is anchored by the upcoming `:`, and the
-    // else recurses into parse_conditional so `a ? b : c ? d : e` becomes
-    // `a ? b : (c ? d : e)`.
-    fn parse_conditional(&mut self) -> Result<Expr, String> {
-        let cond = self.parse_logical_or()?;
-        if !matches!(self.peek(), Some(Token::Question)) {
-            return Ok(cond);
-        }
-        self.index += 1;
-        let then_expr = self.parse_expression()?;
-        match self.next() {
-            Some(Token::Colon) => {}
-            _ => return Err("expected `:` in conditional expression".to_string()),
-        }
-        let else_expr = self.parse_conditional()?;
-        Ok(Expr::Conditional {
-            cond: Box::new(cond),
-            then_expr: Box::new(then_expr),
-            else_expr: Box::new(else_expr),
-        })
-    }
-
-    fn parse_logical_or(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_logical_and()?;
-
-        while matches!(self.peek(), Some(Token::LogicalOr)) {
-            self.index += 1;
-            let rhs = self.parse_logical_and()?;
-            expression = Expr::Binary {
-                op: BinaryOp::LogicalOr,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
-    }
-
-    fn parse_logical_and(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_bitwise_or()?;
-
-        while matches!(self.peek(), Some(Token::LogicalAnd)) {
-            self.index += 1;
-            let rhs = self.parse_bitwise_or()?;
-            expression = Expr::Binary {
-                op: BinaryOp::LogicalAnd,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
-    }
-
-    // LRM Table 5-4: bitwise binary band sits between `&&` and `==`, with
-    // internal order `&` (tightest) > `^` `~^` `^~` > `|` (loosest).
-    fn parse_bitwise_or(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_bitwise_xor()?;
-
-        while matches!(self.peek(), Some(Token::BitwiseOr)) {
-            self.index += 1;
-            let rhs = self.parse_bitwise_xor()?;
-            expression = Expr::Binary {
-                op: BinaryOp::BitwiseOr,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
-    }
-
-    fn parse_bitwise_xor(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_bitwise_and()?;
-
-        while matches!(self.peek(), Some(Token::BitwiseXor | Token::BitwiseXnor)) {
-            let op = match self.peek() {
-                Some(Token::BitwiseXor) => BinaryOp::BitwiseXor,
-                Some(Token::BitwiseXnor) => BinaryOp::BitwiseXnor,
-                _ => unreachable!("guarded by while condition"),
-            };
-            self.index += 1;
-            let rhs = self.parse_bitwise_and()?;
-            expression = Expr::Binary {
-                op,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
-    }
-
-    fn parse_bitwise_and(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_equality()?;
-
-        while matches!(self.peek(), Some(Token::BitwiseAnd)) {
-            self.index += 1;
-            let rhs = self.parse_equality()?;
-            expression = Expr::Binary {
-                op: BinaryOp::BitwiseAnd,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
-    }
-
-    fn parse_equality(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_relational()?;
-
-        loop {
-            let op = match self.peek() {
-                Some(Token::EqualEqual) => BinaryOp::Equal,
-                Some(Token::NotEqual) => BinaryOp::NotEqual,
-                Some(Token::CaseEqual) => BinaryOp::CaseEqual,
-                Some(Token::CaseNotEqual) => BinaryOp::CaseNotEqual,
-                _ => break,
-            };
-            self.index += 1;
-
-            let rhs = self.parse_relational()?;
-            expression = Expr::Binary {
-                op,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
-    }
-
-    fn parse_relational(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_shift()?;
-
-        loop {
-            let op = match self.peek() {
-                Some(Token::Less) => BinaryOp::LessThan,
-                Some(Token::Greater) => BinaryOp::GreaterThan,
-                Some(Token::LessEqual) => BinaryOp::LessThanOrEqual,
-                Some(Token::GreaterEqual) => BinaryOp::GreaterThanOrEqual,
-                _ => break,
-            };
-            self.index += 1;
-
-            let rhs = self.parse_shift()?;
-            expression = Expr::Binary {
-                op,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
-    }
-
-    // LRM Table 5-4: shifts sit between additive and relational. Left
-    // associative; `<<<`/`>>>` share this level with `<<`/`>>` (LRM 5.1.12).
-    fn parse_shift(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_additive()?;
-
-        loop {
-            let op = match self.peek() {
-                Some(Token::LogicalShiftLeft) => BinaryOp::LogicalShiftLeft,
-                Some(Token::LogicalShiftRight) => BinaryOp::LogicalShiftRight,
-                Some(Token::ArithmeticShiftLeft) => BinaryOp::ArithmeticShiftLeft,
-                Some(Token::ArithmeticShiftRight) => BinaryOp::ArithmeticShiftRight,
-                _ => break,
-            };
-            self.index += 1;
-
-            let rhs = self.parse_additive()?;
-            expression = Expr::Binary {
-                op,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
-    }
-
-    fn parse_additive(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_multiplicative()?;
-
-        loop {
-            let op = match self.peek() {
-                Some(Token::Plus) => BinaryOp::Add,
-                Some(Token::Minus) => BinaryOp::Subtract,
-                _ => break,
-            };
-            self.index += 1;
-
-            let rhs = self.parse_multiplicative()?;
-            expression = Expr::Binary {
-                op,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
-    }
-
-    fn parse_multiplicative(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_power()?;
-
-        loop {
-            let op = match self.peek() {
-                Some(Token::Star) => BinaryOp::Multiply,
-                Some(Token::Slash) => BinaryOp::Divide,
-                Some(Token::Percent) => BinaryOp::Modulus,
-                _ => break,
-            };
-            self.index += 1;
-
-            let rhs = self.parse_power()?;
-            expression = Expr::Binary {
-                op,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
-    }
-
-    // Unary binds tighter than `**` (LRM 1364-2005 Table 22), so both sides of
-    // `**` go through `parse_unary`. The while loop accumulates left-to-right.
-    fn parse_power(&mut self) -> Result<Expr, String> {
-        let mut expression = self.parse_unary()?;
-
-        while matches!(self.peek(), Some(Token::Power)) {
-            self.index += 1;
-            let rhs = self.parse_unary()?;
-            expression = Expr::Binary {
-                op: BinaryOp::Power,
-                lhs: Box::new(expression),
-                rhs: Box::new(rhs),
-            };
-        }
-
-        Ok(expression)
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {
