@@ -454,6 +454,26 @@ fn infix_binding_power(token: &Token) -> Option<(BinaryOp, u8, u8)> {
 const COND_LBP: u8 = 10;
 const COND_RBP: u8 = 9;
 
+// Prefix unary operators per LRM 5.1.2 / Table 5-3 plus the reduction
+// forms (LRM 5.1.11). Returns `None` for any token that isn't a unary
+// operator at this position. Drives the iterative prefix-op accumulator
+// in `parse_unary`.
+fn prefix_unary_op(token: &Token) -> Option<UnaryOp> {
+    Some(match token {
+        Token::Plus => UnaryOp::Plus,
+        Token::Minus => UnaryOp::Minus,
+        Token::Bang => UnaryOp::LogicalNot,
+        Token::Tilde => UnaryOp::BitwiseNot,
+        Token::BitwiseAnd => UnaryOp::ReductionAnd,
+        Token::BitwiseOr => UnaryOp::ReductionOr,
+        Token::BitwiseXor => UnaryOp::ReductionXor,
+        Token::BitwiseXnor => UnaryOp::ReductionXnor,
+        Token::BitwiseNand => UnaryOp::ReductionNand,
+        Token::BitwiseNor => UnaryOp::ReductionNor,
+        _ => return None,
+    })
+}
+
 struct Parser<'a> {
     tokens: &'a [Token],
     index: usize,
@@ -750,38 +770,33 @@ impl<'a> Parser<'a> {
         })
     }
 
+    // Position-based disambiguation: `&`/`|`/`^`/`~^` (and the alt
+    // spelling `^~`) are binary OR unary depending on parse position.
+    // `parse_unary` claims them at unary position; the binary side of
+    // `infix_binding_power` only sees them after a primary, so dispatch is
+    // unambiguous without a token rewrite. `~&` and `~|` are unary-only —
+    // no binary BP entry consumes them, so a free-standing `a ~& b`
+    // cleanly fails as "unexpected token".
+    //
+    // Iterative: a chain like `!!!!1` accumulates ops in a Vec rather than
+    // recursing once per `!`. With the recursive form a long-enough unary
+    // chain would overflow the stack the same way `(((...)))` does in
+    // `parse_primary`. Wrapping happens in reverse so the outermost
+    // operator (first one read) ends up the outermost `Expr::Unary`.
     fn parse_unary(&mut self) -> Result<Expr, String> {
-        // Position-based disambiguation: `&`/`|`/`^`/`~^` (and the alt
-        // spelling `^~`) are binary OR unary depending on parse position.
-        // `parse_unary` claims them at unary position; the binary
-        // `parse_bitwise_{and,xor,or}` levels only see them after a primary,
-        // so dispatch is unambiguous without a token rewrite. `~&` and `~|`
-        // are unary-only — no binary parse level consumes them, so a
-        // free-standing `a ~& b` cleanly fails as "unexpected token".
-        let op = match self.peek() {
-            Some(Token::Plus) => Some(UnaryOp::Plus),
-            Some(Token::Minus) => Some(UnaryOp::Minus),
-            Some(Token::Bang) => Some(UnaryOp::LogicalNot),
-            Some(Token::Tilde) => Some(UnaryOp::BitwiseNot),
-            Some(Token::BitwiseAnd) => Some(UnaryOp::ReductionAnd),
-            Some(Token::BitwiseOr) => Some(UnaryOp::ReductionOr),
-            Some(Token::BitwiseXor) => Some(UnaryOp::ReductionXor),
-            Some(Token::BitwiseXnor) => Some(UnaryOp::ReductionXnor),
-            Some(Token::BitwiseNand) => Some(UnaryOp::ReductionNand),
-            Some(Token::BitwiseNor) => Some(UnaryOp::ReductionNor),
-            _ => None,
-        };
-
-        if let Some(op) = op {
+        let mut ops: Vec<UnaryOp> = Vec::new();
+        while let Some(op) = self.peek().and_then(prefix_unary_op) {
             self.index += 1;
-            let expr = self.parse_unary()?;
-            Ok(Expr::Unary {
+            ops.push(op);
+        }
+        let mut expr = self.parse_primary()?;
+        while let Some(op) = ops.pop() {
+            expr = Expr::Unary {
                 op,
                 expr: Box::new(expr),
-            })
-        } else {
-            self.parse_primary()
+            };
         }
+        Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, String> {
