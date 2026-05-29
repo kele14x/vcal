@@ -4,7 +4,7 @@ use num_bigint::BigInt;
 
 use crate::lexer::{Token, tokenize};
 use crate::parser::{BinaryOp, Expr, UnaryOp, parse_expression, parse_integer};
-use crate::{Session, evaluate_input, parse_input, run_repl};
+use crate::{Session, evaluate_input, parse_input, parse_input_with_depth, run_repl};
 
 #[test]
 fn evaluates_unsized_decimal() {
@@ -7311,6 +7311,31 @@ fn parse_input_returns_ast_without_evaluating() {
     // eval path so callers get a uniform diagnostic shape.
     let err = parse_input("1 +").expect_err("trailing op should fail");
     assert!(err.starts_with("Syntax error:"), "got: {err}");
+}
+
+#[test]
+fn parse_input_with_depth_respects_caller_specified_cap() {
+    // A shallow cap truncates aggressively: every Grouped at depth >
+    // cap collapses to the `…` placeholder. Verify the cap is honored
+    // by checking that a small depth produces fewer Grouped layers in
+    // the rendered output than a larger depth.
+    let input: String = "(".repeat(20) + "1" + &")".repeat(20);
+
+    let shallow = parse_input_with_depth(&input, 5).expect("parse at depth 5");
+    let deep = parse_input_with_depth(&input, 50).expect("parse at depth 50");
+
+    let count_grouped = |s: &str| s.matches("Grouped").count();
+    assert!(
+        count_grouped(&shallow) < count_grouped(&deep),
+        "shallow cap should produce fewer Grouped nodes; \
+         shallow={}, deep={}",
+        count_grouped(&shallow),
+        count_grouped(&deep)
+    );
+    // Shallow render must show the truncation marker; deep render
+    // shouldn't (input only goes 20 deep).
+    assert!(shallow.contains('…'), "expected '…' at depth 5");
+    assert!(!deep.contains('…'), "should not truncate at depth 50");
 }
 
 #[test]

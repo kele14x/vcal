@@ -268,21 +268,32 @@ pub fn evaluate_input(input: &str) -> Result<Evaluation, String> {
     session.eval(input)
 }
 
+// Default depth at which `parse_input` truncates the AST before
+// `{:#?}` rendering. The auto-derived `Debug` impl recurses one stack
+// frame per `Box<Expr>` level, so without truncation a 10^4-deep input
+// — even though the parser builds it iteratively — would crash during
+// formatting. 64 is deeper than any plausible human-written expression,
+// shallow enough that the bounded-depth render can't overflow on a
+// default thread stack.
+pub const DEFAULT_DISPLAY_DEPTH: usize = 64;
+
 // Debug entry point: run the parser only and return the AST as a
 // pretty-printed Debug string. Skips validate / evaluate so callers
 // can inspect what the parser actually built — useful for diagnosing
 // parser-stage issues (deep paren nests, weird precedence, etc.) in
-// isolation from the eval pipeline.
-//
-// Truncates the AST to a fixed display depth before formatting. The
-// auto-derived `Debug` impl recurses one stack frame per `Box<Expr>`
-// level, so without truncation a 10^4-deep input — even though the
-// parser builds it iteratively — would crash during `{:#?}` rendering.
-// The cap is 64: deeper than any plausible human-written expression,
-// shallow enough that the bounded recursion can't overflow.
+// isolation from the eval pipeline. Uses `DEFAULT_DISPLAY_DEPTH` for
+// truncation; see `parse_input_with_depth` to pick a different cap.
 pub fn parse_input(input: &str) -> Result<String, String> {
-    const DISPLAY_DEPTH_CAP: usize = 64;
+    parse_input_with_depth(input, DEFAULT_DISPLAY_DEPTH)
+}
 
+// Same as `parse_input` but lets the caller choose the truncation depth.
+// Higher caps preserve more of the AST at the cost of recursion in the
+// `{:#?}` formatter — picking a value much above 10⁵ may overflow the
+// default thread stack on a deep input. `0` truncates immediately
+// (every expression becomes the `…` placeholder); useful only as a
+// "did this parse?" probe.
+pub fn parse_input_with_depth(input: &str, max_depth: usize) -> Result<String, String> {
     let input = input.trim();
     if input.is_empty() {
         return Ok(String::new());
@@ -290,7 +301,7 @@ pub fn parse_input(input: &str) -> Result<String, String> {
     let mut statements =
         parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
     for stmt in &mut statements {
-        parser::truncate_stmt_for_display(stmt, DISPLAY_DEPTH_CAP);
+        parser::truncate_stmt_for_display(stmt, max_depth);
     }
     Ok(format!("{statements:#?}"))
 }
@@ -789,9 +800,15 @@ pub fn run_interactive() -> io::Result<()> {
 
 // Parse-only REPL for the piped / non-TTY path. Mirrors `run_repl` but
 // stops after the parser and prints the AST instead of evaluating. Used
-// when the binary is invoked with `--parse-only`. No `Session` is
-// threaded through — the parser doesn't read or write variable state.
-pub fn run_parse_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
+// when the binary is invoked with `--parse-only`. `max_depth` controls
+// the AST display truncation cap (see `parse_input_with_depth`). No
+// `Session` is threaded through — the parser doesn't read or write
+// variable state.
+pub fn run_parse_repl<R: BufRead, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    max_depth: usize,
+) -> io::Result<()> {
     let mut index = 0usize;
     let mut line = String::new();
 
@@ -804,7 +821,7 @@ pub fn run_parse_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> i
             break;
         }
 
-        match parse_input(&line) {
+        match parse_input_with_depth(&line, max_depth) {
             Ok(ast) => writeln!(writer, "Out[{index}]: {ast}")?,
             Err(message) => {
                 writeln!(writer, "Out[{index}]: ")?;
@@ -819,7 +836,7 @@ pub fn run_parse_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> i
 }
 
 // Parse-only TTY REPL — rustyline-backed counterpart to run_parse_repl.
-pub fn run_parse_interactive() -> io::Result<()> {
+pub fn run_parse_interactive(max_depth: usize) -> io::Result<()> {
     use rustyline::DefaultEditor;
     use rustyline::error::ReadlineError;
 
@@ -837,7 +854,7 @@ pub fn run_parse_interactive() -> io::Result<()> {
             let _ = editor.add_history_entry(line.as_str());
         }
 
-        match parse_input(&line) {
+        match parse_input_with_depth(&line, max_depth) {
             Ok(ast) => println!("Out[{index}]: {ast}"),
             Err(message) => {
                 println!("Out[{index}]: ");
