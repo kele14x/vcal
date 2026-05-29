@@ -699,12 +699,12 @@ fn tokenizes_le_and_ge_as_single_tokens() {
 fn relational_binds_looser_than_additive() {
     // 1 + 2 < 4 parses as (1 + 2) < 4 → 3 < 4 → true
     let expr = parse_expression("1 + 2 < 4").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::LessThan,
             lhs,
             ..
-        } => assert!(matches!(*lhs, Expr::Binary { op: BinaryOp::Add, .. })),
+        } => assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Add, .. })),
         other => panic!("expected top-level <, got {other:?}"),
     }
 
@@ -716,13 +716,13 @@ fn relational_binds_looser_than_additive() {
 fn relational_is_left_associative() {
     // 4 < 5 < 1 parses as (4 < 5) < 1 → 1 < 1 → false
     let expr = parse_expression("4 < 5 < 1").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::LessThan,
             lhs,
             ..
         } => assert!(matches!(
-            *lhs,
+            lhs.as_ref(),
             Expr::Binary {
                 op: BinaryOp::LessThan,
                 ..
@@ -1052,12 +1052,12 @@ fn equality_is_left_associative() {
     // 4'd1 == 4'd1 == 4'd1 → (1 == 1) == 4'd1 → 1'b1 == 4'd1 → 1 == 1 → 1
     let result = evaluate_input("4'd1 == 4'd1 == 4'd1").expect("assoc");
     let expr = parse_expression("4'd1 == 4'd1 == 4'd1").expect("parse assoc");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::Equal,
             lhs,
             ..
-        } => assert!(matches!(*lhs, Expr::Binary { op: BinaryOp::Equal, .. })),
+        } => assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Equal, .. })),
         other => panic!("expected top-level ==, got {other:?}"),
     }
     assert_eq!(result.output, "1'b1");
@@ -1174,13 +1174,13 @@ fn logical_not_binds_tighter_than_power() {
     // LRM Table 5-4: unary operators (including !) are higher precedence
     // than **. So `!4'd0 ** 4'd2` parses as `(!4'd0) ** 4'd2` → 1**2 → 1.
     let expr = parse_expression("!4'd0 ** 4'd2").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::Power,
             lhs,
             ..
         } => assert!(matches!(
-            *lhs,
+            lhs.as_ref(),
             Expr::Unary {
                 op: UnaryOp::LogicalNot,
                 ..
@@ -1196,12 +1196,12 @@ fn logical_not_binds_tighter_than_power() {
 fn logical_and_lower_precedence_than_equality() {
     // `4'd0 == 4'd0 && 4'd1` parses as `(4'd0 == 4'd0) && 4'd1`.
     let expr = parse_expression("4'd0 == 4'd0 && 4'd1").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::LogicalAnd,
             lhs,
             ..
-        } => assert!(matches!(*lhs, Expr::Binary { op: BinaryOp::Equal, .. })),
+        } => assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Equal, .. })),
         other => panic!("expected top-level &&, got {other:?}"),
     }
     let result = evaluate_input("4'd0 == 4'd0 && 4'd1").expect("eval");
@@ -1212,13 +1212,13 @@ fn logical_and_lower_precedence_than_equality() {
 fn logical_or_lower_precedence_than_logical_and() {
     // `4'd1 || 4'd0 && 4'd0` parses as `4'd1 || (4'd0 && 4'd0)` → 1.
     let expr = parse_expression("4'd1 || 4'd0 && 4'd0").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::LogicalOr,
             rhs,
             ..
         } => assert!(matches!(
-            *rhs,
+            rhs.as_ref(),
             Expr::Binary {
                 op: BinaryOp::LogicalAnd,
                 ..
@@ -1247,13 +1247,13 @@ fn logical_and_is_left_associative() {
     // a && b && c parses as (a && b) && c; same shape check as the
     // existing equality_is_left_associative test.
     let expr = parse_expression("4'd1 && 4'd1 && 4'd1").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::LogicalAnd,
             lhs,
             ..
         } => assert!(matches!(
-            *lhs,
+            lhs.as_ref(),
             Expr::Binary {
                 op: BinaryOp::LogicalAnd,
                 ..
@@ -1268,13 +1268,13 @@ fn logical_and_is_left_associative() {
 #[test]
 fn logical_or_is_left_associative() {
     let expr = parse_expression("4'd0 || 4'd0 || 4'd1").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::LogicalOr,
             lhs,
             ..
         } => assert!(matches!(
-            *lhs,
+            lhs.as_ref(),
             Expr::Binary {
                 op: BinaryOp::LogicalOr,
                 ..
@@ -1402,13 +1402,13 @@ fn bitwise_not_binds_tighter_than_power() {
     // 4'b1110 = 14; 14**2 = 196; 196 mod 16 = 4. Result base inherits
     // from the lhs (decimal), so 4'd4.
     let expr = parse_expression("~4'd1 ** 2").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::Power,
             lhs,
             ..
         } => assert!(matches!(
-            *lhs,
+            lhs.as_ref(),
             Expr::Unary {
                 op: UnaryOp::BitwiseNot,
                 ..
@@ -1572,12 +1572,12 @@ fn bitwise_band_precedence_below_equality() {
     // 1'b1 zero-extends to 4'b0001 under the unified 4-bit context, then
     // & 4'b0001 → 4'b0001.
     let expr = parse_expression("4'd1 == 4'd1 & 4'd1").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::BitwiseAnd,
             lhs,
             ..
-        } => assert!(matches!(*lhs, Expr::Binary { op: BinaryOp::Equal, .. })),
+        } => assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Equal, .. })),
         other => panic!("expected top-level &, got {other:?}"),
     }
     let result = evaluate_input("4'd1 == 4'd1 & 4'd1").expect("eval");
@@ -1588,13 +1588,13 @@ fn bitwise_band_precedence_below_equality() {
 fn bitwise_band_precedence_above_logical_and() {
     // `4'd1 & 4'd1 && 4'd0` parses as `(4'd1 & 4'd1) && 4'd0`.
     let expr = parse_expression("4'd1 & 4'd1 && 4'd0").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::LogicalAnd,
             lhs,
             ..
         } => assert!(matches!(
-            *lhs,
+            lhs.as_ref(),
             Expr::Binary {
                 op: BinaryOp::BitwiseAnd,
                 ..
@@ -1625,13 +1625,13 @@ fn bitwise_internal_precedence_and_tightest_or_loosest() {
 fn bitwise_binary_is_left_associative() {
     // Same shape check used elsewhere: a OP b OP c parses as (a OP b) OP c.
     let expr = parse_expression("4'd1 & 4'd2 & 4'd3").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::BitwiseAnd,
             lhs,
             ..
         } => assert!(matches!(
-            *lhs,
+            lhs.as_ref(),
             Expr::Binary {
                 op: BinaryOp::BitwiseAnd,
                 ..
@@ -2170,12 +2170,12 @@ fn shift_precedence_below_additive_above_relational() {
     //   `4'd2 << 4'd1 < 4'd5` parses as `(4'd2 << 4'd1) < 4'd5`
     //                              = 4 < 5 = 1.
     let add_then_shift_expr = parse_expression("4'd1 + 4'd2 << 4'd1").expect("parse");
-    match add_then_shift_expr {
+    match &add_then_shift_expr {
         Expr::Binary {
             op: BinaryOp::LogicalShiftLeft,
             lhs,
             ..
-        } => assert!(matches!(*lhs, Expr::Binary { op: BinaryOp::Add, .. })),
+        } => assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Add, .. })),
         other => panic!("expected top-level <<, got {other:?}"),
     }
     let add_then_shift = evaluate_input("4'd1 + 4'd2 << 4'd1").expect("eval");
@@ -2183,13 +2183,13 @@ fn shift_precedence_below_additive_above_relational() {
 
     let shift_then_relational_expr =
         parse_expression("4'd2 << 4'd1 < 4'd5").expect("parse");
-    match shift_then_relational_expr {
+    match &shift_then_relational_expr {
         Expr::Binary {
             op: BinaryOp::LessThan,
             lhs,
             ..
         } => assert!(matches!(
-            *lhs,
+            lhs.as_ref(),
             Expr::Binary {
                 op: BinaryOp::LogicalShiftLeft,
                 ..
@@ -2206,13 +2206,13 @@ fn shift_is_left_associative() {
     // `a << b << c` parses as `(a << b) << c`. Same shape check used for
     // the other binary levels.
     let expr = parse_expression("4'd1 << 4'd1 << 4'd1").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::LogicalShiftLeft,
             lhs,
             ..
         } => assert!(matches!(
-            *lhs,
+            lhs.as_ref(),
             Expr::Binary {
                 op: BinaryOp::LogicalShiftLeft,
                 ..
@@ -2243,13 +2243,13 @@ fn reduction_binds_tighter_than_power() {
     // LRM Table 5-4: unary reductions are at the unary level, tighter
     // than **. So `&4'b1111 ** 2` parses as `(&4'b1111) ** 2` = 1**2 = 1.
     let expr = parse_expression("&4'b1111 ** 2").expect("parse");
-    match expr {
+    match &expr {
         Expr::Binary {
             op: BinaryOp::Power,
             lhs,
             ..
         } => assert!(matches!(
-            *lhs,
+            lhs.as_ref(),
             Expr::Unary {
                 op: UnaryOp::ReductionAnd,
                 ..
@@ -2467,9 +2467,9 @@ fn conditional_is_right_associative() {
     // `1'b0 ? 1 : 1'b1 ? 2 : 3` parses as `1'b0 ? 1 : (1'b1 ? 2 : 3)`.
     // Cond is false, so the else branch runs, picking 2.
     let expr = parse_expression("1'b0 ? 1 : 1'b1 ? 2 : 3").expect("parse");
-    match expr {
+    match &expr {
         Expr::Conditional { else_expr, .. } => {
-            assert!(matches!(*else_expr, Expr::Conditional { .. }));
+            assert!(matches!(else_expr.as_ref(), Expr::Conditional { .. }));
         }
         other => panic!("expected top-level conditional, got {other:?}"),
     }
@@ -2484,10 +2484,10 @@ fn conditional_lower_precedence_than_logical_or() {
     // LRM Table 5-4: `?:` sits below `||`. `1 || 0 ? 1 : 2` parses as
     // `(1 || 0) ? 1 : 2`, picking the then branch.
     let expr = parse_expression("1 || 0 ? 1 : 2").expect("parse");
-    match expr {
+    match &expr {
         Expr::Conditional { cond, .. } => {
             assert!(matches!(
-                *cond,
+                cond.as_ref(),
                 Expr::Binary {
                     op: BinaryOp::LogicalOr,
                     ..
@@ -7209,6 +7209,53 @@ fn long_addition_chain_evaluates_without_quadratic_blowup() {
         })
         .expect("spawn worker thread");
     handle.join().expect("chain test thread panicked");
+}
+
+#[test]
+fn drop_of_deep_grouped_ast_does_not_overflow() {
+    // Without `impl Drop for Expr`, dropping a 10^5-deep `Grouped` chain
+    // overflows the stack — auto-derived Drop walks each `Box<Expr>`
+    // recursively, costing one frame per layer. The custom Drop in
+    // parser.rs flattens the descent into a heap-allocated worklist so
+    // this is O(1) Rust stack regardless of depth.
+    //
+    // Runs on the default test thread (2 MB stack); pre-fix this would
+    // crash well before reaching the 10^5 mark.
+    let mut e = Expr::Identifier(String::new());
+    for _ in 0..100_000 {
+        e = Expr::Grouped(Box::new(e));
+    }
+    drop(e);
+}
+
+#[test]
+fn drop_of_deep_unary_ast_does_not_overflow() {
+    // Same shape as the Grouped test, but exercising the Unary recursion
+    // arm of `steal_expr_children`.
+    let mut e = Expr::Identifier(String::new());
+    for _ in 0..100_000 {
+        e = Expr::Unary {
+            op: UnaryOp::LogicalNot,
+            expr: Box::new(e),
+        };
+    }
+    drop(e);
+}
+
+#[test]
+fn drop_of_deep_binary_ast_does_not_overflow() {
+    // Two-child variant: each level adds one to the lhs spine while the
+    // rhs is a fresh leaf. Confirms the Binary arm of
+    // `steal_expr_children` peels both children iteratively.
+    let mut e = Expr::Identifier(String::new());
+    for _ in 0..100_000 {
+        e = Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(e),
+            rhs: Box::new(Expr::Identifier(String::new())),
+        };
+    }
+    drop(e);
 }
 
 #[test]

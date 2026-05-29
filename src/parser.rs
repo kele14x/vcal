@@ -153,6 +153,109 @@ pub(crate) enum SelectKind {
     },
 }
 
+// Iterative Drop for Expr.
+//
+// `Expr::Grouped(Box<Expr>)`, `Binary { lhs: Box<Expr>, rhs: Box<Expr> }`,
+// and friends form a recursive type. The auto-derived destructor walks
+// these Boxes recursively — for a 10^5-deep `Grouped` chain that's 10^5
+// stack frames during drop, which overflows. Same crash mode as a
+// recursive parser, just at end-of-scope instead of parse time.
+//
+// This impl flattens the descent into a heap-allocated worklist:
+//   1. Replace each child Expr with a cheap leaf placeholder, stashing
+//      the original in the worklist.
+//   2. Pop a victim from the worklist, repeat.
+// The auto-drop that fires after this method returns then sees only
+// leaf-shaped children, so its recursion is O(1) deep regardless of
+// input depth. `SelectKind` carries `Box<Expr>` sub-expressions
+// (index/range/base/width), so it is flattened the same way.
+//
+// The placeholder is `Expr::Identifier(String::new())` — a leaf with no
+// children, no allocation (empty String is inline), and a Drop that
+// re-enters this impl with an empty worklist.
+impl Drop for Expr {
+    fn drop(&mut self) {
+        let mut work: Vec<Expr> = Vec::new();
+        steal_expr_children(self, &mut work);
+        while let Some(mut victim) = work.pop() {
+            steal_expr_children(&mut victim, &mut work);
+            // victim's children are now leaves; auto-drop at end of this
+            // iteration is shallow.
+        }
+    }
+}
+
+fn steal_expr_children(expr: &mut Expr, out: &mut Vec<Expr>) {
+    let placeholder = || Expr::Identifier(String::new());
+    match expr {
+        Expr::Literal(_)
+        | Expr::RealLiteral(_)
+        | Expr::Identifier(_)
+        | Expr::SystemTask { .. } => {}
+        Expr::Grouped(inner) => {
+            out.push(std::mem::replace(inner.as_mut(), placeholder()));
+        }
+        Expr::Unary { expr: inner, .. } => {
+            out.push(std::mem::replace(inner.as_mut(), placeholder()));
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            out.push(std::mem::replace(lhs.as_mut(), placeholder()));
+            out.push(std::mem::replace(rhs.as_mut(), placeholder()));
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            out.push(std::mem::replace(cond.as_mut(), placeholder()));
+            out.push(std::mem::replace(then_expr.as_mut(), placeholder()));
+            out.push(std::mem::replace(else_expr.as_mut(), placeholder()));
+        }
+        Expr::Concatenation { items } => {
+            out.extend(items.drain(..));
+        }
+        Expr::Replication { count, items } => {
+            out.push(std::mem::replace(count.as_mut(), placeholder()));
+            out.extend(items.drain(..));
+        }
+        Expr::SignCast { arg, .. }
+        | Expr::BaseCast { arg, .. }
+        | Expr::RealConversion { arg, .. } => {
+            out.push(std::mem::replace(arg.as_mut(), placeholder()));
+        }
+        Expr::MathFunction { args, .. } => {
+            out.extend(args.drain(..));
+        }
+        Expr::Select { kind, inner, .. } => {
+            steal_select_kind_children(kind, out);
+            if let Some(boxed_inner) = inner.take() {
+                let mut inner_kind = *boxed_inner;
+                steal_select_kind_children(&mut inner_kind, out);
+                // inner_kind drops here: its children are now leaves, so
+                // the auto-drop is shallow.
+            }
+        }
+    }
+}
+
+fn steal_select_kind_children(kind: &mut SelectKind, out: &mut Vec<Expr>) {
+    let placeholder = || Expr::Identifier(String::new());
+    match kind {
+        SelectKind::Bit { index } => {
+            out.push(std::mem::replace(index.as_mut(), placeholder()));
+        }
+        SelectKind::PartConst { msb, lsb } => {
+            out.push(std::mem::replace(msb.as_mut(), placeholder()));
+            out.push(std::mem::replace(lsb.as_mut(), placeholder()));
+        }
+        SelectKind::PartIndexedUp { base, width }
+        | SelectKind::PartIndexedDown { base, width } => {
+            out.push(std::mem::replace(base.as_mut(), placeholder()));
+            out.push(std::mem::replace(width.as_mut(), placeholder()));
+        }
+    }
+}
+
 // Top-level inputs. A REPL line / piped script segment between semicolons is
 // one `Stmt`. Expressions still drive the evaluator, but declarations and
 // blocking assignments mutate the session rather than producing a value.
@@ -1127,13 +1230,25 @@ fn top_level_task_name(expr: &Expr) -> Option<String> {
 // LRM A.8.5 `variable_lvalue`. Called after `parse_statement` has parsed
 // the LHS as an `Expr` and confirmed `=` follows. Accept only the shapes
 // the LRM production allows; reject everything else with a uniform
-// "invalid lvalue" diagnostic. `Grouped` is unwrapped because the
-// statement parser otherwise would force users to repeat themselves for
-// `(a) = ...`, and the leniency matches how `top_level_task_name`
-// already walks through parens for `($finish)`.
-fn expression_to_lvalue(expr: Expr) -> Result<LValue, String> {
-    match expr {
-        Expr::Identifier(name) => Ok(LValue::Name(name)),
+// "invalid lvalue" diagnostic. Leading `Grouped` layers are unwrapped so
+// `(a) = 1` works (matches how `top_level_task_name` walks through parens
+// for `($finish)`).
+//
+// Now that `Expr` has a custom `Drop` (for the deep-AST overflow fix
+// further up), Rust forbids moving owned fields out of `Expr` via
+// pattern match — so this function uses `mem::replace`/`mem::take` to
+// extract owned data while leaving each `Expr` in a leaf-shaped state
+// for its drop. The leading-Grouped peel is also iterative so an
+// `((((a))))` LHS doesn't recurse N levels.
+fn expression_to_lvalue(mut expr: Expr) -> Result<LValue, String> {
+    let placeholder = || Expr::Identifier(String::new());
+
+    while let Expr::Grouped(inner) = &mut expr {
+        expr = std::mem::replace(inner.as_mut(), placeholder());
+    }
+
+    match &mut expr {
+        Expr::Identifier(name) => Ok(LValue::Name(std::mem::take(name))),
         // Chained selects (`a[i][m:l]`) pass straight through: on the LHS
         // the evaluator routes the array-element + inner-select case through
         // the same per-position distribution path the vector-reg LHS uses
@@ -1141,9 +1256,17 @@ fn expression_to_lvalue(expr: Expr) -> Result<LValue, String> {
         // array, inner forbidden on a vector, inner part-select direction
         // matches the element's packed range) happens in `lvalue_meta`, so
         // the parser stays purely syntactic here.
-        Expr::Select { name, kind, inner } => Ok(LValue::Select { name, kind, inner }),
-        Expr::Grouped(inner) => expression_to_lvalue(*inner),
+        Expr::Select { name, kind, inner } => {
+            let name = std::mem::take(name);
+            let kind_placeholder = SelectKind::Bit {
+                index: Box::new(placeholder()),
+            };
+            let kind = std::mem::replace(kind, kind_placeholder);
+            let inner = inner.take();
+            Ok(LValue::Select { name, kind, inner })
+        }
         Expr::Concatenation { items } => {
+            let items = std::mem::take(items);
             let lvalues = items
                 .into_iter()
                 .map(expression_to_lvalue)
