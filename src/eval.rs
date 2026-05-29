@@ -686,11 +686,7 @@ pub(crate) fn evaluate_expr(expr: &Expr, session: &Session) -> Result<Value, Str
     let annotated = annotate(expr, session).map_err(|e| format!("Semantic error: {e}"))?;
     validate_annotated(&annotated, session).map_err(|e| format!("Semantic error: {e}"))?;
     if annotated.is_real() {
-        // Real path stays on the legacy &Expr walker — it's already O(N) and
-        // not on the chain hot path. Long real chains aren't representative
-        // of typical inputs and would land in this branch only with explicit
-        // real arithmetic.
-        evaluate_expr_as_real(expr, session).map(Value::Real)
+        evaluate_annotated_as_real(&annotated, session).map(Value::Real)
     } else {
         evaluate_annotated(&annotated, None, session).map(Value::Integer)
     }
@@ -719,7 +715,7 @@ pub(crate) fn evaluate_assignment_rhs(
     let annotated = annotate(rhs, session).map_err(|e| format!("Semantic error: {e}"))?;
     validate_annotated(&annotated, session).map_err(|e| format!("Semantic error: {e}"))?;
     if annotated.is_real() {
-        let real_val = evaluate_expr_as_real(rhs, session)?;
+        let real_val = evaluate_annotated_as_real(&annotated, session)?;
         return Ok(match real_to_integer_bigint(real_val) {
             Some(bigint) => IntegerValue::from_bigint(bigint, width, signed, base),
             None => IntegerValue::all_x(width, signed, base),
@@ -944,27 +940,42 @@ fn logical_value_of_real(value: f64) -> LogicBit {
     }
 }
 
-// Walks the AST treating every leaf as a real value: integer-typed
-// sub-expressions go through the integer pipeline and convert at the
-// boundary, real-typed leaves and ops apply f64 directly. Operators
-// listed in Table 5-3 (modulus, ===, !==, bitwise, reductions, shifts,
-// concatenation, replication, $signed/$unsigned, bitwise NOT) reject
-// here because their ancestor was real-typed by `expression_is_real`,
-// meaning a real operand reached them; the integer pipeline rejects
-// the same operators when the operand is *directly* real.
-// Iterative real-pipeline evaluator (CES driver with `Vec<f64>` value stack).
-// Mirrors `evaluate_annotated`'s shape: `Visit` tasks dispatch by Expr
-// variant, `Combine` tasks fold popped child f64 values into the parent's
-// result. Integer-typed sub-expressions are routed through
-// `evaluate_expr_in_context` and converted via `integer_value_to_f64` —
-// that integer pipeline is now iterative (P3), so deep mixed real/integer
-// chains stay on the iterative path throughout.
-enum RealEvalTask<'a> {
-    Visit(&'a Expr),
-    Combine(RealCombiner),
+// Thin wrappers preserving the legacy `evaluate_expr_as_real` /
+// `logical_value_of_expr` signatures: previously these were the entry
+// points for the recursive real-eval driver; the iterative driver now
+// walks `&Annotated`, so we annotate at the boundary and dispatch to
+// the unified loop. These remain reachable only from the legacy
+// recursive walker (`evaluate_expr_in_context` and friends), which
+// itself is no longer reached from user input via the iterative path —
+// `visit_eval`'s Leaf arm only sees Literal / RealLiteral / Identifier /
+// Select / SystemTask, none of which dispatch to these helpers. Kept
+// alive so the legacy walker still compiles.
+fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> {
+    let annotated = annotate(expr, session)?;
+    evaluate_annotated_as_real(&annotated, session)
 }
 
-enum RealCombiner {
+fn logical_value_of_expr(expr: &Expr, session: &Session) -> Result<LogicBit, String> {
+    let annotated = annotate(expr, session)?;
+    if annotated.is_real() {
+        Ok(logical_value_of_real(evaluate_annotated_as_real(
+            &annotated, session,
+        )?))
+    } else {
+        Ok(logical_value(&evaluate_annotated(&annotated, None, session)?))
+    }
+}
+
+// Real-pipeline combiners. Folded into the unified work loop in
+// `evaluate_annotated` (alongside the integer-pipeline `EvalCombiner`):
+// Real combiners read/write the f64 value stack and may also bridge
+// to/from the IntegerValue stack at $itor / $bitstoreal / implicit
+// LRM 3.5.3 coercion points. Putting both pipelines on one work stack
+// is what eliminates Rust-stack growth at deep alternating shapes like
+// `$rtoi($itor($rtoi($itor(...))))` — the previous design had each
+// crossing call into the other driver's loop, adding one C-stack frame
+// per crossing.
+enum RealCombiner<'b, 'a: 'b> {
     /// Unary `+` is identity; `-` negates. Pops 1 f64.
     UnaryPlus,
     UnaryMinus,
@@ -974,223 +985,46 @@ enum RealCombiner {
     /// Conditional with x/z cond — both branches evaluated and merged
     /// per `f64::to_bits()` agreement. Pops 2 f64s (then, else).
     ConditionalRealMerge,
+    /// Real-result math function (`$pow`, `$ln`, `$atan2`, ...). Pops
+    /// `arity` f64s in push order; applies the math function; pushes the
+    /// f64 result.
+    MathFunction { kind: MathFunctionKind, arity: usize },
+    /// LRM 3.5.3 implicit integer→real coercion — for an integer-typed
+    /// sub-expression appearing in a real chain (e.g., `1.0 + 1`, or
+    /// `$pow(2, 1)` where `2` is an integer literal). Pops 1 IntegerValue
+    /// from `int_vals`, pushes `integer_value_to_f64(...)` to `real_vals`.
+    CoerceFromInteger,
+    /// `$itor` argument consumed: same shape as `CoerceFromInteger` but
+    /// emitted explicitly so the rule in [doc/non-standard.md] stays
+    /// traceable. Pops 1 IntegerValue, pushes 1 f64.
+    ItorFromInt,
+    /// `$bitstoreal` argument consumed: pops 1 IntegerValue (must have
+    /// width = 64; the validator already enforces this, the runtime check
+    /// here is defence-in-depth), pushes `bits_value_to_real(...)`.
+    BitstoRealFromInt,
+    /// Real-result conditional with integer cond. Pops 1 IntegerValue
+    /// (cond) from `int_vals`, reduces via `logical_value`, then pushes
+    /// `VisitReal/coerce` for the chosen branch (or both branches +
+    /// `ConditionalRealMerge` for x/z cond).
+    DispatchIntCondRealResult {
+        then_arm: &'b Annotated<'a>,
+        else_arm: &'b Annotated<'a>,
+    },
+    /// Real-result conditional with real cond. Pops 1 f64 from
+    /// `real_vals`, reduces via `logical_value_of_real`, dispatches.
+    DispatchRealCondRealResult {
+        then_arm: &'b Annotated<'a>,
+        else_arm: &'b Annotated<'a>,
+    },
 }
 
-fn evaluate_expr_as_real(root: &Expr, session: &Session) -> Result<f64, String> {
-    let mut work: Vec<RealEvalTask> = vec![RealEvalTask::Visit(root)];
-    let mut vals: Vec<f64> = Vec::new();
-
-    while let Some(task) = work.pop() {
-        match task {
-            RealEvalTask::Visit(expr) => {
-                visit_real_eval(expr, &mut work, &mut vals, session)?;
-            }
-            RealEvalTask::Combine(c) => {
-                combine_real_eval(c, &mut vals)?;
-            }
-        }
-    }
-
-    debug_assert_eq!(vals.len(), 1, "evaluate_expr_as_real produced {} values", vals.len());
-    Ok(vals.pop().expect("driver invariant: one root produces one f64"))
-}
-
-fn visit_real_eval<'a>(
-    expr: &'a Expr,
-    work: &mut Vec<RealEvalTask<'a>>,
-    vals: &mut Vec<f64>,
-    session: &Session,
-) -> Result<(), String> {
-    // Integer-typed sub-expression: route through the integer pipeline
-    // and convert at the boundary. This is what makes mixed real/integer
-    // chains iterative — the integer pipeline is iterative as of P3.
-    if !expression_is_real(expr, session) {
-        let int_val = evaluate_expr_in_context(expr, None, session)?;
-        vals.push(integer_value_to_f64(&int_val));
-        return Ok(());
-    }
-
-    match expr {
-        Expr::Literal(_) => unreachable!("integer literal handled by integer fast-path"),
-        Expr::RealLiteral(value) => vals.push(*value),
-        Expr::Grouped(inner) => work.push(RealEvalTask::Visit(inner)),
-        Expr::Unary { op, expr: operand } => match op {
-            UnaryOp::Plus => {
-                work.push(RealEvalTask::Combine(RealCombiner::UnaryPlus));
-                work.push(RealEvalTask::Visit(operand));
-            }
-            UnaryOp::Minus => {
-                work.push(RealEvalTask::Combine(RealCombiner::UnaryMinus));
-                work.push(RealEvalTask::Visit(operand));
-            }
-            _ => {
-                return Err(format!(
-                    "operator {} not allowed on real operand",
-                    unary_op_name(*op)
-                ));
-            }
-        },
-        Expr::Binary { op, lhs, rhs } => match op {
-            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide
-            | BinaryOp::Power => {
-                work.push(RealEvalTask::Combine(RealCombiner::BinaryArith { op: *op }));
-                work.push(RealEvalTask::Visit(rhs));
-                work.push(RealEvalTask::Visit(lhs));
-            }
-            _ => {
-                return Err(format!(
-                    "operator {} not allowed on real operand",
-                    binary_op_name(*op)
-                ));
-            }
-        },
-        Expr::Conditional {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            // cond reduces to a 1-bit logical via the integer/real
-            // logical helpers; same as the recursive version.
-            let cond_logical = logical_value_of_expr(cond, session)?;
-            match cond_logical {
-                LogicBit::One => {
-                    // No combine needed: the chosen branch's value IS the
-                    // conditional's result for the real path (no
-                    // signedness/base re-stamping).
-                    work.push(RealEvalTask::Visit(then_expr));
-                }
-                LogicBit::Zero => {
-                    work.push(RealEvalTask::Visit(else_expr));
-                }
-                LogicBit::X | LogicBit::Z => {
-                    work.push(RealEvalTask::Combine(RealCombiner::ConditionalRealMerge));
-                    work.push(RealEvalTask::Visit(else_expr));
-                    work.push(RealEvalTask::Visit(then_expr));
-                }
-            }
-        }
-        Expr::Concatenation { .. } | Expr::Replication { .. } => {
-            unreachable!("concatenation/replication never has real result type")
-        }
-        Expr::SignCast { .. } => {
-            unreachable!("$signed/$unsigned never has real result type")
-        }
-        Expr::BaseCast { .. } => {
-            unreachable!("$bin/$oct/$dec/$hex never has real result type")
-        }
-        Expr::RealConversion { kind, arg } => match kind {
-            RealConversionKind::IntegerToReal => {
-                if expression_is_real(arg, session) {
-                    unreachable!("validator rejects real $itor arg before evaluation");
-                }
-                let int_val = evaluate_expr_in_context(arg, None, session)?;
-                vals.push(integer_value_to_f64(&int_val));
-            }
-            RealConversionKind::BitsToReal => {
-                if expression_is_real(arg, session) {
-                    unreachable!("validator rejects real $bitstoreal arg before evaluation");
-                }
-                let arg_meta = infer_expr_meta(arg, session)?;
-                if arg_meta.width != 64 {
-                    return Err(format!(
-                        "$bitstoreal argument must be 64 bits wide, got {}",
-                        arg_meta.width
-                    ));
-                }
-                let int_val = evaluate_expr_in_context(arg, None, session)?;
-                vals.push(bits_value_to_real(&int_val));
-            }
-            RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {
-                unreachable!("integer-result conversions handled by integer pipeline")
-            }
-        },
-        Expr::MathFunction { kind, args } => {
-            if !kind.is_real_result() {
-                unreachable!("integer-result math functions handled by integer pipeline");
-            }
-            // Math function args are short lists, rarely deep chains in
-            // their own right. Each arg evaluates via the iterative
-            // real driver (via evaluate_expr_as_real reentry) — which
-            // itself stays iterative. Push the result inline.
-            vals.push(evaluate_real_math_function(*kind, args, session)?);
-        }
-        Expr::SystemTask { name } => return Err(task_in_expression_error(name)),
-        Expr::Identifier(name) => {
-            let v = session
-                .lookup(name)
-                .and_then(|reg| reg.real())
-                .ok_or_else(|| format!("unknown real variable `{name}`"))?;
-            vals.push(v);
-        }
-        Expr::Select { name, kind, inner } => {
-            debug_assert!(inner.is_none(), "validator drops chained selects on real array");
-            let index = match kind {
-                SelectKind::Bit { index } => index,
-                _ => unreachable!("validator rejects part-select on real array"),
-            };
-            vals.push(evaluate_real_array_element_select(name, index, session)?);
-        }
-        Expr::Truncated => unreachable!(
-            "Expr::Truncated is a display-only sentinel; never reaches evaluate_expr_as_real"
-        ),
-    }
-    Ok(())
-}
-
-fn combine_real_eval(combiner: RealCombiner, vals: &mut Vec<f64>) -> Result<(), String> {
-    match combiner {
-        RealCombiner::UnaryPlus => {
-            // Identity; leave the popped value on the stack by popping
-            // and re-pushing.
-            let v = vals.pop().expect("UnaryPlus: operand missing");
-            vals.push(v);
-        }
-        RealCombiner::UnaryMinus => {
-            let v = vals.pop().expect("UnaryMinus: operand missing");
-            vals.push(-v);
-        }
-        RealCombiner::BinaryArith { op } => {
-            let rhs = vals.pop().expect("BinaryArith: rhs missing");
-            let lhs = vals.pop().expect("BinaryArith: lhs missing");
-            let result = match op {
-                BinaryOp::Add => lhs + rhs,
-                BinaryOp::Subtract => lhs - rhs,
-                BinaryOp::Multiply => lhs * rhs,
-                // LRM §5.1.5: real `/` is IEEE 754 division — no truncation,
-                // no division-by-zero error.
-                BinaryOp::Divide => lhs / rhs,
-                // LRM §5.1.5: real `**` inherits f64::powf semantics for
-                // the unspecified corners (0**≤0, negative**non-integral).
-                BinaryOp::Power => lhs.powf(rhs),
-                _ => unreachable!("BinaryArith Combine got {:?}", op),
-            };
-            vals.push(result);
-        }
-        RealCombiner::ConditionalRealMerge => {
-            // x/z cond merge: agree → keep, disagree → NaN. Real has no
-            // per-bit identity, so agree/disagree uses f64 bit pattern
-            // (preserving NaN-bit identity).
-            let else_val = vals.pop().expect("ConditionalRealMerge: else missing");
-            let then_val = vals.pop().expect("ConditionalRealMerge: then missing");
-            let merged = if then_val.to_bits() == else_val.to_bits() {
-                then_val
-            } else {
-                f64::NAN
-            };
-            vals.push(merged);
-        }
-    }
-    Ok(())
-}
-
-fn evaluate_real_math_function(
-    kind: MathFunctionKind,
-    args: &[Expr],
-    session: &Session,
-) -> Result<f64, String> {
-    if kind.arity() == 1 {
-        let x = evaluate_expr_as_real(&args[0], session)?;
-        return Ok(match kind {
+// Apply a real-result math function to `arity` operands popped from
+// `real_vals`. Order on the stack matches push order (lhs at the bottom
+// of the popped slice, rhs at the top).
+fn apply_real_math_function(kind: MathFunctionKind, args: &[f64]) -> f64 {
+    if args.len() == 1 {
+        let x = args[0];
+        return match kind {
             MathFunctionKind::Ln => x.ln(),
             MathFunctionKind::Log10 => x.log10(),
             MathFunctionKind::Exp => x.exp(),
@@ -1213,12 +1047,11 @@ fn evaluate_real_math_function(
             | MathFunctionKind::Pow
             | MathFunctionKind::Atan2
             | MathFunctionKind::Hypot => unreachable!("kind handled by other arity branch"),
-        });
+        };
     }
-
-    let x = evaluate_expr_as_real(&args[0], session)?;
-    let y = evaluate_expr_as_real(&args[1], session)?;
-    Ok(match kind {
+    let x = args[0];
+    let y = args[1];
+    match kind {
         // LRM 17.11 + README "Real numbers": $pow shares f64::powf with
         // the `**` operator on reals, so corner-case results
         // (0.0**0.0=1.0, negative**non-integral=NaN, 0.0**neg=±∞) match.
@@ -1226,17 +1059,6 @@ fn evaluate_real_math_function(
         MathFunctionKind::Atan2 => x.atan2(y),
         MathFunctionKind::Hypot => x.hypot(y),
         _ => unreachable!("kind handled by other arity branch"),
-    })
-}
-
-// Reduce an arbitrary expression — integer- or real-typed — to its 1-bit
-// logical value. Used by ?: cond on both pipelines and by &&/|| operands
-// when at least one operand is real.
-fn logical_value_of_expr(expr: &Expr, session: &Session) -> Result<LogicBit, String> {
-    if expression_is_real(expr, session) {
-        Ok(logical_value_of_real(evaluate_expr_as_real(expr, session)?))
-    } else {
-        Ok(logical_value(&evaluate_expr_in_context(expr, None, session)?))
     }
 }
 
@@ -2137,6 +1959,17 @@ enum EvalTask<'b, 'a: 'b> {
         ctx: Option<ExprMeta>,
     },
     Combine(EvalCombiner<'b, 'a>),
+    /// Visit a real-typed annotated node: leave 1 f64 on `real_vals`.
+    /// Sister of `Visit`; both share the same work loop in the unified
+    /// driver so cross-pipeline transitions (`$rtoi(real_arg)`,
+    /// `$itor(int_arg)`, `1.0 + 1`, `real ? then : else`) become
+    /// regular work-stack pushes instead of nested function calls.
+    VisitReal {
+        node: &'b Annotated<'a>,
+    },
+    /// Real-pipeline combiner. Pops/pushes f64s on `real_vals` and may
+    /// also bridge between `int_vals` and `real_vals` (see RealCombiner).
+    RealCombine(RealCombiner<'b, 'a>),
 }
 
 enum EvalCombiner<'b, 'a: 'b> {
@@ -2279,6 +2112,61 @@ enum EvalCombiner<'b, 'a: 'b> {
         ctx: Option<ExprMeta>,
         strict: bool,
     },
+    /// `$rtoi` / `$realtobits`: real-result-typed argument has just been
+    /// evaluated and sits on `real_vals`. Pops 1 f64; produces 1
+    /// IntegerValue per LRM 17.7.1 / 17.8 then applies outer-context
+    /// extension.
+    RealConversionToInt {
+        kind: RealConversionKind,
+        ctx: Option<ExprMeta>,
+    },
+    /// `$clog2`: integer-typed argument has just been evaluated. Pops 1
+    /// IntegerValue, applies the LRM 17.11.1 ceiling-log; outer-context
+    /// extension follows. Inlines the legacy `evaluate_clog2` body so
+    /// `$clog2($clog2(...))` no longer falls through to the recursive
+    /// walker.
+    Clog2 {
+        ctx: Option<ExprMeta>,
+    },
+    /// `!real_operand`: pops 1 f64 from `real_vals`, applies LRM 5.1.9
+    /// logical-NOT to the f64's reduced logical value, widens to the
+    /// outer context per `widen_relational_result`.
+    UnaryLogicalNotReal {
+        ctx: Option<ExprMeta>,
+    },
+    /// Relational comparison with at least one real operand. Both
+    /// operands have been evaluated to `real_vals` (with implicit
+    /// LRM 3.5.3 coercion via `RealCombiner::CoerceFromInteger` if the
+    /// raw operand was integer-typed). Pops 2 f64s; produces a 1-bit
+    /// IntegerValue.
+    BinaryRealRelational {
+        op: BinaryOp,
+        ctx: Option<ExprMeta>,
+    },
+    /// `==` / `!=` on real operands. IEEE 754 unordered semantics — both
+    /// false for `==` and true for `!=` when either operand is NaN.
+    /// Pops 2 f64s; produces 1-bit.
+    BinaryRealEquality {
+        op: BinaryOp,
+        ctx: Option<ExprMeta>,
+    },
+    /// `&&` / `||` with at least one real operand. LRM 5.1.9 truth table
+    /// after each operand reduces via `logical_value_of_real`. NaN → x.
+    BinaryRealLogical {
+        op: BinaryOp,
+        ctx: Option<ExprMeta>,
+    },
+    /// Real-typed `?:` cond on an integer-result conditional. Pops 1
+    /// f64 (cond) and dispatches: definite cond pushes
+    /// `Visit(chosen, ctx)` + `ConditionalFinalize`; x/z cond pushes
+    /// both branches + `ConditionalMerge`.
+    ConditionalChooseRealCond {
+        then_arm: &'b Annotated<'a>,
+        else_arm: &'b Annotated<'a>,
+        effective_meta: ExprMeta,
+        result_signed: bool,
+        result_base: Base,
+    },
 }
 
 fn evaluate_annotated(
@@ -2286,37 +2174,408 @@ fn evaluate_annotated(
     root_ctx: Option<ExprMeta>,
     session: &Session,
 ) -> Result<IntegerValue, String> {
-    let mut work: Vec<EvalTask> = vec![EvalTask::Visit {
-        node: root,
-        ctx: root_ctx,
-    }];
-    let mut vals: Vec<IntegerValue> = Vec::new();
+    let (mut int_vals, real_vals) = run_eval_loop(
+        EvalTask::Visit {
+            node: root,
+            ctx: root_ctx,
+        },
+        session,
+    )?;
+    debug_assert_eq!(
+        int_vals.len(),
+        1,
+        "evaluate_annotated produced {} integer values",
+        int_vals.len()
+    );
+    debug_assert!(
+        real_vals.is_empty(),
+        "evaluate_annotated leaked {} real values",
+        real_vals.len()
+    );
+    Ok(int_vals
+        .pop()
+        .expect("driver invariant: one root produces one integer value"))
+}
+
+// Real-result entry point. Sister of `evaluate_annotated`; both share
+// `run_eval_loop` so a tree that mixes real and integer subtrees runs
+// on a single work stack. `root.is_real()` must be true.
+fn evaluate_annotated_as_real(root: &Annotated, session: &Session) -> Result<f64, String> {
+    debug_assert!(
+        root.is_real(),
+        "evaluate_annotated_as_real called on integer-typed root"
+    );
+    let (int_vals, mut real_vals) = run_eval_loop(EvalTask::VisitReal { node: root }, session)?;
+    debug_assert_eq!(
+        real_vals.len(),
+        1,
+        "evaluate_annotated_as_real produced {} real values",
+        real_vals.len()
+    );
+    debug_assert!(
+        int_vals.is_empty(),
+        "evaluate_annotated_as_real leaked {} integer values",
+        int_vals.len()
+    );
+    Ok(real_vals
+        .pop()
+        .expect("driver invariant: one real root produces one f64"))
+}
+
+// Unified work-loop shared by both entry points. Holds two value stacks
+// — `int_vals` for IntegerValue results, `real_vals` for f64 results —
+// and dispatches each `EvalTask` to the appropriate pipeline. Cross-
+// pipeline transitions (`$rtoi`, `$itor`, `!real`, `real cond ? ... : ...`,
+// implicit LRM 3.5.3 coercion of integer subtrees in real chains) become
+// task pushes here, so deep alternation doesn't grow the Rust call stack.
+fn run_eval_loop<'b, 'a: 'b>(
+    initial: EvalTask<'b, 'a>,
+    session: &Session,
+) -> Result<(Vec<IntegerValue>, Vec<f64>), String> {
+    let mut work: Vec<EvalTask<'b, 'a>> = vec![initial];
+    let mut int_vals: Vec<IntegerValue> = Vec::new();
+    let mut real_vals: Vec<f64> = Vec::new();
 
     while let Some(task) = work.pop() {
         match task {
             EvalTask::Visit { node, ctx } => {
-                visit_eval(node, ctx, &mut work, &mut vals, session)?;
+                visit_eval(node, ctx, &mut work, &mut int_vals, &mut real_vals, session)?;
             }
             EvalTask::Combine(combiner) => {
-                combine_eval(combiner, &mut work, &mut vals, session)?;
+                combine_eval(combiner, &mut work, &mut int_vals, &mut real_vals, session)?;
+            }
+            EvalTask::VisitReal { node } => {
+                visit_real_eval(node, &mut work, &mut int_vals, &mut real_vals, session)?;
+            }
+            EvalTask::RealCombine(combiner) => {
+                combine_real_eval(combiner, &mut work, &mut int_vals, &mut real_vals)?;
             }
         }
     }
-
-    debug_assert_eq!(
-        vals.len(),
-        1,
-        "evaluate_annotated produced {} values",
-        vals.len()
-    );
-    Ok(vals.pop().expect("driver invariant: one root produces one value"))
+    Ok((int_vals, real_vals))
 }
+
+// Push `node` so it deposits a real value on `real_vals`. If the node is
+// real-typed, that's a single `VisitReal`; if it's integer-typed, queue
+// `Visit { ctx: None }` followed by `RealCombine(CoerceFromInteger)` so
+// the IntegerValue produced by the integer pipeline is bridged to f64
+// via LRM 3.5.3 implicit coercion. Children of real-typed parents
+// (e.g. `1.0 + 1`) go through this helper.
+fn push_visit_as_real<'b, 'a: 'b>(node: &'b Annotated<'a>, work: &mut Vec<EvalTask<'b, 'a>>) {
+    if node.is_real() {
+        work.push(EvalTask::VisitReal { node });
+    } else {
+        work.push(EvalTask::RealCombine(RealCombiner::CoerceFromInteger));
+        work.push(EvalTask::Visit { node, ctx: None });
+    }
+}
+
+// Real-pipeline counterpart of `visit_eval`. Walks the same `Annotated`
+// tree but produces an f64 on `real_vals`. Cross-pipeline transitions
+// (`$itor`, `$bitstoreal`, integer subtree under real arith, `?:` cond
+// bridging) push tasks onto the shared work stack instead of recursing,
+// so deep alternation never grows the Rust call stack.
+fn visit_real_eval<'b, 'a: 'b>(
+    node: &'b Annotated<'a>,
+    work: &mut Vec<EvalTask<'b, 'a>>,
+    _vals: &mut Vec<IntegerValue>,
+    real_vals: &mut Vec<f64>,
+    session: &Session,
+) -> Result<(), String> {
+    debug_assert!(
+        node.is_real(),
+        "visit_real_eval invoked on integer-typed node — caller should have used push_visit_as_real"
+    );
+    match &node.kind {
+        AnnotatedKind::Grouped(inner) => {
+            // Grouped is transparent. Inner of a real-typed Grouped is
+            // itself real-typed.
+            push_visit_as_real(inner, work);
+        }
+        AnnotatedKind::Unary(operand) => {
+            let op = match node.expr {
+                Expr::Unary { op, .. } => *op,
+                _ => unreachable!(),
+            };
+            match op {
+                UnaryOp::Plus => {
+                    work.push(EvalTask::RealCombine(RealCombiner::UnaryPlus));
+                    push_visit_as_real(operand, work);
+                }
+                UnaryOp::Minus => {
+                    work.push(EvalTask::RealCombine(RealCombiner::UnaryMinus));
+                    push_visit_as_real(operand, work);
+                }
+                _ => {
+                    return Err(format!(
+                        "operator {} not allowed on real operand",
+                        unary_op_name(op)
+                    ));
+                }
+            }
+        }
+        AnnotatedKind::Binary { lhs, rhs } => {
+            let op = match node.expr {
+                Expr::Binary { op, .. } => *op,
+                _ => unreachable!(),
+            };
+            match op {
+                BinaryOp::Add
+                | BinaryOp::Subtract
+                | BinaryOp::Multiply
+                | BinaryOp::Divide
+                | BinaryOp::Power => {
+                    work.push(EvalTask::RealCombine(RealCombiner::BinaryArith { op }));
+                    push_visit_as_real(rhs, work);
+                    push_visit_as_real(lhs, work);
+                }
+                _ => {
+                    return Err(format!(
+                        "operator {} not allowed on real operand",
+                        binary_op_name(op)
+                    ));
+                }
+            }
+        }
+        AnnotatedKind::Conditional {
+            cond,
+            then_arm,
+            else_arm,
+        } => {
+            // Cond may be integer- or real-typed; both branches are
+            // real-typed at this point (the conditional itself is real,
+            // so integer branches implicitly coerce per LRM 3.5.3 via
+            // `push_visit_as_real`). Definite cond short-circuits to
+            // one branch (matching legacy walker's behavior); x/z cond
+            // evaluates both branches and merges via
+            // `ConditionalRealMerge`.
+            //
+            // The dispatch is done by a combiner that pops the cond
+            // value (from `int_vals` or `real_vals` depending on cond
+            // type) and pushes the appropriate downstream tasks.
+            if cond.is_real() {
+                work.push(EvalTask::RealCombine(
+                    RealCombiner::DispatchRealCondRealResult { then_arm, else_arm },
+                ));
+                work.push(EvalTask::VisitReal { node: cond });
+            } else {
+                work.push(EvalTask::RealCombine(
+                    RealCombiner::DispatchIntCondRealResult { then_arm, else_arm },
+                ));
+                work.push(EvalTask::Visit {
+                    node: cond,
+                    ctx: None,
+                });
+            }
+        }
+        AnnotatedKind::Concatenation(_) | AnnotatedKind::Replication { .. } => {
+            unreachable!("concatenation/replication never has real result type");
+        }
+        AnnotatedKind::SignCast(_) | AnnotatedKind::BaseCast(_) => {
+            unreachable!("$signed/$unsigned/$bin/$oct/$dec/$hex never has real result type");
+        }
+        AnnotatedKind::RealConversion(arg) => {
+            let kind = match node.expr {
+                Expr::RealConversion { kind, .. } => *kind,
+                _ => unreachable!(),
+            };
+            match kind {
+                RealConversionKind::IntegerToReal => {
+                    // $itor: pop 1 IntegerValue (self-determined arg
+                    // evaluated via integer pipeline), push 1 f64 via
+                    // LRM 3.5.3 implicit conversion.
+                    work.push(EvalTask::RealCombine(RealCombiner::ItorFromInt));
+                    work.push(EvalTask::Visit {
+                        node: arg,
+                        ctx: None,
+                    });
+                }
+                RealConversionKind::BitsToReal => {
+                    work.push(EvalTask::RealCombine(RealCombiner::BitstoRealFromInt));
+                    work.push(EvalTask::Visit {
+                        node: arg,
+                        ctx: None,
+                    });
+                }
+                RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {
+                    unreachable!("integer-result conversions handled by integer pipeline");
+                }
+            }
+        }
+        AnnotatedKind::MathFunction(args) => {
+            let kind = match node.expr {
+                Expr::MathFunction { kind, .. } => *kind,
+                _ => unreachable!(),
+            };
+            debug_assert!(
+                kind.is_real_result(),
+                "integer-result math function `{}` reached real driver",
+                kind.name()
+            );
+            // Push the combiner first (executes last), then args in
+            // reverse — so args[0] visits first and lands at the bottom
+            // of the popped slice.
+            work.push(EvalTask::RealCombine(RealCombiner::MathFunction {
+                kind,
+                arity: args.len(),
+            }));
+            for arg in args.iter().rev() {
+                push_visit_as_real(arg, work);
+            }
+        }
+        AnnotatedKind::Leaf => match node.expr {
+            Expr::RealLiteral(value) => real_vals.push(*value),
+            Expr::Identifier(name) => {
+                let v = session
+                    .lookup(name)
+                    .and_then(|reg| reg.real())
+                    .ok_or_else(|| format!("unknown real variable `{name}`"))?;
+                real_vals.push(v);
+            }
+            Expr::Select { name, kind, inner } => {
+                debug_assert!(
+                    inner.is_none(),
+                    "validator drops chained selects on real array"
+                );
+                let index = match kind {
+                    SelectKind::Bit { index } => index,
+                    _ => unreachable!("validator rejects part-select on real array"),
+                };
+                real_vals.push(evaluate_real_array_element_select(name, index, session)?);
+            }
+            Expr::SystemTask { name } => return Err(task_in_expression_error(name)),
+            Expr::Literal(_) => {
+                unreachable!("integer literal Leaf isn't real-typed; would be coerced earlier");
+            }
+            _ => unreachable!("Leaf annotated kind only wraps Literal / RealLiteral / Identifier / Select / SystemTask"),
+        },
+    }
+    Ok(())
+}
+
+// Real-pipeline combiner. Reads/writes `real_vals` (and may also pop
+// from `int_vals` for the bridge variants). The bridge combiners
+// (`CoerceFromInteger`, `ItorFromInt`, `BitstoRealFromInt`) consume one
+// IntegerValue produced by an integer-side `Visit` task and convert to
+// f64 — they are how integer subtrees appearing inside real chains
+// (LRM 3.5.3 implicit coercion, `$itor`, `$bitstoreal`) deposit a real
+// value on `real_vals` without recursing.
+fn combine_real_eval<'b, 'a: 'b>(
+    combiner: RealCombiner<'b, 'a>,
+    work: &mut Vec<EvalTask<'b, 'a>>,
+    int_vals: &mut Vec<IntegerValue>,
+    real_vals: &mut Vec<f64>,
+) -> Result<(), String> {
+    match combiner {
+        RealCombiner::UnaryPlus => {
+            // Identity; leave the popped value on the stack.
+        }
+        RealCombiner::UnaryMinus => {
+            let v = real_vals.pop().expect("UnaryMinus: operand missing");
+            real_vals.push(-v);
+        }
+        RealCombiner::BinaryArith { op } => {
+            let rhs = real_vals.pop().expect("BinaryArith: rhs missing");
+            let lhs = real_vals.pop().expect("BinaryArith: lhs missing");
+            let result = match op {
+                BinaryOp::Add => lhs + rhs,
+                BinaryOp::Subtract => lhs - rhs,
+                BinaryOp::Multiply => lhs * rhs,
+                BinaryOp::Divide => lhs / rhs,
+                BinaryOp::Power => lhs.powf(rhs),
+                _ => unreachable!("BinaryArith Combine got {:?}", op),
+            };
+            real_vals.push(result);
+        }
+        RealCombiner::ConditionalRealMerge => {
+            let else_val = real_vals
+                .pop()
+                .expect("ConditionalRealMerge: else missing");
+            let then_val = real_vals
+                .pop()
+                .expect("ConditionalRealMerge: then missing");
+            let merged = if then_val.to_bits() == else_val.to_bits() {
+                then_val
+            } else {
+                f64::NAN
+            };
+            real_vals.push(merged);
+        }
+        RealCombiner::MathFunction { kind, arity } => {
+            let start = real_vals.len() - arity;
+            let args: Vec<f64> = real_vals.drain(start..).collect();
+            let result = apply_real_math_function(kind, &args);
+            real_vals.push(result);
+        }
+        RealCombiner::CoerceFromInteger => {
+            let v = int_vals.pop().expect("CoerceFromInteger: int missing");
+            real_vals.push(integer_value_to_f64(&v));
+        }
+        RealCombiner::ItorFromInt => {
+            let v = int_vals.pop().expect("ItorFromInt: int missing");
+            real_vals.push(integer_value_to_f64(&v));
+        }
+        RealCombiner::BitstoRealFromInt => {
+            let v = int_vals.pop().expect("BitstoRealFromInt: int missing");
+            // LRM 17.8: $bitstoreal requires exactly 64-bit operand.
+            // Validator catches the bad case earlier; defence in depth.
+            if v.width != 64 {
+                return Err(format!(
+                    "$bitstoreal argument must be 64 bits wide, got {}",
+                    v.width
+                ));
+            }
+            real_vals.push(bits_value_to_real(&v));
+        }
+        RealCombiner::DispatchIntCondRealResult { then_arm, else_arm } => {
+            let cond_value = int_vals
+                .pop()
+                .expect("DispatchIntCondRealResult: cond missing");
+            push_real_cond_branches(logical_value(&cond_value), then_arm, else_arm, work);
+        }
+        RealCombiner::DispatchRealCondRealResult { then_arm, else_arm } => {
+            let cond_value = real_vals
+                .pop()
+                .expect("DispatchRealCondRealResult: cond missing");
+            push_real_cond_branches(
+                logical_value_of_real(cond_value),
+                then_arm,
+                else_arm,
+                work,
+            );
+        }
+    }
+    Ok(())
+}
+
+// Push the downstream tasks for a real-result conditional after the
+// cond has been reduced to a `LogicBit`. Definite cond → just visit the
+// chosen branch as real; x/z → visit both then merge per LRM §5.1.13's
+// `f64::to_bits()`-equality rule.
+fn push_real_cond_branches<'b, 'a: 'b>(
+    cond_logical: LogicBit,
+    then_arm: &'b Annotated<'a>,
+    else_arm: &'b Annotated<'a>,
+    work: &mut Vec<EvalTask<'b, 'a>>,
+) {
+    match cond_logical {
+        LogicBit::One => push_visit_as_real(then_arm, work),
+        LogicBit::Zero => push_visit_as_real(else_arm, work),
+        LogicBit::X | LogicBit::Z => {
+            work.push(EvalTask::RealCombine(RealCombiner::ConditionalRealMerge));
+            push_visit_as_real(else_arm, work);
+            push_visit_as_real(then_arm, work);
+        }
+    }
+}
+
 
 fn visit_eval<'b, 'a: 'b>(
     node: &'b Annotated<'a>,
     ctx: Option<ExprMeta>,
     work: &mut Vec<EvalTask<'b, 'a>>,
     vals: &mut Vec<IntegerValue>,
+    real_vals: &mut Vec<f64>,
     session: &Session,
 ) -> Result<(), String> {
     match &node.kind {
@@ -2328,21 +2587,21 @@ fn visit_eval<'b, 'a: 'b>(
                 Expr::Binary { op, .. } => *op,
                 _ => unreachable!("AnnotatedKind::Binary only wraps Expr::Binary"),
             };
-            visit_binary_eval(op, lhs, rhs, ctx, work, vals, session)?;
+            visit_binary_eval(op, lhs, rhs, ctx, work, vals, real_vals, session)?;
         }
         AnnotatedKind::Unary(operand) => {
             let op = match node.expr {
                 Expr::Unary { op, .. } => *op,
                 _ => unreachable!("AnnotatedKind::Unary only wraps Expr::Unary"),
             };
-            visit_unary_eval(op, operand, ctx, work, vals, session)?;
+            visit_unary_eval(op, operand, ctx, work, vals, real_vals, session)?;
         }
         AnnotatedKind::Conditional {
             cond,
             then_arm,
             else_arm,
         } => {
-            visit_conditional_eval(cond, then_arm, else_arm, ctx, work, vals, session)?;
+            visit_conditional_eval(cond, then_arm, else_arm, ctx, work, vals, real_vals, session)?;
         }
         AnnotatedKind::SignCast(arg) => {
             // LRM 5.5: argument is evaluated self-determined; the cast
@@ -2410,31 +2669,84 @@ fn visit_eval<'b, 'a: 'b>(
                 ctx: None,
             });
         }
-        // RealConversion / MathFunction / Leaf dispatch to the legacy
-        // walker — their argument subtrees aren't typically deep.
-        AnnotatedKind::RealConversion(_)
-        | AnnotatedKind::MathFunction(_)
-        | AnnotatedKind::Leaf => {
+        // `$rtoi` / `$realtobits`: argument is real-typed (validator
+        // rule). Push the bridge combiner that converts the popped f64
+        // to an IntegerValue per LRM 17.7.1 / 17.8, then queue the
+        // argument as a real-side visit so its result lands on
+        // `real_vals` ready for the bridge to pop. Iterative across
+        // any depth — alternating `$rtoi($itor(...))` is the case the
+        // unified driver was added to handle.
+        AnnotatedKind::RealConversion(arg) => {
+            let kind = match node.expr {
+                Expr::RealConversion { kind, .. } => *kind,
+                _ => unreachable!("AnnotatedKind::RealConversion only wraps Expr::RealConversion"),
+            };
+            match kind {
+                RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {
+                    work.push(EvalTask::Combine(EvalCombiner::RealConversionToInt {
+                        kind,
+                        ctx,
+                    }));
+                    push_visit_as_real(arg, work);
+                }
+                RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => {
+                    unreachable!(
+                        "$itor / $bitstoreal are real-result; integer driver should not see them"
+                    );
+                }
+            }
+        }
+        // Math function: the only integer-result kind is `$clog2`. Real-
+        // result math functions (Pow, Atan2, ..., real-arity-1 family)
+        // are handled by the real driver, never by `visit_eval`.
+        AnnotatedKind::MathFunction(args) => {
+            let kind = match node.expr {
+                Expr::MathFunction { kind, .. } => *kind,
+                _ => unreachable!("AnnotatedKind::MathFunction only wraps Expr::MathFunction"),
+            };
+            match kind {
+                MathFunctionKind::Clog2 => {
+                    debug_assert_eq!(args.len(), 1, "$clog2 has arity 1");
+                    work.push(EvalTask::Combine(EvalCombiner::Clog2 { ctx }));
+                    work.push(EvalTask::Visit {
+                        node: &args[0],
+                        ctx: None,
+                    });
+                }
+                _ => unreachable!(
+                    "real-result math functions handled by evaluate_annotated_as_real"
+                ),
+            }
+        }
+        // Leaves (Literal, Identifier, Select, SystemTask) are evaluated
+        // by the legacy walker. They have no children deeper than the
+        // select index/range, which the walker routes through the
+        // iterative `evaluate_select_subexpr`. RealLiteral can't reach
+        // here — it's real-typed and goes through `visit_real_eval`.
+        AnnotatedKind::Leaf => {
             vals.push(evaluate_expr_in_context(node.expr, ctx, session)?);
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_binary_eval<'b, 'a: 'b>(
     op: BinaryOp,
     lhs: &'b Annotated<'a>,
     rhs: &'b Annotated<'a>,
     ctx: Option<ExprMeta>,
     work: &mut Vec<EvalTask<'b, 'a>>,
-    vals: &mut Vec<IntegerValue>,
-    session: &Session,
+    _vals: &mut Vec<IntegerValue>,
+    _real_vals: &mut Vec<f64>,
+    _session: &Session,
 ) -> Result<(), String> {
-    // LRM Table 5-3 dispatch for real-typed operands. For ops that produce
-    // an integer result with a real operand (relational / equality /
-    // logical), call the legacy real helper inline — its operand
-    // evaluation goes through `evaluate_expr_as_real`, which is still
-    // recursive at this phase. P4 will fix that.
+    // LRM Table 5-3 dispatch for real-typed operands. Relational /
+    // equality / logical produce an integer result from real(s) — push
+    // a bridge combiner that pops 2 reals from `real_vals` and produces
+    // the 1-bit IntegerValue, with each operand visited via
+    // `push_visit_as_real` so an integer subtree (e.g. `1.0 < 1`) gets
+    // implicit LRM 3.5.3 coercion through `RealCombiner::CoerceFromInteger`.
     if lhs.is_real() || rhs.is_real() {
         match op {
             BinaryOp::Add
@@ -2464,21 +2776,24 @@ fn visit_binary_eval<'b, 'a: 'b>(
             | BinaryOp::GreaterThan
             | BinaryOp::LessThanOrEqual
             | BinaryOp::GreaterThanOrEqual => {
-                vals.push(evaluate_real_relational_expr(
-                    op, lhs.expr, rhs.expr, ctx, session,
-                )?);
+                work.push(EvalTask::Combine(EvalCombiner::BinaryRealRelational {
+                    op,
+                    ctx,
+                }));
+                push_visit_as_real(rhs, work);
+                push_visit_as_real(lhs, work);
                 return Ok(());
             }
             BinaryOp::Equal | BinaryOp::NotEqual => {
-                vals.push(evaluate_real_equality_expr(
-                    op, lhs.expr, rhs.expr, ctx, session,
-                )?);
+                work.push(EvalTask::Combine(EvalCombiner::BinaryRealEquality { op, ctx }));
+                push_visit_as_real(rhs, work);
+                push_visit_as_real(lhs, work);
                 return Ok(());
             }
             BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
-                vals.push(evaluate_real_logical_expr(
-                    op, lhs.expr, rhs.expr, ctx, session,
-                )?);
+                work.push(EvalTask::Combine(EvalCombiner::BinaryRealLogical { op, ctx }));
+                push_visit_as_real(rhs, work);
+                push_visit_as_real(lhs, work);
                 return Ok(());
             }
         }
@@ -2671,8 +2986,9 @@ fn visit_unary_eval<'b, 'a: 'b>(
     operand: &'b Annotated<'a>,
     ctx: Option<ExprMeta>,
     work: &mut Vec<EvalTask<'b, 'a>>,
-    vals: &mut Vec<IntegerValue>,
-    session: &Session,
+    _vals: &mut Vec<IntegerValue>,
+    _real_vals: &mut Vec<f64>,
+    _session: &Session,
 ) -> Result<(), String> {
     if operand.is_real() {
         // Real unary: only LogicalNot is integer-result on a real
@@ -2680,13 +2996,12 @@ fn visit_unary_eval<'b, 'a: 'b>(
         // path); BitwiseNot/Reductions are validator-rejected.
         match op {
             UnaryOp::LogicalNot => {
-                let value = evaluate_expr_as_real(operand.expr, session)?;
-                let bit = match logical_value_of_real(value) {
-                    LogicBit::One => LogicBit::Zero,
-                    LogicBit::Zero => LogicBit::One,
-                    LogicBit::X | LogicBit::Z => LogicBit::X,
-                };
-                vals.push(widen_relational_result(comparison_result_value(bit), ctx));
+                // Bridge: pop 1 f64 from `real_vals`, push 1-bit
+                // IntegerValue per LRM 5.1.9. Operand visit goes through
+                // `push_visit_as_real` so `!1` (integer operand) implicitly
+                // coerces; `!1.0` (real operand) directly visits as real.
+                work.push(EvalTask::Combine(EvalCombiner::UnaryLogicalNotReal { ctx }));
+                push_visit_as_real(operand, work);
                 return Ok(());
             }
             UnaryOp::BitwiseNot
@@ -2751,6 +3066,7 @@ fn visit_unary_eval<'b, 'a: 'b>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn visit_conditional_eval<'b, 'a: 'b>(
     cond: &'b Annotated<'a>,
     then_arm: &'b Annotated<'a>,
@@ -2758,7 +3074,8 @@ fn visit_conditional_eval<'b, 'a: 'b>(
     ctx: Option<ExprMeta>,
     work: &mut Vec<EvalTask<'b, 'a>>,
     _vals: &mut Vec<IntegerValue>,
-    session: &Session,
+    _real_vals: &mut Vec<f64>,
+    _session: &Session,
 ) -> Result<(), String> {
     if then_arm.is_real() || else_arm.is_real() {
         unreachable!("real-typed conditional should be handled by the real path");
@@ -2777,51 +3094,18 @@ fn visit_conditional_eval<'b, 'a: 'b>(
     };
 
     // Cond may be real-typed even when result is integer (LRM lets cond
-    // be any type). Real cond reduces via real logical; integer cond
-    // reduces via logical_value at combine time. Handle real cond inline
-    // (recursive, P4 fixes).
+    // be any type). Real cond goes through `ConditionalChooseRealCond`
+    // which pops the f64 cond off `real_vals` and dispatches the chosen
+    // branch; the cond visit pushes onto `real_vals` via `VisitReal`.
     if cond.is_real() {
-        let real_val = evaluate_expr_as_real(cond.expr, session)?;
-        let cond_logical = logical_value_of_real(real_val);
-        match cond_logical {
-            LogicBit::One => {
-                work.push(EvalTask::Combine(EvalCombiner::ConditionalFinalize {
-                    effective_meta,
-                    result_signed: effective_meta.signed,
-                    result_base: meta.base,
-                }));
-                work.push(EvalTask::Visit {
-                    node: then_arm,
-                    ctx: Some(effective_meta),
-                });
-            }
-            LogicBit::Zero => {
-                work.push(EvalTask::Combine(EvalCombiner::ConditionalFinalize {
-                    effective_meta,
-                    result_signed: effective_meta.signed,
-                    result_base: meta.base,
-                }));
-                work.push(EvalTask::Visit {
-                    node: else_arm,
-                    ctx: Some(effective_meta),
-                });
-            }
-            LogicBit::X | LogicBit::Z => {
-                work.push(EvalTask::Combine(EvalCombiner::ConditionalMerge {
-                    effective_meta,
-                    result_signed: effective_meta.signed,
-                    result_base: meta.base,
-                }));
-                work.push(EvalTask::Visit {
-                    node: else_arm,
-                    ctx: Some(effective_meta),
-                });
-                work.push(EvalTask::Visit {
-                    node: then_arm,
-                    ctx: Some(effective_meta),
-                });
-            }
-        }
+        work.push(EvalTask::Combine(EvalCombiner::ConditionalChooseRealCond {
+            then_arm,
+            else_arm,
+            effective_meta,
+            result_signed: effective_meta.signed,
+            result_base: meta.base,
+        }));
+        work.push(EvalTask::VisitReal { node: cond });
         return Ok(());
     }
 
@@ -2844,6 +3128,7 @@ fn combine_eval<'b, 'a: 'b>(
     combiner: EvalCombiner<'b, 'a>,
     work: &mut Vec<EvalTask<'b, 'a>>,
     vals: &mut Vec<IntegerValue>,
+    real_vals: &mut Vec<f64>,
     session: &Session,
 ) -> Result<(), String> {
     match combiner {
@@ -3269,9 +3554,149 @@ fn combine_eval<'b, 'a: 'b>(
             let result = IntegerValue::computed(bits.len(), false, leftmost_base, bits);
             vals.push(extend_to_outer_context(result, ctx));
         }
+        // ----- Bridge variants (real_vals → int_vals or read int_vals to
+        // produce an integer-pipeline value). -----
+        EvalCombiner::RealConversionToInt { kind, ctx } => {
+            let real_val = real_vals
+                .pop()
+                .expect("RealConversionToInt: real arg missing");
+            let result = match kind {
+                RealConversionKind::RealToInteger => real_to_integer_value(real_val),
+                RealConversionKind::RealToBits => {
+                    // LRM 17.8: bitcast a real to its 64-bit IEEE 754
+                    // representation. Display as hex since the value is a
+                    // bit pattern, not a magnitude.
+                    let bits = real_val.to_bits();
+                    IntegerValue::from_bigint(BigInt::from(bits), 64, false, Base::Hex)
+                }
+                RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => {
+                    unreachable!("real-result conversions don't reach RealConversionToInt");
+                }
+            };
+            vals.push(extend_cast_to_outer_context(result, ctx));
+        }
+        EvalCombiner::Clog2 { ctx } => {
+            let arg = vals.pop().expect("Clog2: arg missing");
+            let result = if arg.has_unknown_bits() {
+                IntegerValue::all_x(32, true, Base::Decimal)
+            } else {
+                clog2_result_value(bits_to_biguint(&arg.bits))
+            };
+            vals.push(extend_cast_to_outer_context(result, ctx));
+        }
+        EvalCombiner::UnaryLogicalNotReal { ctx } => {
+            let value = real_vals
+                .pop()
+                .expect("UnaryLogicalNotReal: operand missing");
+            let bit = match logical_value_of_real(value) {
+                LogicBit::One => LogicBit::Zero,
+                LogicBit::Zero => LogicBit::One,
+                LogicBit::X | LogicBit::Z => LogicBit::X,
+            };
+            vals.push(widen_relational_result(comparison_result_value(bit), ctx));
+        }
+        EvalCombiner::BinaryRealRelational { op, ctx } => {
+            let rhs_val = real_vals
+                .pop()
+                .expect("BinaryRealRelational: rhs missing");
+            let lhs_val = real_vals
+                .pop()
+                .expect("BinaryRealRelational: lhs missing");
+            let result = match op {
+                BinaryOp::LessThan => lhs_val < rhs_val,
+                BinaryOp::GreaterThan => lhs_val > rhs_val,
+                BinaryOp::LessThanOrEqual => lhs_val <= rhs_val,
+                BinaryOp::GreaterThanOrEqual => lhs_val >= rhs_val,
+                _ => unreachable!("non-relational op in BinaryRealRelational"),
+            };
+            let bit = if result { LogicBit::One } else { LogicBit::Zero };
+            vals.push(widen_relational_result(comparison_result_value(bit), ctx));
+        }
+        EvalCombiner::BinaryRealEquality { op, ctx } => {
+            let rhs_val = real_vals.pop().expect("BinaryRealEquality: rhs missing");
+            let lhs_val = real_vals.pop().expect("BinaryRealEquality: lhs missing");
+            let result = match op {
+                BinaryOp::Equal => lhs_val == rhs_val,
+                BinaryOp::NotEqual => lhs_val != rhs_val,
+                _ => unreachable!("non-equality op in BinaryRealEquality"),
+            };
+            let bit = if result { LogicBit::One } else { LogicBit::Zero };
+            vals.push(widen_relational_result(comparison_result_value(bit), ctx));
+        }
+        EvalCombiner::BinaryRealLogical { op, ctx } => {
+            let rhs_val = real_vals.pop().expect("BinaryRealLogical: rhs missing");
+            let lhs_val = real_vals.pop().expect("BinaryRealLogical: lhs missing");
+            let lhs_logical = logical_value_of_real(lhs_val);
+            let rhs_logical = logical_value_of_real(rhs_val);
+            let bit = match op {
+                BinaryOp::LogicalAnd => match (lhs_logical, rhs_logical) {
+                    (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
+                    (LogicBit::One, LogicBit::One) => LogicBit::One,
+                    _ => LogicBit::X,
+                },
+                BinaryOp::LogicalOr => match (lhs_logical, rhs_logical) {
+                    (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
+                    (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
+                    _ => LogicBit::X,
+                },
+                _ => unreachable!("non-logical op in BinaryRealLogical"),
+            };
+            vals.push(widen_relational_result(comparison_result_value(bit), ctx));
+        }
+        EvalCombiner::ConditionalChooseRealCond {
+            then_arm,
+            else_arm,
+            effective_meta,
+            result_signed,
+            result_base,
+        } => {
+            let cond_val = real_vals
+                .pop()
+                .expect("ConditionalChooseRealCond: cond missing");
+            match logical_value_of_real(cond_val) {
+                LogicBit::One => {
+                    work.push(EvalTask::Combine(EvalCombiner::ConditionalFinalize {
+                        effective_meta,
+                        result_signed,
+                        result_base,
+                    }));
+                    work.push(EvalTask::Visit {
+                        node: then_arm,
+                        ctx: Some(effective_meta),
+                    });
+                }
+                LogicBit::Zero => {
+                    work.push(EvalTask::Combine(EvalCombiner::ConditionalFinalize {
+                        effective_meta,
+                        result_signed,
+                        result_base,
+                    }));
+                    work.push(EvalTask::Visit {
+                        node: else_arm,
+                        ctx: Some(effective_meta),
+                    });
+                }
+                LogicBit::X | LogicBit::Z => {
+                    work.push(EvalTask::Combine(EvalCombiner::ConditionalMerge {
+                        effective_meta,
+                        result_signed,
+                        result_base,
+                    }));
+                    work.push(EvalTask::Visit {
+                        node: else_arm,
+                        ctx: Some(effective_meta),
+                    });
+                    work.push(EvalTask::Visit {
+                        node: then_arm,
+                        ctx: Some(effective_meta),
+                    });
+                }
+            }
+        }
     }
     Ok(())
 }
+
 
 // Pure value-level relational comparison; mirrors `evaluate_relational_expr`'s
 // bit-comparison logic but on already-evaluated, already-extended values.

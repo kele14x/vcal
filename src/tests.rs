@@ -3,7 +3,10 @@ use std::io::Cursor;
 use num_bigint::BigInt;
 
 use crate::lexer::{Token, tokenize};
-use crate::parser::{BinaryOp, Expr, UnaryOp, parse_expression, parse_integer};
+use crate::parser::{
+    BinaryOp, Expr, MathFunctionKind, RealConversionKind, UnaryOp, parse_expression,
+    parse_integer,
+};
 use crate::{Session, evaluate_input, parse_input, parse_input_with_depth, run_repl};
 
 #[test]
@@ -7731,6 +7734,162 @@ fn evaluate_of_deep_concatenation_two_items_per_layer_does_not_overflow() {
     let total_bits = n + 1;
     let expected_digits = "1".repeat(total_bits);
     assert_eq!(value.canonical(), format!("{total_bits}'b{expected_digits}"));
+}
+
+#[test]
+fn evaluate_of_deep_real_math_chain_does_not_overflow() {
+    // `$ln($ln(...$ln(1.0)))` chain. Real-result arity-1 math fn. The
+    // pre-fix recursion came from `evaluate_real_math_function` calling
+    // `evaluate_expr_as_real` per arg; the unified driver dispatches the
+    // arg via a `RealCombiner::MathFunction` task, so depth turns into
+    // work-stack growth, not Rust-stack growth.
+    let mut e = Expr::RealLiteral(1.0);
+    for _ in 0..50_000 {
+        e = Expr::MathFunction {
+            kind: MathFunctionKind::Ln,
+            args: vec![e],
+        };
+    }
+    let session = Session::new();
+    let value = crate::eval::evaluate_expr(&e, &session).expect("deep $ln chain evaluates");
+    // $ln(1.0) = 0.0; $ln(0.0) = -inf; $ln(-inf) = NaN; thereafter NaN.
+    // Surface result is NaN regardless of exact transition; we just
+    // assert it's a real value (no crash).
+    assert!(matches!(value, crate::value::Value::Real(_)));
+}
+
+#[test]
+fn evaluate_of_deep_pow_chain_does_not_overflow() {
+    // `$pow(2, $pow(2, ... $pow(2, 1)))` — real-result arity-2.
+    // Exercises the recursive `evaluate_real_math_function` path that
+    // crashed pre-fix at ~10K depth.
+    let mut e = Expr::Literal(parse_integer("1").expect("inner literal"));
+    for _ in 0..50_000 {
+        e = Expr::MathFunction {
+            kind: MathFunctionKind::Pow,
+            args: vec![Expr::Literal(parse_integer("2").expect("base literal")), e],
+        };
+    }
+    let session = Session::new();
+    let value = crate::eval::evaluate_expr(&e, &session).expect("deep $pow chain evaluates");
+    assert!(matches!(value, crate::value::Value::Real(_)));
+}
+
+#[test]
+fn evaluate_of_deep_clog2_chain_does_not_overflow() {
+    // `$clog2($clog2(...$clog2(4)))` — integer-result. Pre-fix
+    // recursion came from `evaluate_clog2` calling
+    // `evaluate_expr_in_context` for the arg; now dispatched via the
+    // `EvalCombiner::Clog2` bridge.
+    let mut e = Expr::Literal(parse_integer("4").expect("inner literal"));
+    for _ in 0..50_000 {
+        e = Expr::MathFunction {
+            kind: MathFunctionKind::Clog2,
+            args: vec![e],
+        };
+    }
+    let session = Session::new();
+    let value = crate::eval::evaluate_expr(&e, &session).expect("deep $clog2 chain evaluates");
+    assert!(matches!(value, crate::value::Value::Integer(_)));
+}
+
+#[test]
+fn evaluate_of_deep_rtoi_itor_alternation_does_not_overflow() {
+    // Strict alternation of `$rtoi($itor($rtoi($itor(...))))` — the
+    // case the unified driver was added for. Pre-fix this recursed
+    // through `evaluate_real_conversion_expr` ↔ `visit_real_eval`'s
+    // IntegerToReal arm at every level (4 frames per pair).
+    let mut e = Expr::Literal(parse_integer("1").expect("inner literal"));
+    for i in 0..50_000usize {
+        e = if i.is_multiple_of(2) {
+            Expr::RealConversion {
+                kind: RealConversionKind::IntegerToReal,
+                arg: Box::new(e),
+            }
+        } else {
+            Expr::RealConversion {
+                kind: RealConversionKind::RealToInteger,
+                arg: Box::new(e),
+            }
+        };
+    }
+    // Outer is RealToInteger (i=49_999, odd) → integer result.
+    let session = Session::new();
+    let value =
+        crate::eval::evaluate_expr(&e, &session).expect("deep $rtoi/$itor alternation evaluates");
+    assert!(matches!(value, crate::value::Value::Integer(_)));
+}
+
+#[test]
+fn evaluate_of_deep_realtobits_bitstoreal_alternation_does_not_overflow() {
+    // Sister test for $realtobits/$bitstoreal — same shape, tests the
+    // 64-bit bitcast bridge path.
+    let mut e = Expr::RealLiteral(1.0);
+    for i in 0..30_000usize {
+        e = if i.is_multiple_of(2) {
+            Expr::RealConversion {
+                kind: RealConversionKind::RealToBits,
+                arg: Box::new(e),
+            }
+        } else {
+            Expr::RealConversion {
+                kind: RealConversionKind::BitsToReal,
+                arg: Box::new(e),
+            }
+        };
+    }
+    let session = Session::new();
+    let value = crate::eval::evaluate_expr(&e, &session)
+        .expect("deep $realtobits/$bitstoreal alternation evaluates");
+    // Outer kind decides result type.
+    let _ = value;
+}
+
+#[test]
+fn evaluate_of_pow_with_deep_integer_arg_does_not_overflow() {
+    // `$pow(2, 1+1+...+1)` — pre-fix the integer arg fell through
+    // `visit_real_eval`'s integer fallback to the recursive
+    // `evaluate_expr_in_context`. Now an integer subtree visited from a
+    // real-mode parent goes through the integer CES with a
+    // `RealCombiner::CoerceFromInteger` bridge.
+    let mut chain = Expr::Literal(parse_integer("1").expect("seed literal"));
+    for _ in 0..50_000 {
+        chain = Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(chain),
+            rhs: Box::new(Expr::Literal(parse_integer("1").expect("step literal"))),
+        };
+    }
+    let e = Expr::MathFunction {
+        kind: MathFunctionKind::Pow,
+        args: vec![Expr::Literal(parse_integer("2").expect("base literal")), chain],
+    };
+    let session = Session::new();
+    let value = crate::eval::evaluate_expr(&e, &session)
+        .expect("$pow(2, deep integer chain) evaluates");
+    assert!(matches!(value, crate::value::Value::Real(_)));
+}
+
+#[test]
+fn evaluate_of_itor_with_deep_integer_arg_does_not_overflow() {
+    // `$itor(1+1+...+1)` — forces a single int→real bridge over a deep
+    // integer subtree.
+    let mut chain = Expr::Literal(parse_integer("1").expect("seed literal"));
+    for _ in 0..50_000 {
+        chain = Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(chain),
+            rhs: Box::new(Expr::Literal(parse_integer("1").expect("step literal"))),
+        };
+    }
+    let e = Expr::RealConversion {
+        kind: RealConversionKind::IntegerToReal,
+        arg: Box::new(chain),
+    };
+    let session = Session::new();
+    let value =
+        crate::eval::evaluate_expr(&e, &session).expect("$itor(deep integer chain) evaluates");
+    assert!(matches!(value, crate::value::Value::Real(_)));
 }
 
 #[test]
