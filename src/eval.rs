@@ -1650,13 +1650,21 @@ enum AnnValidateTask<'b, 'a: 'b> {
         item: &'b Annotated<'a>,
         role: &'static str,
     },
-    /// Final pass for a Concatenation/Replication node: runs
-    /// `collect_concatenation_bits` after every item has been validated.
-    /// Original ordering surfaces "concatenation operand cannot be real"
-    /// before "indefinite width" / "unknown bits" diagnostics emitted
-    /// by `collect_concatenation_bits`.
-    PostCollectBits {
-        raw_items: &'a [Expr],
+    /// Final pass for a Concatenation/Replication node, run after every
+    /// item has been structurally validated. Enforces LRM 5.1.14's two
+    /// list-level constraints:
+    ///
+    /// 1. each operand must have a definite width
+    ///    (`is_indefinite_width` per item),
+    /// 2. the joined width must be positive (`sum of meta().width`).
+    ///
+    /// Both reads are cached on the Annotated children, so this is O(N)
+    /// in the operand count rather than O(N) in the subtree size — the
+    /// O(N²) re-walk that used to live in `collect_concatenation_bits`
+    /// is gone. The variant carries `&[Annotated]` directly; raw `&Expr`
+    /// is no longer needed since width comes from cached meta.
+    PostCheckConcatWidth {
+        items: &'b [Annotated<'a>],
     },
 }
 
@@ -1668,15 +1676,10 @@ fn validate_annotated(annot: &Annotated, session: &Session) -> Result<(), String
             AnnValidateTask::ConcatItem { item, role } => {
                 let unwrapped = unwrap_grouped_annotated(item);
                 if let AnnotatedKind::Replication { count, items } = &unwrapped.kind {
-                    let raw_items = match unwrapped.expr {
-                        Expr::Replication { items: ri, .. } => ri.as_slice(),
-                        _ => unreachable!(),
-                    };
                     push_replication_validation_annotated(
                         count,
                         items,
-                        raw_items,
-                        evaluate_replication_count_allow_zero,
+                        /* strict = */ false,
                         &mut work,
                         session,
                     )?;
@@ -1692,8 +1695,22 @@ fn validate_annotated(annot: &Annotated, session: &Session) -> Result<(), String
                     return Err(format!("{role} operand cannot be real"));
                 }
             }
-            AnnValidateTask::PostCollectBits { raw_items } => {
-                let _ = collect_concatenation_bits(raw_items, session)?;
+            AnnValidateTask::PostCheckConcatWidth { items } => {
+                let mut total_width: usize = 0;
+                for item in items.iter() {
+                    if is_indefinite_width(item.expr) {
+                        return Err(
+                            "concatenation operand has indefinite width".to_string()
+                        );
+                    }
+                    total_width = total_width.saturating_add(item.meta().width);
+                }
+                if total_width == 0 {
+                    return Err(
+                        "concatenation must have at least one operand with positive size"
+                            .to_string(),
+                    );
+                }
             }
         }
     }
@@ -1788,17 +1805,14 @@ fn visit_annotated<'b, 'a: 'b>(
             work.push(AnnValidateTask::Visit(cond));
         }
         AnnotatedKind::Concatenation(items) => {
-            // collect_concatenation_bits operates on raw Exprs and
-            // evaluates each item; we have the raw children on annot.expr.
-            // It runs LAST so per-item real-rejection (via ConcatItem)
-            // surfaces before the indefinite-width / unknown-bits checks
-            // that collect_concatenation_bits emits — matching the
-            // original recursive walker's diagnostic priority.
-            let raw_items = match annot.expr {
-                Expr::Concatenation { items: ri } => ri.as_slice(),
-                _ => unreachable!(),
-            };
-            work.push(AnnValidateTask::PostCollectBits { raw_items });
+            // PostCheckConcatWidth runs LAST so per-item real-rejection
+            // (via ConcatItem) and per-item structural errors surface
+            // before the indefinite-width / positive-width checks —
+            // matching the original recursive walker's diagnostic
+            // priority. Width is read from cached meta(), so this no
+            // longer re-walks subtrees the way `collect_concatenation_bits`
+            // did.
+            work.push(AnnValidateTask::PostCheckConcatWidth { items });
             for item in items.iter().rev() {
                 work.push(AnnValidateTask::ConcatItem {
                     item,
@@ -1807,15 +1821,10 @@ fn visit_annotated<'b, 'a: 'b>(
             }
         }
         AnnotatedKind::Replication { count, items } => {
-            let raw_items = match annot.expr {
-                Expr::Replication { items: ri, .. } => ri.as_slice(),
-                _ => unreachable!(),
-            };
             push_replication_validation_annotated(
                 count,
                 items,
-                raw_items,
-                evaluate_replication_count,
+                /* strict = */ true,
                 work,
                 session,
             )?;
@@ -1889,8 +1898,7 @@ fn visit_annotated<'b, 'a: 'b>(
 fn push_replication_validation_annotated<'b, 'a: 'b>(
     count: &'b Annotated<'a>,
     items: &'b [Annotated<'a>],
-    raw_items: &'a [Expr],
-    count_check: fn(&Expr, &Session) -> Result<usize, String>,
+    strict: bool,
     work: &mut Vec<AnnValidateTask<'b, 'a>>,
     session: &Session,
 ) -> Result<(), String> {
@@ -1900,21 +1908,36 @@ fn push_replication_validation_annotated<'b, 'a: 'b>(
     //   3. validate each item     // structural recursion
     //   4. count_check            // constant-eval count
     //   5. collect_concat_bits    // evaluate each item & combine
-    // The eager real-check + count_check before pushing children would
-    // surface different diagnostics for inputs whose count or items are
-    // structurally invalid, so we keep the same ordering: real-check
-    // runs first (local; cheap), then push count/items for recursion;
-    // count_check + collect_bits happen in PostCollectBits at the end.
-    // count_check is materialised inline by routing through the same
-    // PostCollectBits sink — but it carries `raw_items` only, so we
-    // run the count_check eagerly here. By construction count's
-    // structural validation runs to completion before this PostCollectBits
-    // fires (PostCollectBits is pushed first, so it pops last).
+    // We keep the ordering: real-check runs first (cheap, local); the
+    // eager count constant-eval runs before pushing the count's Visit
+    // (mirroring how the legacy walker called `count_check` outside the
+    // recursion); items are validated via ConcatItem; the final
+    // indefinite-width / positive-width check fires through
+    // PostCheckConcatWidth.
+    //
+    // The count is evaluated through `evaluate_annotated` (iterative)
+    // rather than the legacy recursive `evaluate_expr_in_context`, so a
+    // deep arithmetic chain inside the count no longer crashes.
+    // `strict = true` rejects count = 0 (top-level replication); `strict
+    // = false` allows zero (replication directly inside a concat list).
     if count.is_real() {
         return Err("replication count cannot be real".to_string());
     }
-    let _ = count_check(count.expr, session)?;
-    work.push(AnnValidateTask::PostCollectBits { raw_items });
+    let count_val = evaluate_annotated(count, None, session)?;
+    if count_val.has_unknown_bits() {
+        return Err("replication count contains unknown bits".to_string());
+    }
+    let count_bigint = count_val.as_bigint(count_val.signed);
+    if count_bigint.sign() == Sign::Minus {
+        return Err("replication count must be non-negative".to_string());
+    }
+    let count_usize = count_bigint
+        .to_usize()
+        .ok_or_else(|| "replication count too large".to_string())?;
+    if strict && count_usize == 0 {
+        return Err("replication count must be positive in this context".to_string());
+    }
+    work.push(AnnValidateTask::PostCheckConcatWidth { items });
     for item in items.iter().rev() {
         work.push(AnnValidateTask::ConcatItem {
             item,
@@ -1931,6 +1954,39 @@ fn unwrap_grouped_annotated<'a, 'b>(annot: &'b Annotated<'a>) -> &'b Annotated<'
         cur = inner;
     }
     cur
+}
+
+// Schedule evaluation of one concatenation operand. The LRM 5.1.14
+// "lenient zero-rep" rule — a Replication directly inside a concat list
+// may have count = 0 and contribute no bits — is implemented by peeling
+// any leading Grouped and routing a Replication item to the same
+// `ReplicationCountReceived` combiner the top-level Replication uses,
+// but with `strict = false` so a zero count is a no-op rather than an
+// error. Non-Replication items take the normal Visit path with `ctx =
+// None` (concat operands are self-determined per LRM 5.1.14).
+fn push_concat_item_eval<'b, 'a: 'b>(
+    item: &'b Annotated<'a>,
+    work: &mut Vec<EvalTask<'b, 'a>>,
+) {
+    let unwrapped = unwrap_grouped_annotated(item);
+    if let AnnotatedKind::Replication { count, items } = &unwrapped.kind {
+        let leftmost_base = items[0].meta().base;
+        work.push(EvalTask::Combine(EvalCombiner::ReplicationCountReceived {
+            items,
+            leftmost_base,
+            ctx: None,
+            strict: false,
+        }));
+        work.push(EvalTask::Visit {
+            node: count,
+            ctx: None,
+        });
+    } else {
+        work.push(EvalTask::Visit {
+            node: item,
+            ctx: None,
+        });
+    }
 }
 
 fn unary_op_name(op: UnaryOp) -> &'static str {
@@ -2182,6 +2238,47 @@ enum EvalCombiner<'b, 'a: 'b> {
         base: Base,
         ctx: Option<ExprMeta>,
     },
+    /// LRM 5.1.14 concatenation. Pops `item_count` already-evaluated
+    /// item values (in source order on the value stack: items[0] at the
+    /// bottom, items[N-1] on top). Joins their bits MSB-first → LSB-last
+    /// to build an unsigned natural-width result, then extends to the
+    /// outer ctx if the ctx is wider. Emits the "must have at least one
+    /// operand with positive size" error when every popped item
+    /// contributes zero bits (only possible when every item is a zero-
+    /// count Replication).
+    Concatenation {
+        item_count: usize,
+        leftmost_base: Base,
+        ctx: Option<ExprMeta>,
+    },
+    /// First half of a Replication evaluation: the count expression has
+    /// just been evaluated and sits on top of the value stack. Validates
+    /// the count (unknown bits, sign, fits-in-usize, strict-positive)
+    /// and either short-circuits (count = 0 in lenient/inside-concat
+    /// position → push a zero-bit value) or pushes a `ReplicationFinalize`
+    /// Combine plus per-item Visits to evaluate the inner items. Strict
+    /// mode is used at the top level (`{N{...}}` with no surrounding
+    /// concat) where LRM 5.1.14 forbids count = 0; lenient mode is used
+    /// when a Replication appears as a concatenation operand.
+    ReplicationCountReceived {
+        items: &'b [Annotated<'a>],
+        leftmost_base: Base,
+        ctx: Option<ExprMeta>,
+        strict: bool,
+    },
+    /// Final pass of a Replication: the inner items have been evaluated
+    /// (`item_count` IntegerValues on top of the stack). Joins them into
+    /// `inner_bits` and replicates `count` times. In strict mode (top-
+    /// level) an empty `inner_bits` is rejected with the same diagnostic
+    /// the legacy `collect_concatenation_bits` emitted; in lenient mode
+    /// (inside a concat) the result is allowed to be zero-width.
+    ReplicationFinalize {
+        item_count: usize,
+        count: usize,
+        leftmost_base: Base,
+        ctx: Option<ExprMeta>,
+        strict: bool,
+    },
 }
 
 fn evaluate_annotated(
@@ -2275,19 +2372,47 @@ fn visit_eval<'b, 'a: 'b>(
                 ctx: None,
             });
         }
-        // Concatenation and Replication fall through to the legacy walker
-        // because the concat-item / lenient-count rules (LRM 5.1.14) are
-        // intricate enough that re-implementing them in CES would be its
-        // own change. Deep chains inside a single concat item still hit
-        // the recursive walker — left as a known follow-up. For the
-        // reported deep-chain crash (top-level `1+1+...+1`, `((..1..))`,
-        // etc.), neither shape matters.
-        //
-        // RealConversion / MathFunction / Leaf likewise dispatch to the
-        // legacy walker — their argument subtrees aren't typically deep.
-        AnnotatedKind::Concatenation(_)
-        | AnnotatedKind::Replication { .. }
-        | AnnotatedKind::RealConversion(_)
+        // LRM 5.1.14 concatenation: each operand is self-determined; the
+        // joined width comes from summing their widths; the result is
+        // unsigned and uses the leftmost item's base. Items are pushed
+        // in reverse so items[0] visits first and lands at the bottom of
+        // the value stack — the Combine drains them in source order.
+        // Replication-inside-concat is dispatched lenient (count = 0 is
+        // a no-op contributing zero bits) via `push_concat_item_eval`.
+        AnnotatedKind::Concatenation(items) => {
+            // `meta()` is the cached LRM 5.1.14 meta computed in
+            // `annotate`'s Combine; reading items[0]'s base is O(1) and
+            // replaces the legacy `infer_expr_meta(items[0])` re-walk.
+            let leftmost_base = items[0].meta().base;
+            work.push(EvalTask::Combine(EvalCombiner::Concatenation {
+                item_count: items.len(),
+                leftmost_base,
+                ctx,
+            }));
+            for item in items.iter().rev() {
+                push_concat_item_eval(item, work);
+            }
+        }
+        // Top-level Replication (`{N{a, b, ...}}` not inside a surrounding
+        // concat). Strict count: zero is rejected. The count is evaluated
+        // first via the same iterative driver — its IntegerValue lands on
+        // the value stack and `ReplicationCountReceived` pops it.
+        AnnotatedKind::Replication { count, items } => {
+            let leftmost_base = items[0].meta().base;
+            work.push(EvalTask::Combine(EvalCombiner::ReplicationCountReceived {
+                items,
+                leftmost_base,
+                ctx,
+                strict: true,
+            }));
+            work.push(EvalTask::Visit {
+                node: count,
+                ctx: None,
+            });
+        }
+        // RealConversion / MathFunction / Leaf dispatch to the legacy
+        // walker — their argument subtrees aren't typically deep.
+        AnnotatedKind::RealConversion(_)
         | AnnotatedKind::MathFunction(_)
         | AnnotatedKind::Leaf => {
             vals.push(evaluate_expr_in_context(node.expr, ctx, session)?);
@@ -3054,6 +3179,95 @@ fn combine_eval<'b, 'a: 'b>(
             let cast_value =
                 IntegerValue::computed(arg.width, arg.signed, base, arg.bits);
             vals.push(extend_cast_to_outer_context(cast_value, ctx));
+        }
+        EvalCombiner::Concatenation {
+            item_count,
+            leftmost_base,
+            ctx,
+        } => {
+            // Drain item_count items from the value stack in source order
+            // (items[0] at the bottom). Bit vectors are LSB-first; concat
+            // joins items leftmost → MSB-side, so iterate items in reverse
+            // and extend bits in that order.
+            let start = vals.len() - item_count;
+            let items: Vec<IntegerValue> = vals.drain(start..).collect();
+            let mut bits = Vec::new();
+            for item in items.iter().rev() {
+                bits.extend(item.bits.iter().copied());
+            }
+            if bits.is_empty() {
+                return Err(
+                    "concatenation must have at least one operand with positive size".to_string(),
+                );
+            }
+            let result = IntegerValue::computed(bits.len(), false, leftmost_base, bits);
+            vals.push(extend_to_outer_context(result, ctx));
+        }
+        EvalCombiner::ReplicationCountReceived {
+            items,
+            leftmost_base,
+            ctx,
+            strict,
+        } => {
+            let count_val = vals.pop().expect("ReplicationCountReceived: count missing");
+            if count_val.has_unknown_bits() {
+                return Err("replication count contains unknown bits".to_string());
+            }
+            let count_bigint = count_val.as_bigint(count_val.signed);
+            if count_bigint.sign() == Sign::Minus {
+                return Err("replication count must be non-negative".to_string());
+            }
+            let count = count_bigint
+                .to_usize()
+                .ok_or_else(|| "replication count too large".to_string())?;
+            if count == 0 {
+                if strict {
+                    return Err(
+                        "replication count must be positive in this context".to_string()
+                    );
+                }
+                // Lenient (inside-concat): contribute zero bits. The
+                // surrounding Concatenation Combine still enforces the
+                // "must have at least one operand with positive size"
+                // rule by inspecting the joined bits.
+                vals.push(IntegerValue::computed(0, false, leftmost_base, Vec::new()));
+                return Ok(());
+            }
+            work.push(EvalTask::Combine(EvalCombiner::ReplicationFinalize {
+                item_count: items.len(),
+                count,
+                leftmost_base,
+                ctx,
+                strict,
+            }));
+            for item in items.iter().rev() {
+                push_concat_item_eval(item, work);
+            }
+        }
+        EvalCombiner::ReplicationFinalize {
+            item_count,
+            count,
+            leftmost_base,
+            ctx,
+            strict,
+        } => {
+            let start = vals.len() - item_count;
+            let items: Vec<IntegerValue> = vals.drain(start..).collect();
+            let mut inner_bits = Vec::new();
+            for item in items.iter().rev() {
+                inner_bits.extend(item.bits.iter().copied());
+            }
+            if strict && inner_bits.is_empty() {
+                return Err(
+                    "concatenation must have at least one operand with positive size".to_string(),
+                );
+            }
+            let mut bits = Vec::with_capacity(inner_bits.len().saturating_mul(count));
+            for _ in 0..count {
+                bits.extend(inner_bits.iter().copied());
+            }
+            let result = IntegerValue::computed(bits.len(), false, leftmost_base, bits);
+            vals.push(extend_to_outer_context(result, ctx));
         }
     }
     Ok(())

@@ -7512,6 +7512,138 @@ fn deep_select_index_chain_evaluates() {
     assert_eq!(outcome.output, "1'bx");
 }
 
+// Direct-build deep-concat regression suite. The parser uses a recursive
+// `parse_expression` for each concat item, so an end-to-end `{{{…}}}` at
+// 10^5 levels overflows in the parser before reaching the evaluator. To
+// exercise the eval pipeline at full depth, these tests construct the
+// `Expr` tree in memory and feed it directly to `annotate` /
+// `semantic_check` / `evaluate_annotated` — the same convention the
+// `*_does_not_overflow` suite earlier in this file uses for Grouped and
+// Binary chains.
+//
+// Pre-fix: `evaluate_annotated`'s CES driver fell through to the
+// recursive `evaluate_expr_in_context` for `AnnotatedKind::Concatenation`,
+// and `validate_annotated`'s `PostCollectBits` task re-entered the
+// recursive `collect_concatenation_bits`. Both walkers re-walked nested
+// items per level, which combined a stack-overflow risk with O(N²)
+// re-walk cost (`infer_expr_meta(items[0])` + `is_indefinite_width(item)`
+// per concat level). Post-fix: the eval CES handles Concatenation /
+// Replication directly off cached `Annotated::meta()`, and validation
+// reads the cached widths without re-walking.
+
+#[test]
+fn annotate_of_deep_concatenation_does_not_overflow() {
+    // Wraps `1'b1` in 10^5 single-item concatenations. annotate's
+    // Concatenation Combine pops one child Annotated and builds the
+    // parent. impl Drop for Annotated handles the resulting deep
+    // Vec<Annotated> chain iteratively at end-of-scope.
+    let mut e = Expr::Literal(parse_integer("1'b1").expect("literal should parse"));
+    for _ in 0..100_000 {
+        e = Expr::Concatenation { items: vec![e] };
+    }
+    let session = Session::new();
+    let annotated = crate::eval::annotate(&e, &session).expect("deep concat annotates");
+    drop(annotated);
+}
+
+#[test]
+fn semantic_check_of_deep_concatenation_does_not_overflow() {
+    // semantic_check = annotate + validate_annotated. The validator
+    // dispatches each concat via ConcatItem (iterative) and the new
+    // PostCheckConcatWidth reads the cached `meta().width` rather than
+    // re-walking. Pre-fix this overflowed via `PostCollectBits` →
+    // `collect_concatenation_bits` → `evaluate_concatenation_item_bits`
+    // → recursive `evaluate_concatenation_expr`.
+    let mut e = Expr::Literal(parse_integer("1'b1").expect("literal should parse"));
+    for _ in 0..100_000 {
+        e = Expr::Concatenation { items: vec![e] };
+    }
+    let session = Session::new();
+    crate::eval::semantic_check(&e, &session).expect("deep concat semantic-checks");
+}
+
+#[test]
+fn evaluate_of_deep_concatenation_does_not_overflow() {
+    // End-to-end eval through the iterative annotate + validate +
+    // evaluate pipeline. Each concat layer wraps a single `1'b1` so the
+    // joined width stays at 1 and the result is `1'b1` independent of
+    // depth. Hits the new EvalCombiner::Concatenation arm at every
+    // level, popping one IntegerValue per Combine.
+    let mut e = Expr::Literal(parse_integer("1'b1").expect("literal should parse"));
+    for _ in 0..100_000 {
+        e = Expr::Concatenation { items: vec![e] };
+    }
+    let session = Session::new();
+    let value = crate::eval::evaluate_expr(&e, &session).expect("deep concat evaluates");
+    assert_eq!(value.canonical(), "1'b1");
+}
+
+#[test]
+fn evaluate_of_deep_replication_does_not_overflow() {
+    // Single-item Replication at every level: `{1{ {1{ ... {1{1'b1}} ... }} }}`.
+    // Each layer's count = 1, so the result stays 1-bit. Hits
+    // EvalCombiner::ReplicationCountReceived (the count's Visit
+    // resolves first) and EvalCombiner::ReplicationFinalize at every
+    // level — no re-walk because the inner-item value is popped off
+    // the value stack.
+    let mut e = Expr::Literal(parse_integer("1'b1").expect("literal should parse"));
+    for _ in 0..100_000 {
+        e = Expr::Replication {
+            count: Box::new(Expr::Literal(parse_integer("1").expect("count literal"))),
+            items: vec![e],
+        };
+    }
+    let session = Session::new();
+    let value = crate::eval::evaluate_expr(&e, &session).expect("deep replication evaluates");
+    assert_eq!(value.canonical(), "1'b1");
+}
+
+#[test]
+fn evaluate_of_deep_concat_inside_replication_does_not_overflow() {
+    // Mixes the two: every other layer alternates Concatenation /
+    // Replication. Verifies the lenient-replication-inside-concat
+    // dispatch (`push_concat_item_eval` peels Grouped + detects
+    // Replication) survives at depth.
+    let mut e = Expr::Literal(parse_integer("1'b1").expect("literal should parse"));
+    for i in 0usize..100_000 {
+        e = if i.is_multiple_of(2) {
+            Expr::Concatenation { items: vec![e] }
+        } else {
+            Expr::Replication {
+                count: Box::new(Expr::Literal(parse_integer("1").expect("count literal"))),
+                items: vec![e],
+            }
+        };
+    }
+    let session = Session::new();
+    let value = crate::eval::evaluate_expr(&e, &session).expect("deep mixed evaluates");
+    assert_eq!(value.canonical(), "1'b1");
+}
+
+#[test]
+fn evaluate_of_deep_concatenation_two_items_per_layer_does_not_overflow() {
+    // Each concat layer has two items: the first is the next-deeper
+    // concat, the second is a fresh `1'b1` sibling. Total result
+    // width grows linearly with depth — at depth 10^4 the result is
+    // 10001 bits wide, all 1s. Tests that the value-stack drain in
+    // EvalCombiner::Concatenation handles wider stacks.
+    let n = 10_000usize;
+    let mut e = Expr::Literal(parse_integer("1'b1").expect("literal should parse"));
+    for _ in 0..n {
+        e = Expr::Concatenation {
+            items: vec![
+                e,
+                Expr::Literal(parse_integer("1'b1").expect("sibling literal")),
+            ],
+        };
+    }
+    let session = Session::new();
+    let value = crate::eval::evaluate_expr(&e, &session).expect("deep two-item concat evaluates");
+    let total_bits = n + 1;
+    let expected_digits = "1".repeat(total_bits);
+    assert_eq!(value.canonical(), format!("{total_bits}'b{expected_digits}"));
+}
+
 #[test]
 fn parse_input_returns_ast_without_evaluating() {
     // The --parse-only debug entry point: parser runs, AST renders via
