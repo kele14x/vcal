@@ -7219,6 +7219,95 @@ fn parses_deeply_nested_parens_without_overflow() {
 }
 
 #[test]
+fn parses_deeply_nested_concatenation_without_overflow() {
+    // Pre-fix, `parse_brace_primary` recursively called `parse_expression`
+    // for each concat item ([parser.rs:1390](src/parser.rs)), so
+    // `{{{...}}}` overflowed at depth ~7100 in release (~4 frames per
+    // level × ~300 bytes/frame on an 8 MB main thread). The iterative
+    // driver now consumes `{` directly in `parse_expr_bp` via the
+    // `Pending::Brace` frame; concat depth is bounded by heap, not
+    // stack. Runs on the default 2 MB test thread.
+    let input: String = "{".repeat(100_000) + "1'b1" + &"}".repeat(100_000);
+    let expr = parse_expression(&input).expect("deep concatenation should parse");
+    assert!(matches!(&expr, Expr::Concatenation { .. }));
+}
+
+#[test]
+fn parses_deeply_nested_replication_without_overflow() {
+    // `{1{{1{{1{...}}}}}}` — every level is a single-item replication
+    // wrapping the next-deeper replication. Pre-fix, both
+    // `parse_brace_primary` and its inner `parse_concatenation_items`
+    // recursed via `parse_expression` for the count and inner items.
+    // Now both consume tokens through `Pending::Brace` /
+    // `Pending::Replication` heap frames in the same iterative driver.
+    let input: String = "{1{".repeat(50_000) + "1'b1" + &"}}".repeat(50_000);
+    let expr = parse_expression(&input).expect("deep replication should parse");
+    assert!(matches!(&expr, Expr::Replication { .. }));
+}
+
+#[test]
+fn parses_deeply_nested_system_function_without_overflow() {
+    // `$signed($signed($signed(...)))` — single-arg cast nesting. Pre-fix,
+    // `parse_system_function_call` re-entered `parse_expression` for the
+    // arg ([parser.rs:1321](src/parser.rs)), overflowing at ~8000 in
+    // release. The iterative driver now consumes `$name(` and pushes a
+    // `Pending::SystemArgs` frame; depth is bounded by heap.
+    let input: String = "$signed(".repeat(100_000) + "4'sd1" + &")".repeat(100_000);
+    let expr = parse_expression(&input).expect("deep $signed should parse");
+    assert!(matches!(&expr, Expr::SignCast { .. }));
+}
+
+#[test]
+fn parses_deeply_nested_math_function_without_overflow() {
+    // `$pow(2, $pow(2, $pow(2, ...)))` — two-arg math function nesting
+    // along the second arg. Same `Pending::SystemArgs` path, but
+    // exercises the comma → next-arg state of the frame as well as the
+    // arity check fired at finalization.
+    let mut input = String::new();
+    let n = 50_000;
+    for _ in 0..n {
+        input.push_str("$pow(2, ");
+    }
+    input.push('0');
+    for _ in 0..n {
+        input.push(')');
+    }
+    let expr = parse_expression(&input).expect("deep $pow should parse");
+    assert!(matches!(&expr, Expr::MathFunction { .. }));
+}
+
+#[test]
+fn parses_deeply_nested_concat_inside_replication_inside_signed_without_overflow() {
+    // Mixed shape: `$signed({1{$signed({1{...}})}})` — alternating
+    // SystemArgs / Replication / Concatenation frames on the heap stack.
+    // Verifies the three new Pending variants compose without
+    // re-introducing recursion at a transition.
+    let n = 30_000;
+    let mut input = String::new();
+    for _ in 0..n {
+        input.push_str("$signed({1{");
+    }
+    input.push_str("1'b1");
+    for _ in 0..n {
+        input.push_str("}})");
+    }
+    let expr = parse_expression(&input).expect("deep mixed should parse");
+    assert!(matches!(&expr, Expr::SignCast { .. }));
+}
+
+#[test]
+fn evaluates_deeply_nested_concat_through_full_pipeline() {
+    // End-to-end: parser + annotate + validate + evaluate at a depth
+    // that pre-fix would crash the parser (~7100). Now all three
+    // pipelines are iterative, so this evaluates cleanly on the
+    // default 2 MB test thread.
+    let n = 50_000;
+    let input: String = "{".repeat(n) + "1'b1" + &"}".repeat(n);
+    let evaluation = evaluate_input(&input).expect("deep concat should evaluate");
+    assert_eq!(evaluation.output, "1'b1");
+}
+
+#[test]
 fn parses_deep_nested_ternary_without_overflow() {
     // `a ? b : c ? d : e ? f : ...` — right-associative ternary. In the
     // recursive Pratt parser, each `?` added two stack frames (one for

@@ -790,6 +790,144 @@ enum Pending {
         then: Expr,
         saved_min_bp: u8,
     },
+    /// `{` consumed; parsing the items of either a concatenation or the
+    /// count of a replication. The disambiguation happens after the
+    /// first inner expression reduces: a following `{` triggers the
+    /// transition to `Replication`; `,` keeps collecting concat items;
+    /// `}` finalizes as `Concatenation`. `unary_wrap` is the prefix
+    /// unary chain that appeared immediately before the `{`, applied
+    /// to the finalized result the same way `Group` does for `(`.
+    Brace {
+        items: Vec<Expr>,
+        unary_wrap: Vec<UnaryOp>,
+        saved_min_bp: u8,
+    },
+    /// `{ count {` consumed; collecting comma-separated inner items.
+    /// Closes with `}}` (inner `}` then outer `}`). The `count`
+    /// expression came from the `Brace` frame's first reduced item.
+    Replication {
+        count: Expr,
+        items: Vec<Expr>,
+        unary_wrap: Vec<UnaryOp>,
+        saved_min_bp: u8,
+    },
+    /// `$func(` consumed; collecting comma-separated args. Closes with
+    /// `)`. `kind` says which `Expr` variant to build at finalization;
+    /// arity is enforced in the closer arm.
+    SystemArgs {
+        name: String,
+        kind: SystemFnKind,
+        args: Vec<Expr>,
+        unary_wrap: Vec<UnaryOp>,
+        saved_min_bp: u8,
+    },
+    /// `$finish(` or `$stop(` consumed with at least one argument
+    /// pending. Args are parsed for syntactic validity then dropped
+    /// (LRM 17.4: vcal prints no exit diagnostic, so the message-
+    /// verbosity argument has no effect).
+    SystemTask {
+        name: String,
+        unary_wrap: Vec<UnaryOp>,
+        saved_min_bp: u8,
+    },
+}
+
+// Discriminant for system-function call frames. Mirrors the local
+// `SystemFn` enum that used to live inside the recursive
+// `parse_system_function_call`; lifting it to module scope lets the
+// `Pending::SystemArgs` frame hold it without a lifetime parameter.
+enum SystemFnKind {
+    /// `$signed` (true) / `$unsigned` (false). LRM 5.5.
+    SignCast(bool),
+    /// `$bin` / `$oct` / `$dec` / `$hex`.
+    BaseCast(Base),
+    /// `$rtoi` / `$itor` / `$realtobits` / `$bitstoreal`. LRM 17.8.
+    RealConversion(RealConversionKind),
+    /// `$pow`, `$ln`, `$clog2`, etc. — arity enforced at finalization
+    /// per `MathFunctionKind::arity()`.
+    MathFunction(MathFunctionKind),
+}
+
+// Resolve a `$name` token to the system-function kind, or fail with the
+// "unsupported system function" diagnostic. Pure name → kind mapping
+// used by the iterative parser before consuming the opening `(`.
+fn resolve_system_fn_kind(name: &str) -> Result<SystemFnKind, String> {
+    Ok(match name {
+        "$signed" => SystemFnKind::SignCast(true),
+        "$unsigned" => SystemFnKind::SignCast(false),
+        "$bin" => SystemFnKind::BaseCast(Base::Binary),
+        "$oct" => SystemFnKind::BaseCast(Base::Octal),
+        "$dec" => SystemFnKind::BaseCast(Base::Decimal),
+        "$hex" => SystemFnKind::BaseCast(Base::Hex),
+        "$rtoi" => SystemFnKind::RealConversion(RealConversionKind::RealToInteger),
+        "$itor" => SystemFnKind::RealConversion(RealConversionKind::IntegerToReal),
+        "$realtobits" => SystemFnKind::RealConversion(RealConversionKind::RealToBits),
+        "$bitstoreal" => SystemFnKind::RealConversion(RealConversionKind::BitsToReal),
+        _ => match MathFunctionKind::from_name(name) {
+            Some(math_kind) => SystemFnKind::MathFunction(math_kind),
+            None => return Err(format!("unsupported system function: {name}")),
+        },
+    })
+}
+
+// Build the final `Expr` for a system-function call once all args are
+// collected and the closing `)` has been consumed. Math functions
+// enforce arity via `MathFunctionKind::arity()`; the single-arg
+// variants reject anything other than exactly one argument with the
+// same "expected `)` after <name> argument" diagnostic the recursive
+// helper emitted when a comma followed the first arg.
+fn build_system_fn_expr(
+    name: &str,
+    kind: SystemFnKind,
+    args: Vec<Expr>,
+) -> Result<Expr, String> {
+    match kind {
+        SystemFnKind::MathFunction(math_kind) => {
+            let expected = math_kind.arity();
+            if args.len() != expected {
+                return Err(format!(
+                    "{} expects {expected} argument{plural}, got {actual}",
+                    math_kind.name(),
+                    plural = if expected == 1 { "" } else { "s" },
+                    actual = args.len()
+                ));
+            }
+            Ok(Expr::MathFunction { kind: math_kind, args })
+        }
+        SystemFnKind::SignCast(signed) => {
+            if args.len() != 1 {
+                return Err(format!("expected `)` after {name} argument"));
+            }
+            let arg = args.into_iter().next().expect("len == 1");
+            Ok(Expr::SignCast { signed, arg: Box::new(arg) })
+        }
+        SystemFnKind::BaseCast(base) => {
+            if args.len() != 1 {
+                return Err(format!("expected `)` after {name} argument"));
+            }
+            let arg = args.into_iter().next().expect("len == 1");
+            Ok(Expr::BaseCast { base, arg: Box::new(arg) })
+        }
+        SystemFnKind::RealConversion(conv) => {
+            if args.len() != 1 {
+                return Err(format!("expected `)` after {name} argument"));
+            }
+            let arg = args.into_iter().next().expect("len == 1");
+            Ok(Expr::RealConversion { kind: conv, arg: Box::new(arg) })
+        }
+    }
+}
+
+// Wrap an `Expr` with a chain of prefix unary operators in source
+// order — the operators are applied right-to-left so the rightmost
+// (innermost) prefix wraps `expr` first. Used by `parse_expr_bp` when
+// finalizing a primary or a frame-built Expr that carried prefix ops
+// across the open delimiter.
+fn apply_prefix_unary_ops(mut expr: Expr, ops: Vec<UnaryOp>) -> Expr {
+    for op in ops.into_iter().rev() {
+        expr = Expr::Unary { op, expr: Box::new(expr) };
+    }
+    expr
 }
 
 #[cfg(test)]
@@ -873,8 +1011,12 @@ impl<'a> Parser<'a> {
 
         loop {
             if value.is_none() {
-                // State: need an operand. Read prefix unary ops, then the
-                // primary (which may be `(...)`).
+                // State: need an operand. Read prefix unary ops, then
+                // dispatch on the next token. The opening tokens that
+                // would otherwise re-enter `parse_expression` (`(`, `{`,
+                // `$name`) are handled here by pushing a heap frame onto
+                // `stack` and continuing; that's what keeps the Rust
+                // call stack at one frame regardless of input depth.
                 let mut prefix_ops: Vec<UnaryOp> = Vec::new();
                 while let Some(op) = self.peek().and_then(prefix_unary_op) {
                     self.index += 1;
@@ -891,19 +1033,81 @@ impl<'a> Parser<'a> {
                     continue;
                 }
 
-                // Non-paren primary. parse_primary's LParen branch is
-                // unreachable from here because we just handled `(`
-                // ourselves; everything else (literals, identifiers,
-                // `{...}`, `[...]`, system functions) flows through.
-                let primary = self.parse_primary()?;
-                let mut wrapped = primary;
-                for op in prefix_ops.into_iter().rev() {
-                    wrapped = Expr::Unary {
-                        op,
-                        expr: Box::new(wrapped),
-                    };
+                if matches!(self.peek(), Some(Token::LBrace)) {
+                    self.index += 1;
+                    stack.push(Pending::Brace {
+                        items: Vec::new(),
+                        unary_wrap: prefix_ops,
+                        saved_min_bp: min_bp,
+                    });
+                    min_bp = 0;
+                    continue;
                 }
-                value = Some(wrapped);
+
+                if matches!(self.peek(), Some(Token::SystemIdentifier(_))) {
+                    let name = match self.next() {
+                        Some(Token::SystemIdentifier(n)) => n.clone(),
+                        _ => unreachable!("matches! guard guarantees SystemIdentifier"),
+                    };
+                    // LRM 17.4: `$finish` / `$stop` are statements but
+                    // also accepted in expression position so the
+                    // top-level driver can distinguish task-at-AST-root
+                    // (exit) from task-nested-in-expression (rejected by
+                    // the evaluator). Without a `(` they're a bare
+                    // `Expr::SystemTask`; with `()` they're the same
+                    // value with no args; with `(args)` we collect the
+                    // args for syntactic validation and discard them.
+                    if matches!(name.as_str(), "$finish" | "$stop") {
+                        if !matches!(self.peek(), Some(Token::LParen)) {
+                            value = Some(apply_prefix_unary_ops(
+                                Expr::SystemTask { name },
+                                prefix_ops,
+                            ));
+                            continue;
+                        }
+                        self.index += 1; // consume `(`
+                        if matches!(self.peek(), Some(Token::RParen)) {
+                            self.index += 1;
+                            value = Some(apply_prefix_unary_ops(
+                                Expr::SystemTask { name },
+                                prefix_ops,
+                            ));
+                            continue;
+                        }
+                        stack.push(Pending::SystemTask {
+                            name,
+                            unary_wrap: prefix_ops,
+                            saved_min_bp: min_bp,
+                        });
+                        min_bp = 0;
+                        continue;
+                    }
+                    // Real system functions: resolve the kind, expect
+                    // `(`, then push a SystemArgs frame and parse the
+                    // first arg. The arity check fires at finalization.
+                    let kind = resolve_system_fn_kind(&name)?;
+                    match self.next() {
+                        Some(Token::LParen) => {}
+                        _ => return Err(format!("expected `(` after {name}")),
+                    }
+                    stack.push(Pending::SystemArgs {
+                        name,
+                        kind,
+                        args: Vec::new(),
+                        unary_wrap: prefix_ops,
+                        saved_min_bp: min_bp,
+                    });
+                    min_bp = 0;
+                    continue;
+                }
+
+                // Non-paren / non-brace / non-system primary.
+                // parse_primary's LParen / LBrace / SystemIdentifier
+                // branches are unreachable from here because we just
+                // handled them; everything else (literals, identifiers,
+                // identifier-with-`[...]`) flows through.
+                let primary = self.parse_primary()?;
+                value = Some(apply_prefix_unary_ops(primary, prefix_ops));
                 continue;
             }
 
@@ -933,33 +1137,38 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            // No extension possible. Reduce: pop a pending frame.
-            match stack.pop() {
-                Some(Pending::Group {
-                    unary_wrap,
-                    saved_min_bp,
-                }) => {
+            // No infix / `?` extension possible. Reduce or close. The
+            // collector frames (Brace, Replication, SystemArgs,
+            // SystemTask) dispatch on the next token: `,` keeps the
+            // frame alive and starts a new operand; the matching
+            // closer pops the frame and produces the parent `Expr`.
+            // Single-sub frames (Group, BinaryAwaitRhs, Conditional*)
+            // pop unconditionally and combine, same as the original
+            // iterative driver.
+            match stack.last() {
+                None => {
+                    return Ok(value.take().expect("value is Some at end of expression"));
+                }
+                Some(Pending::Group { .. }) => {
                     match self.next() {
                         Some(Token::RParen) => {}
                         _ => return Err("missing closing parenthesis".to_string()),
                     }
                     let inner = value.take().expect("value is Some when reducing");
-                    let mut wrapped = Expr::Grouped(Box::new(inner));
-                    for op in unary_wrap.into_iter().rev() {
-                        wrapped = Expr::Unary {
-                            op,
-                            expr: Box::new(wrapped),
-                        };
-                    }
+                    let frame = stack.pop().expect("just inspected via last()");
+                    let Pending::Group { unary_wrap, saved_min_bp } = frame else {
+                        unreachable!("matched Group above");
+                    };
+                    let wrapped = apply_prefix_unary_ops(Expr::Grouped(Box::new(inner)), unary_wrap);
                     value = Some(wrapped);
                     min_bp = saved_min_bp;
                 }
-                Some(Pending::BinaryAwaitRhs {
-                    lhs,
-                    op,
-                    saved_min_bp,
-                }) => {
+                Some(Pending::BinaryAwaitRhs { .. }) => {
                     let rhs = value.take().expect("value is Some when reducing");
+                    let frame = stack.pop().expect("just inspected via last()");
+                    let Pending::BinaryAwaitRhs { lhs, op, saved_min_bp } = frame else {
+                        unreachable!("matched BinaryAwaitRhs above");
+                    };
                     value = Some(Expr::Binary {
                         op,
                         lhs: Box::new(lhs),
@@ -967,15 +1176,16 @@ impl<'a> Parser<'a> {
                     });
                     min_bp = saved_min_bp;
                 }
-                Some(Pending::ConditionalThen {
-                    cond,
-                    saved_min_bp,
-                }) => {
+                Some(Pending::ConditionalThen { .. }) => {
                     match self.next() {
                         Some(Token::Colon) => {}
                         _ => return Err("expected `:` in conditional expression".to_string()),
                     }
                     let then = value.take().expect("value is Some when reducing");
+                    let frame = stack.pop().expect("just inspected via last()");
+                    let Pending::ConditionalThen { cond, saved_min_bp } = frame else {
+                        unreachable!("matched ConditionalThen above");
+                    };
                     stack.push(Pending::ConditionalElse {
                         cond,
                         then,
@@ -984,12 +1194,12 @@ impl<'a> Parser<'a> {
                     min_bp = COND_RBP;
                     value = None;
                 }
-                Some(Pending::ConditionalElse {
-                    cond,
-                    then,
-                    saved_min_bp,
-                }) => {
+                Some(Pending::ConditionalElse { .. }) => {
                     let else_expr = value.take().expect("value is Some when reducing");
+                    let frame = stack.pop().expect("just inspected via last()");
+                    let Pending::ConditionalElse { cond, then, saved_min_bp } = frame else {
+                        unreachable!("matched ConditionalElse above");
+                    };
                     value = Some(Expr::Conditional {
                         cond: Box::new(cond),
                         then_expr: Box::new(then),
@@ -997,8 +1207,149 @@ impl<'a> Parser<'a> {
                     });
                     min_bp = saved_min_bp;
                 }
-                None => {
-                    return Ok(value.take().expect("value is Some at end of expression"));
+                Some(Pending::Brace { items, .. }) => {
+                    let items_empty = items.is_empty();
+                    if matches!(self.peek(), Some(Token::Comma)) {
+                        // Continue collecting concat items. Push the
+                        // just-parsed value into the frame's `items`
+                        // list and reset to operand-needed state.
+                        self.index += 1;
+                        let v = value.take().expect("value is Some when reducing");
+                        let Some(Pending::Brace { items, .. }) = stack.last_mut() else {
+                            unreachable!("matched Brace above");
+                        };
+                        items.push(v);
+                    } else if matches!(self.peek(), Some(Token::RBrace)) {
+                        // Finalize as Concatenation.
+                        self.index += 1;
+                        let v = value.take().expect("value is Some when reducing");
+                        let frame = stack.pop().expect("just inspected via last()");
+                        let Pending::Brace { mut items, unary_wrap, saved_min_bp } = frame else {
+                            unreachable!("matched Brace above");
+                        };
+                        items.push(v);
+                        value = Some(apply_prefix_unary_ops(
+                            Expr::Concatenation { items },
+                            unary_wrap,
+                        ));
+                        min_bp = saved_min_bp;
+                    } else if items_empty && matches!(self.peek(), Some(Token::LBrace)) {
+                        // First inner expression was followed by `{`:
+                        // transition to Replication. The just-parsed
+                        // value is the count; the `Brace`'s unary_wrap
+                        // / saved_min_bp carry over to the new frame.
+                        self.index += 1; // consume `{`
+                        let count = value.take().expect("value is Some when reducing");
+                        let frame = stack.pop().expect("just inspected via last()");
+                        let Pending::Brace { unary_wrap, saved_min_bp, .. } = frame else {
+                            unreachable!("matched Brace above");
+                        };
+                        stack.push(Pending::Replication {
+                            count,
+                            items: Vec::new(),
+                            unary_wrap,
+                            saved_min_bp,
+                        });
+                        min_bp = 0;
+                    } else {
+                        return Err("missing closing brace in concatenation".to_string());
+                    }
+                }
+                Some(Pending::Replication { .. }) => {
+                    if matches!(self.peek(), Some(Token::Comma)) {
+                        self.index += 1;
+                        let v = value.take().expect("value is Some when reducing");
+                        let Some(Pending::Replication { items, .. }) = stack.last_mut() else {
+                            unreachable!("matched Replication above");
+                        };
+                        items.push(v);
+                    } else if matches!(self.peek(), Some(Token::RBrace)) {
+                        // Inner `}` consumed; expect the outer `}` to
+                        // finalize the replication. The two-`}`
+                        // sequence matches the legacy walker's
+                        // `parse_concatenation_items` returning at the
+                        // inner `}` and the outer `parse_brace_primary`
+                        // requiring its own `}`.
+                        self.index += 1;
+                        match self.next() {
+                            Some(Token::RBrace) => {}
+                            _ => return Err("missing closing brace in replication".to_string()),
+                        }
+                        let v = value.take().expect("value is Some when reducing");
+                        let frame = stack.pop().expect("just inspected via last()");
+                        let Pending::Replication {
+                            count,
+                            mut items,
+                            unary_wrap,
+                            saved_min_bp,
+                        } = frame
+                        else {
+                            unreachable!("matched Replication above");
+                        };
+                        items.push(v);
+                        value = Some(apply_prefix_unary_ops(
+                            Expr::Replication {
+                                count: Box::new(count),
+                                items,
+                            },
+                            unary_wrap,
+                        ));
+                        min_bp = saved_min_bp;
+                    } else {
+                        return Err("missing closing brace in concatenation".to_string());
+                    }
+                }
+                Some(Pending::SystemArgs { name, .. }) => {
+                    if matches!(self.peek(), Some(Token::Comma)) {
+                        self.index += 1;
+                        let v = value.take().expect("value is Some when reducing");
+                        let Some(Pending::SystemArgs { args, .. }) = stack.last_mut() else {
+                            unreachable!("matched SystemArgs above");
+                        };
+                        args.push(v);
+                    } else if matches!(self.peek(), Some(Token::RParen)) {
+                        self.index += 1;
+                        let v = value.take().expect("value is Some when reducing");
+                        let frame = stack.pop().expect("just inspected via last()");
+                        let Pending::SystemArgs {
+                            name,
+                            kind,
+                            mut args,
+                            unary_wrap,
+                            saved_min_bp,
+                        } = frame
+                        else {
+                            unreachable!("matched SystemArgs above");
+                        };
+                        args.push(v);
+                        let expr = build_system_fn_expr(&name, kind, args)?;
+                        value = Some(apply_prefix_unary_ops(expr, unary_wrap));
+                        min_bp = saved_min_bp;
+                    } else {
+                        return Err(format!("expected `)` after {name} argument"));
+                    }
+                }
+                Some(Pending::SystemTask { name, .. }) => {
+                    if matches!(self.peek(), Some(Token::Comma)) {
+                        // Discard the value; $finish / $stop args are
+                        // parsed for syntactic validity only.
+                        self.index += 1;
+                        let _ = value.take();
+                    } else if matches!(self.peek(), Some(Token::RParen)) {
+                        self.index += 1;
+                        let _ = value.take();
+                        let frame = stack.pop().expect("just inspected via last()");
+                        let Pending::SystemTask { name, unary_wrap, saved_min_bp } = frame else {
+                            unreachable!("matched SystemTask above");
+                        };
+                        value = Some(apply_prefix_unary_ops(
+                            Expr::SystemTask { name },
+                            unary_wrap,
+                        ));
+                        min_bp = saved_min_bp;
+                    } else {
+                        return Err(format!("expected `)` after {name} arguments"));
+                    }
                 }
             }
         }
@@ -1211,10 +1562,6 @@ impl<'a> Parser<'a> {
         match token {
             Some(Token::IntegerLiteral(text)) => parse_integer(text).map(Expr::Literal),
             Some(Token::RealLiteral(text)) => parse_real(text).map(Expr::RealLiteral),
-            Some(Token::SystemIdentifier(name)) => {
-                let name = name.clone();
-                self.parse_system_function_call(&name)
-            }
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
                 // Bit-select / part-select picked up here, not at
@@ -1228,190 +1575,26 @@ impl<'a> Parser<'a> {
                     Ok(Expr::Identifier(name))
                 }
             }
-            Some(Token::LParen) => {
-                // Unreachable from the iterative `parse_expr_bp` driver:
-                // it consumes `(` itself and pushes a Group frame before
-                // calling parse_primary. Reaching this arm means a future
-                // caller skipped that handling — a programming-contract
-                // violation, not a user-input error. `unreachable!` panics
-                // in both debug and release builds, so the contract is
-                // enforced strictly rather than silently re-introducing the
-                // deep-paren recursion this refactor exists to fix.
-                unreachable!("parse_primary must not be called on `(`; parse_expr_bp consumes LParen itself")
-            }
-            Some(Token::LBrace) => self.parse_brace_primary(),
+            // `(`, `{`, and `$name` are all consumed by `parse_expr_bp`'s
+            // iterative driver before it calls `parse_primary` — the
+            // driver pushes a heap frame instead of recursing, which is
+            // the whole point of the iterative parser. Any of these
+            // arms reaching `parse_primary` means a future caller
+            // skipped that dispatch, which is a programming-contract
+            // violation, not a user-input error.
+            Some(Token::LParen) => unreachable!(
+                "parse_primary must not be called on `(`; parse_expr_bp consumes LParen itself"
+            ),
+            Some(Token::LBrace) => unreachable!(
+                "parse_primary must not be called on `{{`; parse_expr_bp consumes LBrace itself"
+            ),
+            Some(Token::SystemIdentifier(_)) => unreachable!(
+                "parse_primary must not be called on `$name`; parse_expr_bp consumes SystemIdentifier itself"
+            ),
             Some(Token::RParen) => Err("unexpected closing parenthesis".to_string()),
             Some(_) => Err("expected expression operand".to_string()),
             None => Err("unexpected end of expression".to_string()),
         }
-    }
-
-    // LRM 5.5 / 17.8: every supported system function in expression
-    // position takes exactly one parenthesised argument. Anything else
-    // starting with `$` is rejected with a clear message so the generic
-    // "expected expression operand" path doesn't fire for typos.
-    fn parse_system_function_call(&mut self, name: &str) -> Result<Expr, String> {
-        // LRM 17.4 simulation control tasks: `$finish` / `$stop` are
-        // statements, not expressions. Parse them as `Expr::SystemTask`
-        // here so identifier-matching is uniform with system functions; the
-        // top-level driver in lib.rs distinguishes "task at top of AST"
-        // (exit) from "task nested in expression" (rejected by evaluator).
-        if matches!(name, "$finish" | "$stop") {
-            return self.parse_system_task_call(name);
-        }
-
-        enum SystemFn {
-            SignCast(bool),
-            BaseCast(Base),
-            RealConversion(RealConversionKind),
-            MathFunction(MathFunctionKind),
-        }
-
-        // $signed/$unsigned, the four base casts, and the four real-conversion
-        // casts are listed explicitly here; everything else falls through to
-        // the MATH_FUNCTIONS table so a new math function only needs adding
-        // there. `from_name` is the inverse of `MathFunctionKind::name()`.
-        let kind = match name {
-            "$signed" => SystemFn::SignCast(true),
-            "$unsigned" => SystemFn::SignCast(false),
-            "$bin" => SystemFn::BaseCast(Base::Binary),
-            "$oct" => SystemFn::BaseCast(Base::Octal),
-            "$dec" => SystemFn::BaseCast(Base::Decimal),
-            "$hex" => SystemFn::BaseCast(Base::Hex),
-            "$rtoi" => SystemFn::RealConversion(RealConversionKind::RealToInteger),
-            "$itor" => SystemFn::RealConversion(RealConversionKind::IntegerToReal),
-            "$realtobits" => SystemFn::RealConversion(RealConversionKind::RealToBits),
-            "$bitstoreal" => SystemFn::RealConversion(RealConversionKind::BitsToReal),
-            _ => match MathFunctionKind::from_name(name) {
-                Some(math_kind) => SystemFn::MathFunction(math_kind),
-                None => return Err(format!("unsupported system function: {name}")),
-            },
-        };
-
-        match self.next() {
-            Some(Token::LParen) => {}
-            _ => return Err(format!("expected `(` after {name}")),
-        }
-
-        if let SystemFn::MathFunction(math_kind) = kind {
-            let mut args = vec![self.parse_expression()?];
-            while matches!(self.peek(), Some(Token::Comma)) {
-                self.index += 1;
-                args.push(self.parse_expression()?);
-            }
-            match self.next() {
-                Some(Token::RParen) => {}
-                _ => return Err(format!("expected `)` after {name} argument")),
-            }
-            let expected = math_kind.arity();
-            if args.len() != expected {
-                return Err(format!(
-                    "{} expects {expected} argument{plural}, got {actual}",
-                    math_kind.name(),
-                    plural = if expected == 1 { "" } else { "s" },
-                    actual = args.len()
-                ));
-            }
-            return Ok(Expr::MathFunction {
-                kind: math_kind,
-                args,
-            });
-        }
-
-        let arg = self.parse_expression()?;
-
-        match self.next() {
-            Some(Token::RParen) => {}
-            _ => return Err(format!("expected `)` after {name} argument")),
-        }
-
-        Ok(match kind {
-            SystemFn::SignCast(signed) => Expr::SignCast {
-                signed,
-                arg: Box::new(arg),
-            },
-            SystemFn::BaseCast(base) => Expr::BaseCast {
-                base,
-                arg: Box::new(arg),
-            },
-            SystemFn::RealConversion(kind) => Expr::RealConversion {
-                kind,
-                arg: Box::new(arg),
-            },
-            SystemFn::MathFunction(_) => unreachable!("MathFunction handled above"),
-        })
-    }
-
-    // LRM 17.4: `$finish[(n)]` / `$stop[(n)]`. Per the LRM the argument
-    // controls exit-message verbosity (n ∈ {0,1,2}); vcal prints no exit
-    // diagnostic, so the argument is meaningless. The parser is therefore
-    // lenient: any number of comma-separated arguments is accepted (the LRM
-    // 0-or-1 arity check would only teach users a rule vcal itself does not
-    // enforce). Each argument is parsed for syntactic validity so genuine
-    // typos like `$finish(1 +)` still surface as a parse error, but the
-    // resulting expression values are discarded — they are never evaluated.
-    fn parse_system_task_call(&mut self, name: &str) -> Result<Expr, String> {
-        if !matches!(self.peek(), Some(Token::LParen)) {
-            return Ok(Expr::SystemTask {
-                name: name.to_string(),
-            });
-        }
-        self.index += 1; // consume `(`
-        if matches!(self.peek(), Some(Token::RParen)) {
-            self.index += 1;
-            return Ok(Expr::SystemTask {
-                name: name.to_string(),
-            });
-        }
-        loop {
-            let _ = self.parse_expression()?;
-            if matches!(self.peek(), Some(Token::Comma)) {
-                self.index += 1;
-                continue;
-            }
-            break;
-        }
-        match self.next() {
-            Some(Token::RParen) => {}
-            _ => return Err(format!("expected `)` after {name} arguments")),
-        }
-        Ok(Expr::SystemTask {
-            name: name.to_string(),
-        })
-    }
-
-    // LRM 5.1.14: `{ expr {, expr} }` (concatenation) or
-    // `{ count_expr { expr {, expr} } }` (multiple concatenation /
-    // replication). Disambiguated by what follows the first inner expression:
-    // a `{` starts the inner concatenation list (replication form), anything
-    // else (`,` or `}`) means we're in plain concatenation. The leading `{`
-    // has already been consumed by `parse_primary`.
-    fn parse_brace_primary(&mut self) -> Result<Expr, String> {
-        let first = self.parse_expression()?;
-
-        if matches!(self.peek(), Some(Token::LBrace)) {
-            self.index += 1;
-            let items = self.parse_concatenation_items()?;
-            match self.next() {
-                Some(Token::RBrace) => {}
-                _ => return Err("missing closing brace in replication".to_string()),
-            }
-            return Ok(Expr::Replication {
-                count: Box::new(first),
-                items,
-            });
-        }
-
-        let mut items = vec![first];
-        while matches!(self.peek(), Some(Token::Comma)) {
-            self.index += 1;
-            items.push(self.parse_expression()?);
-        }
-        match self.next() {
-            Some(Token::RBrace) => {}
-            _ => return Err("missing closing brace in concatenation".to_string()),
-        }
-        Ok(Expr::Concatenation { items })
     }
 
     // Caller has consumed the `[` after an identifier; dispatch on the
@@ -1495,18 +1678,6 @@ impl<'a> Parser<'a> {
             _ => return Err("expected `]`, `:`, `+:`, or `-:` in select".to_string()),
         };
         Ok(kind)
-    }
-
-    fn parse_concatenation_items(&mut self) -> Result<Vec<Expr>, String> {
-        let mut items = vec![self.parse_expression()?];
-        while matches!(self.peek(), Some(Token::Comma)) {
-            self.index += 1;
-            items.push(self.parse_expression()?);
-        }
-        match self.next() {
-            Some(Token::RBrace) => Ok(items),
-            _ => Err("missing closing brace in concatenation".to_string()),
-        }
     }
 
     fn peek(&self) -> Option<&Token> {
