@@ -7334,8 +7334,14 @@ fn parse_input_with_depth_respects_caller_specified_cap() {
     );
     // Shallow render must show the truncation marker; deep render
     // shouldn't (input only goes 20 deep).
-    assert!(shallow.contains('…'), "expected '…' at depth 5");
-    assert!(!deep.contains('…'), "should not truncate at depth 50");
+    assert!(
+        shallow.contains("Truncated"),
+        "expected `Truncated` marker at depth 5"
+    );
+    assert!(
+        !deep.contains("Truncated"),
+        "should not truncate at depth 50"
+    );
 }
 
 #[test]
@@ -7350,8 +7356,8 @@ fn parse_input_renders_deep_input_without_overflow() {
     let rendered = parse_input(&input).expect("deep parens should parse and render");
     // The truncation marker should appear; the AST was deeper than 64.
     assert!(
-        rendered.contains('…'),
-        "expected truncation marker '…' for input deeper than the display cap"
+        rendered.contains("Truncated"),
+        "expected `Truncated` marker for input deeper than the display cap"
     );
 }
 

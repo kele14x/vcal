@@ -124,6 +124,15 @@ pub(crate) enum Expr {
         kind: SelectKind,
         inner: Option<Box<SelectKind>>,
     },
+    // Display-only sentinel inserted by `truncate_expr_for_display` to
+    // replace sub-trees that exceed the caller-requested render depth.
+    // Never produced by the parser, never consumed by eval (which
+    // `unreachable!`s on it). Existing as a distinct variant — rather
+    // than reusing `Identifier("…")` — keeps the rendered output
+    // unambiguous: a `Truncated` node in `{:#?}` output is obviously a
+    // placeholder, while an `Identifier("…")` could plausibly be a
+    // valid (if oddly-named) symbol.
+    Truncated,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -153,8 +162,8 @@ pub(crate) enum SelectKind {
     },
 }
 
-// Truncate an `Expr` so that any sub-tree deeper than `max_depth` is
-// replaced with a leaf placeholder. Used by `parse_input` (the
+// Truncate an `Expr` so that any sub-tree at depth `>= max_depth` is
+// replaced with `Expr::Truncated`. Used by `parse_input` (the
 // `--parse-only` debug entry point) before `{:#?}`-rendering: the auto-
 // derived `Debug` impl recurses on each Box, so without truncation a
 // 10^4-deep `Grouped` chain would overflow the stack while printing
@@ -162,24 +171,27 @@ pub(crate) enum SelectKind {
 // state-machine parser fixed). Recursion here is bounded by `max_depth`
 // (typically 64), so it can't itself overflow.
 //
-// Nodes at exactly `max_depth` are left intact; only their *children*
-// (depth `max_depth + 1`) get replaced. The placeholder `Identifier("…")`
-// renders as `Identifier("…")` under `{:#?}` — visually distinct from
-// real identifiers and unambiguous as a truncation marker.
+// Depth counting: the top-level `Expr` is depth 0; its direct children
+// are depth 1; etc. With `max_depth = N`, exactly N levels are kept
+// (depths 0 .. N-1), and everything at depth N or below is replaced
+// with `Truncated`. So `--parse-only --max-depth=2` on `(((1)))`
+// renders as `Grouped(Grouped(Truncated))` — two `Grouped` layers plus
+// the marker.
 pub(crate) fn truncate_expr_for_display(expr: &mut Expr, max_depth: usize) {
     truncate_expr_inner(expr, 0, max_depth);
 }
 
 fn truncate_expr_inner(expr: &mut Expr, depth: usize, max_depth: usize) {
-    if depth > max_depth {
-        *expr = Expr::Identifier("…".to_string());
+    if depth >= max_depth {
+        *expr = Expr::Truncated;
         return;
     }
     match expr {
         Expr::Literal(_)
         | Expr::RealLiteral(_)
         | Expr::Identifier(_)
-        | Expr::SystemTask { .. } => {}
+        | Expr::SystemTask { .. }
+        | Expr::Truncated => {}
         Expr::Grouped(inner) => truncate_expr_inner(inner.as_mut(), depth + 1, max_depth),
         Expr::Unary { expr: inner, .. } => {
             truncate_expr_inner(inner.as_mut(), depth + 1, max_depth)
@@ -307,7 +319,8 @@ fn steal_expr_children(expr: &mut Expr, out: &mut Vec<Expr>) {
         Expr::Literal(_)
         | Expr::RealLiteral(_)
         | Expr::Identifier(_)
-        | Expr::SystemTask { .. } => {}
+        | Expr::SystemTask { .. }
+        | Expr::Truncated => {}
         Expr::Grouped(inner) => {
             out.push(std::mem::replace(inner.as_mut(), placeholder()));
         }

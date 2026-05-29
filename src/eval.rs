@@ -408,6 +408,9 @@ fn annotate<'a>(expr: &'a Expr, session: &Session) -> Result<Annotated<'a>, Stri
                 kind: AnnotatedKind::Leaf,
             })
         }
+        Expr::Truncated => {
+            unreachable!("Expr::Truncated is a display-only sentinel; never reaches annotate")
+        }
     }
 }
 
@@ -671,6 +674,9 @@ pub(crate) fn expression_is_real(expr: &Expr, session: &Session) -> bool {
             }
             _ => false,
         },
+        Expr::Truncated => unreachable!(
+            "Expr::Truncated is a display-only sentinel; never reaches expression_is_real"
+        ),
     }
 }
 
@@ -881,6 +887,9 @@ fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> 
             };
             evaluate_real_array_element_select(name, index, session)
         }
+        Expr::Truncated => unreachable!(
+            "Expr::Truncated is a display-only sentinel; never reaches evaluate_expr_as_real"
+        ),
     }
 }
 
@@ -1190,6 +1199,9 @@ fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String>
         Expr::Select { name, kind, inner } => {
             validate_select_expr_structure(name, kind, inner.as_deref(), session)
         }
+        Expr::Truncated => unreachable!(
+            "Expr::Truncated is a display-only sentinel; never reaches validate_expr_structure"
+        ),
     }
 }
 
@@ -1555,6 +1567,9 @@ fn evaluate_expr_in_context(
                 None => value,
             })
         }
+        Expr::Truncated => unreachable!(
+            "Expr::Truncated is a display-only sentinel; never reaches evaluate_expr_in_context"
+        ),
     }
 }
 
@@ -1989,6 +2004,9 @@ fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
         // the two-pass context propagation sees the same shape the
         // materialised value will have.
         Expr::Select { name, kind, inner } => infer_select_meta(name, kind, inner.as_deref(), session),
+        Expr::Truncated => unreachable!(
+            "Expr::Truncated is a display-only sentinel; never reaches infer_expr_meta"
+        ),
     }
 }
 
@@ -3010,6 +3028,9 @@ fn is_indefinite_width(expr: &Expr) -> bool {
         // |m-l|+1 for constant part-select, the constant `width` for the
         // indexed forms), so the result width is always definite.
         Expr::Select { .. } => false,
+        Expr::Truncated => unreachable!(
+            "Expr::Truncated is a display-only sentinel; never reaches has_indefinite_width"
+        ),
     }
 }
 
@@ -3499,6 +3520,9 @@ fn evaluate_expr_as_math_bigint(expr: &Expr, session: &Session) -> Result<BigInt
             value_to_math_bigint(evaluate_expr_in_context(expr, None, session)?)
         }
         Expr::SystemTask { name } => Err(task_in_expression_error(name)),
+        Expr::Truncated => unreachable!(
+            "Expr::Truncated is a display-only sentinel; never reaches evaluate_expr_as_math_bigint"
+        ),
     }
 }
 
