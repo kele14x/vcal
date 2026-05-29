@@ -360,14 +360,12 @@ fn annotate<'a>(expr: &'a Expr, session: &Session) -> Result<Annotated<'a>, Stri
             let reg = session
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-            // Real reg → None meta (real pipeline); integer reg → Some.
-            // Array regs have no value as a whole — validator surfaces the
-            // diagnostic; we stamp a placeholder meta of None here so the
-            // structural validator runs first and produces the friendlier
-            // error before any consumer touches the meta.
-            let meta = if reg.is_real() {
-                None
-            } else if reg.is_array() {
+            // Real reg → None meta (real pipeline). Array regs also stamp
+            // None — they have no value as a whole, so the structural
+            // validator runs first and surfaces the friendlier diagnostic
+            // before any consumer touches the meta. Only a plain vector
+            // reg produces a concrete `ExprMeta`.
+            let meta = if reg.is_real() || reg.is_array() {
                 None
             } else {
                 let value = reg.require_vector(name)?;
@@ -4383,6 +4381,9 @@ fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
                 base: leftmost_base,
             })
         }
+        LValue::Truncated => {
+            unreachable!("LValue::Truncated is a display-only sentinel; never reaches lvalue_meta")
+        }
     }
 }
 
@@ -4398,6 +4399,9 @@ fn flatten_lvalue_leaves<'a>(lvalue: &'a LValue, out: &mut Vec<&'a LValue>) {
                 flatten_lvalue_leaves(item, out);
             }
         }
+        LValue::Truncated => unreachable!(
+            "LValue::Truncated is a display-only sentinel; never reaches flatten_lvalue_leaves"
+        ),
     }
 }
 
@@ -4613,6 +4617,9 @@ fn leaf_target(leaf: &LValue, session: &Session) -> Result<LeafTarget, String> {
         }
         // Concats aren't leaves — flatten_lvalue_leaves never reaches them.
         LValue::Concat(_) => unreachable!("leaf_target called on a Concat"),
+        LValue::Truncated => {
+            unreachable!("LValue::Truncated is a display-only sentinel; never reaches leaf_target")
+        }
     }
 }
 

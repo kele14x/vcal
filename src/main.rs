@@ -19,7 +19,7 @@ fn main() -> ExitCode {
                     "  --max-depth=N  AST display depth cap for --parse-only mode.",
                 );
                 println!(
-                    "                 Sub-trees deeper than N render as `…`. Default {}.",
+                    "                 Sub-trees at depth N or deeper render as `Truncated`. Default {}.",
                     vcal::DEFAULT_DISPLAY_DEPTH
                 );
                 println!(

@@ -254,10 +254,47 @@ fn truncate_select_kind_inner(kind: &mut SelectKind, depth: usize, max_depth: us
     }
 }
 
-// Apply `truncate_expr_for_display` to every `Expr` reachable from a
-// `Stmt` — used by `parse_input` to bound `{:#?}` rendering depth on
-// every expression position (reg ranges, init expressions, assignment
-// LHS/RHS, etc.) without each callsite repeating the descent.
+// Truncate an `LValue` analogously to `truncate_expr_for_display`: any
+// sub-tree at depth `>= max_depth` is replaced with `LValue::Truncated`.
+// Necessary because the LHS of `Stmt::Assign` is its own recursive
+// shape — `LValue::Concat(Vec<LValue>)` can nest arbitrarily — and the
+// `{:#?}` formatter recurses on each level. A bare deep concat LHS like
+// `{{{{...a}}}} = 1` would overflow the render stack without this cap.
+// Recursion here is bounded by `max_depth`, so the walk itself can't
+// overflow.
+pub(crate) fn truncate_lvalue_for_display(lvalue: &mut LValue, max_depth: usize) {
+    truncate_lvalue_inner(lvalue, 0, max_depth);
+}
+
+fn truncate_lvalue_inner(lvalue: &mut LValue, depth: usize, max_depth: usize) {
+    if depth >= max_depth {
+        *lvalue = LValue::Truncated;
+        return;
+    }
+    match lvalue {
+        LValue::Name(_) | LValue::Truncated => {}
+        LValue::Select { kind, inner, .. } => {
+            // Mirrors `Expr::Select`'s depth accounting: the SelectKind
+            // itself is at depth + 1, and `truncate_select_kind_inner`
+            // gives the Expr children that same depth.
+            truncate_select_kind_inner(kind, depth + 1, max_depth);
+            if let Some(inner_kind) = inner.as_mut() {
+                truncate_select_kind_inner(inner_kind, depth + 1, max_depth);
+            }
+        }
+        LValue::Concat(items) => {
+            for item in items {
+                truncate_lvalue_inner(item, depth + 1, max_depth);
+            }
+        }
+    }
+}
+
+// Apply `truncate_expr_for_display` / `truncate_lvalue_for_display` to
+// every `Expr` / `LValue` reachable from a `Stmt` — used by `parse_input`
+// to bound `{:#?}` rendering depth on every expression position (reg
+// ranges, init expressions, assignment LHS/RHS, etc.) without each
+// callsite repeating the descent.
 pub(crate) fn truncate_stmt_for_display(stmt: &mut Stmt, max_depth: usize) {
     match stmt {
         Stmt::Expr(e) => truncate_expr_for_display(e, max_depth),
@@ -276,7 +313,10 @@ pub(crate) fn truncate_stmt_for_display(stmt: &mut Stmt, max_depth: usize) {
                 }
             }
         }
-        Stmt::Assign { rhs, .. } => truncate_expr_for_display(rhs, max_depth),
+        Stmt::Assign { lvalue, rhs } => {
+            truncate_lvalue_for_display(lvalue, max_depth);
+            truncate_expr_for_display(rhs, max_depth);
+        }
         Stmt::Task(_) => {}
     }
 }
@@ -341,11 +381,11 @@ fn steal_expr_children(expr: &mut Expr, out: &mut Vec<Expr>) {
             out.push(std::mem::replace(else_expr.as_mut(), placeholder()));
         }
         Expr::Concatenation { items } => {
-            out.extend(items.drain(..));
+            out.append(items);
         }
         Expr::Replication { count, items } => {
             out.push(std::mem::replace(count.as_mut(), placeholder()));
-            out.extend(items.drain(..));
+            out.append(items);
         }
         Expr::SignCast { arg, .. }
         | Expr::BaseCast { arg, .. }
@@ -353,7 +393,7 @@ fn steal_expr_children(expr: &mut Expr, out: &mut Vec<Expr>) {
             out.push(std::mem::replace(arg.as_mut(), placeholder()));
         }
         Expr::MathFunction { args, .. } => {
-            out.extend(args.drain(..));
+            out.append(args);
         }
         Expr::Select { kind, inner, .. } => {
             steal_select_kind_children(kind, out);
@@ -489,6 +529,13 @@ pub(crate) enum LValue {
         inner: Option<Box<SelectKind>>,
     },
     Concat(Vec<LValue>),
+    // Display-only sentinel inserted by `truncate_lvalue_for_display` to
+    // replace sub-trees that exceed the caller-requested render depth.
+    // Mirrors `Expr::Truncated`: never produced by the parser, never
+    // consumed by eval (which `unreachable!`s on it). Exists so a deeply
+    // nested concat lvalue (`{{{{a}}}}`) can be capped before `{:#?}`
+    // formatter recursion overflows the stack.
+    Truncated,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -872,18 +919,18 @@ impl<'a> Parser<'a> {
                 continue;
             }
 
-            if let Some((op, lbp, rbp)) = self.peek().and_then(infix_binding_power) {
-                if lbp >= min_bp {
-                    self.index += 1;
-                    let lhs = value.take().expect("value is Some in this branch");
-                    stack.push(Pending::BinaryAwaitRhs {
-                        lhs,
-                        op,
-                        saved_min_bp: min_bp,
-                    });
-                    min_bp = rbp;
-                    continue;
-                }
+            if let Some((op, lbp, rbp)) = self.peek().and_then(infix_binding_power)
+                && lbp >= min_bp
+            {
+                self.index += 1;
+                let lhs = value.take().expect("value is Some in this branch");
+                stack.push(Pending::BinaryAwaitRhs {
+                    lhs,
+                    op,
+                    saved_min_bp: min_bp,
+                });
+                min_bp = rbp;
+                continue;
             }
 
             // No extension possible. Reduce: pop a pending frame.
@@ -1184,12 +1231,13 @@ impl<'a> Parser<'a> {
             Some(Token::LParen) => {
                 // Unreachable from the iterative `parse_expr_bp` driver:
                 // it consumes `(` itself and pushes a Group frame before
-                // calling parse_primary. Reaching this arm means the
-                // caller skipped that handling. Treat as an internal-
-                // contract error rather than recursing into
-                // parse_expression (which would re-introduce the deep-
-                // paren stack overflow this refactor exists to fix).
-                Err("internal: parse_primary should not see `(`".to_string())
+                // calling parse_primary. Reaching this arm means a future
+                // caller skipped that handling — a programming-contract
+                // violation, not a user-input error. `unreachable!` panics
+                // in both debug and release builds, so the contract is
+                // enforced strictly rather than silently re-introducing the
+                // deep-paren recursion this refactor exists to fix.
+                unreachable!("parse_primary must not be called on `(`; parse_expr_bp consumes LParen itself")
             }
             Some(Token::LBrace) => self.parse_brace_primary(),
             Some(Token::RParen) => Err("unexpected closing parenthesis".to_string()),

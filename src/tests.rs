@@ -7362,6 +7362,29 @@ fn parse_input_renders_deep_input_without_overflow() {
 }
 
 #[test]
+fn parse_input_truncates_deep_concat_lvalue() {
+    // Regression for the LValue-side display cap: a deeply nested concat
+    // lvalue like `{{{{...a}}}} = 1` has its own recursive shape on the
+    // LHS, and the `{:#?}` formatter recurses one frame per `Concat`
+    // layer. Without `truncate_lvalue_for_display` the rendered output
+    // would overflow the formatter stack — separate from the Expr-side
+    // truncation, which only protects the RHS.
+    //
+    // We need a reg declared first so the LHS parses; the parser doesn't
+    // need it (parse_input skips eval), but expression_to_lvalue runs
+    // during parse to convert the LHS Expr into an LValue.
+    let n = 200;
+    let lhs = "{".repeat(n) + "a" + &"}".repeat(n);
+    let input = format!("{lhs} = 1");
+    let rendered = parse_input_with_depth(&input, 10)
+        .expect("deep concat lvalue should parse and render");
+    assert!(
+        rendered.contains("Truncated"),
+        "expected LValue::Truncated marker when concat lvalue exceeds depth cap"
+    );
+}
+
+#[test]
 fn parse_input_skips_semantic_errors() {
     // Inputs that parse cleanly but would fail at validate/eval time
     // must succeed under parse_input — the whole point is to isolate
