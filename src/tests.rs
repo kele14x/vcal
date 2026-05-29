@@ -4,7 +4,7 @@ use num_bigint::BigInt;
 
 use crate::lexer::{Token, tokenize};
 use crate::parser::{BinaryOp, Expr, UnaryOp, parse_expression, parse_integer};
-use crate::{Session, evaluate_input, run_repl};
+use crate::{Session, evaluate_input, parse_input, run_repl};
 
 #[test]
 fn evaluates_unsized_decimal() {
@@ -7209,4 +7209,36 @@ fn long_addition_chain_evaluates_without_quadratic_blowup() {
         })
         .expect("spawn worker thread");
     handle.join().expect("chain test thread panicked");
+}
+
+#[test]
+fn parse_input_returns_ast_without_evaluating() {
+    // The --parse-only debug entry point: parser runs, AST renders via
+    // {:#?}, validation/evaluation are skipped. We just check the render
+    // mentions the expected operator — exact format isn't part of the
+    // contract.
+    let rendered = parse_input("1 + 2").expect("should parse");
+    assert!(rendered.contains("Add"), "expected Add op in: {rendered}");
+    assert!(rendered.contains("Binary"), "expected Binary node in: {rendered}");
+
+    // Empty input is the same no-op contract as evaluate_input.
+    assert_eq!(parse_input("").unwrap(), "");
+    assert_eq!(parse_input("   \n").unwrap(), "");
+
+    // Syntax errors surface with the same `Syntax error:` prefix as the
+    // eval path so callers get a uniform diagnostic shape.
+    let err = parse_input("1 +").expect_err("trailing op should fail");
+    assert!(err.starts_with("Syntax error:"), "got: {err}");
+}
+
+#[test]
+fn parse_input_skips_semantic_errors() {
+    // Inputs that parse cleanly but would fail at validate/eval time
+    // must succeed under parse_input — the whole point is to isolate
+    // the parser stage. `undefined_var` is a perfectly valid Identifier
+    // expression as far as the parser is concerned; semantic_check is
+    // what would reject it.
+    let rendered = parse_input("undefined_var + 1").expect("parser accepts identifier");
+    assert!(rendered.contains("Identifier"));
+    assert!(rendered.contains("Add"));
 }

@@ -268,6 +268,20 @@ pub fn evaluate_input(input: &str) -> Result<Evaluation, String> {
     session.eval(input)
 }
 
+// Debug entry point: run the parser only and return the AST as a
+// pretty-printed Debug string. Skips validate / evaluate so callers
+// can inspect what the parser actually built — useful for diagnosing
+// parser-stage issues (deep paren nests, weird precedence, etc.) in
+// isolation from the eval pipeline.
+pub fn parse_input(input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(String::new());
+    }
+    let statements = parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
+    Ok(format!("{statements:#?}"))
+}
+
 fn evaluate_input_with_session(
     session: &mut Session,
     input: &str,
@@ -748,6 +762,70 @@ pub fn run_interactive() -> io::Result<()> {
                     break;
                 }
             }
+            Err(message) => {
+                println!("Out[{index}]: ");
+                println!("{message}");
+            }
+        }
+
+        index += 1;
+    }
+
+    Ok(())
+}
+
+// Parse-only REPL for the piped / non-TTY path. Mirrors `run_repl` but
+// stops after the parser and prints the AST instead of evaluating. Used
+// when the binary is invoked with `--parse-only`. No `Session` is
+// threaded through — the parser doesn't read or write variable state.
+pub fn run_parse_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
+    let mut index = 0usize;
+    let mut line = String::new();
+
+    loop {
+        write!(writer, "In[{index}]: ")?;
+        writer.flush()?;
+
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+
+        match parse_input(&line) {
+            Ok(ast) => writeln!(writer, "Out[{index}]: {ast}")?,
+            Err(message) => {
+                writeln!(writer, "Out[{index}]: ")?;
+                writeln!(writer, "{message}")?;
+            }
+        }
+
+        index += 1;
+    }
+
+    Ok(())
+}
+
+// Parse-only TTY REPL — rustyline-backed counterpart to run_parse_repl.
+pub fn run_parse_interactive() -> io::Result<()> {
+    use rustyline::DefaultEditor;
+    use rustyline::error::ReadlineError;
+
+    let mut editor = DefaultEditor::new().map_err(io::Error::other)?;
+    let mut index = 0usize;
+
+    loop {
+        let line = match editor.readline(&format!("In[{index}]: ")) {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+            Err(err) => return Err(io::Error::other(err)),
+        };
+
+        if !line.trim().is_empty() {
+            let _ = editor.add_history_entry(line.as_str());
+        }
+
+        match parse_input(&line) {
+            Ok(ast) => println!("Out[{index}]: {ast}"),
             Err(message) => {
                 println!("Out[{index}]: ");
                 println!("{message}");
