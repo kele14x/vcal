@@ -273,12 +273,25 @@ pub fn evaluate_input(input: &str) -> Result<Evaluation, String> {
 // can inspect what the parser actually built — useful for diagnosing
 // parser-stage issues (deep paren nests, weird precedence, etc.) in
 // isolation from the eval pipeline.
+//
+// Truncates the AST to a fixed display depth before formatting. The
+// auto-derived `Debug` impl recurses one stack frame per `Box<Expr>`
+// level, so without truncation a 10^4-deep input — even though the
+// parser builds it iteratively — would crash during `{:#?}` rendering.
+// The cap is 64: deeper than any plausible human-written expression,
+// shallow enough that the bounded recursion can't overflow.
 pub fn parse_input(input: &str) -> Result<String, String> {
+    const DISPLAY_DEPTH_CAP: usize = 64;
+
     let input = input.trim();
     if input.is_empty() {
         return Ok(String::new());
     }
-    let statements = parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
+    let mut statements =
+        parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
+    for stmt in &mut statements {
+        parser::truncate_stmt_for_display(stmt, DISPLAY_DEPTH_CAP);
+    }
     Ok(format!("{statements:#?}"))
 }
 

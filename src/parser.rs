@@ -153,6 +153,122 @@ pub(crate) enum SelectKind {
     },
 }
 
+// Truncate an `Expr` so that any sub-tree deeper than `max_depth` is
+// replaced with a leaf placeholder. Used by `parse_input` (the
+// `--parse-only` debug entry point) before `{:#?}`-rendering: the auto-
+// derived `Debug` impl recurses on each Box, so without truncation a
+// 10^4-deep `Grouped` chain would overflow the stack while printing
+// (separate from the parser-side overflow that the iterative
+// state-machine parser fixed). Recursion here is bounded by `max_depth`
+// (typically 64), so it can't itself overflow.
+//
+// Nodes at exactly `max_depth` are left intact; only their *children*
+// (depth `max_depth + 1`) get replaced. The placeholder `Identifier("…")`
+// renders as `Identifier("…")` under `{:#?}` — visually distinct from
+// real identifiers and unambiguous as a truncation marker.
+pub(crate) fn truncate_expr_for_display(expr: &mut Expr, max_depth: usize) {
+    truncate_expr_inner(expr, 0, max_depth);
+}
+
+fn truncate_expr_inner(expr: &mut Expr, depth: usize, max_depth: usize) {
+    if depth > max_depth {
+        *expr = Expr::Identifier("…".to_string());
+        return;
+    }
+    match expr {
+        Expr::Literal(_)
+        | Expr::RealLiteral(_)
+        | Expr::Identifier(_)
+        | Expr::SystemTask { .. } => {}
+        Expr::Grouped(inner) => truncate_expr_inner(inner.as_mut(), depth + 1, max_depth),
+        Expr::Unary { expr: inner, .. } => {
+            truncate_expr_inner(inner.as_mut(), depth + 1, max_depth)
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            truncate_expr_inner(lhs.as_mut(), depth + 1, max_depth);
+            truncate_expr_inner(rhs.as_mut(), depth + 1, max_depth);
+        }
+        Expr::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            truncate_expr_inner(cond.as_mut(), depth + 1, max_depth);
+            truncate_expr_inner(then_expr.as_mut(), depth + 1, max_depth);
+            truncate_expr_inner(else_expr.as_mut(), depth + 1, max_depth);
+        }
+        Expr::Concatenation { items } => {
+            for item in items {
+                truncate_expr_inner(item, depth + 1, max_depth);
+            }
+        }
+        Expr::Replication { count, items } => {
+            truncate_expr_inner(count.as_mut(), depth + 1, max_depth);
+            for item in items {
+                truncate_expr_inner(item, depth + 1, max_depth);
+            }
+        }
+        Expr::SignCast { arg, .. }
+        | Expr::BaseCast { arg, .. }
+        | Expr::RealConversion { arg, .. } => {
+            truncate_expr_inner(arg.as_mut(), depth + 1, max_depth);
+        }
+        Expr::MathFunction { args, .. } => {
+            for arg in args {
+                truncate_expr_inner(arg, depth + 1, max_depth);
+            }
+        }
+        Expr::Select { kind, inner, .. } => {
+            truncate_select_kind_inner(kind, depth + 1, max_depth);
+            if let Some(inner_kind) = inner.as_mut() {
+                truncate_select_kind_inner(inner_kind, depth + 1, max_depth);
+            }
+        }
+    }
+}
+
+fn truncate_select_kind_inner(kind: &mut SelectKind, depth: usize, max_depth: usize) {
+    match kind {
+        SelectKind::Bit { index } => truncate_expr_inner(index.as_mut(), depth, max_depth),
+        SelectKind::PartConst { msb, lsb } => {
+            truncate_expr_inner(msb.as_mut(), depth, max_depth);
+            truncate_expr_inner(lsb.as_mut(), depth, max_depth);
+        }
+        SelectKind::PartIndexedUp { base, width }
+        | SelectKind::PartIndexedDown { base, width } => {
+            truncate_expr_inner(base.as_mut(), depth, max_depth);
+            truncate_expr_inner(width.as_mut(), depth, max_depth);
+        }
+    }
+}
+
+// Apply `truncate_expr_for_display` to every `Expr` reachable from a
+// `Stmt` — used by `parse_input` to bound `{:#?}` rendering depth on
+// every expression position (reg ranges, init expressions, assignment
+// LHS/RHS, etc.) without each callsite repeating the descent.
+pub(crate) fn truncate_stmt_for_display(stmt: &mut Stmt, max_depth: usize) {
+    match stmt {
+        Stmt::Expr(e) => truncate_expr_for_display(e, max_depth),
+        Stmt::Decl { range, names, .. } => {
+            if let Some((msb, lsb)) = range {
+                truncate_expr_for_display(msb, max_depth);
+                truncate_expr_for_display(lsb, max_depth);
+            }
+            for name in names {
+                if let Some(init) = name.init.as_mut() {
+                    truncate_expr_for_display(init, max_depth);
+                }
+                if let Some((msb, lsb)) = name.dim.as_mut() {
+                    truncate_expr_for_display(msb, max_depth);
+                    truncate_expr_for_display(lsb, max_depth);
+                }
+            }
+        }
+        Stmt::Assign { rhs, .. } => truncate_expr_for_display(rhs, max_depth),
+        Stmt::Task(_) => {}
+    }
+}
+
 // Iterative Drop for Expr.
 //
 // `Expr::Grouped(Box<Expr>)`, `Binary { lhs: Box<Expr>, rhs: Box<Expr> }`,

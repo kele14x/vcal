@@ -7314,6 +7314,23 @@ fn parse_input_returns_ast_without_evaluating() {
 }
 
 #[test]
+fn parse_input_renders_deep_input_without_overflow() {
+    // The parser is iterative (Phase 3), but the auto-derived `Debug`
+    // impl on `Expr` would still recurse on each `Grouped` layer when
+    // formatting via `{:#?}`. parse_input applies a depth cap before
+    // formatting so the bounded-recursion render is safe.
+    //
+    // 10^4 parens is well past the recursive-Debug overflow threshold.
+    let input: String = "(".repeat(10_000) + "1" + &")".repeat(10_000);
+    let rendered = parse_input(&input).expect("deep parens should parse and render");
+    // The truncation marker should appear; the AST was deeper than 64.
+    assert!(
+        rendered.contains('…'),
+        "expected truncation marker '…' for input deeper than the display cap"
+    );
+}
+
+#[test]
 fn parse_input_skips_semantic_errors() {
     // Inputs that parse cleanly but would fail at validate/eval time
     // must succeed under parse_input — the whole point is to isolate
