@@ -5,6 +5,7 @@
 - `cargo test` — run tests
 - `cargo run` — interactive REPL
 - `cargo build` — build the binary
+- `scripts/stress_recursion.sh` — feed deeply-nested expressions to the release binary and confirm no walker overflows the main-thread stack. Run after touching parser / annotate / validate / evaluate paths.
 
 ## Documentation boundary
 
