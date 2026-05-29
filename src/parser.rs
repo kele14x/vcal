@@ -582,6 +582,40 @@ struct Parser<'a> {
     index: usize,
 }
 
+// Continuation frame for the iterative `parse_expr_bp` state machine.
+// Each frame represents work deferred while a sub-expression is being
+// parsed — the heap-allocated equivalent of a recursive parse_expr_bp
+// call. `saved_min_bp` restores the surrounding precedence context when
+// the frame reduces.
+enum Pending {
+    /// `(` consumed, parsing the inner expression. `unary_wrap` carries
+    /// any prefix unary operators that appeared immediately before this
+    /// `(`, so they apply *after* the matching `)` closes — this is what
+    /// makes `!(((1)))` end up with `Unary` outside `Grouped` rather than
+    /// the other way around.
+    Group {
+        unary_wrap: Vec<UnaryOp>,
+        saved_min_bp: u8,
+    },
+    /// `lhs op` consumed; awaiting the right-hand side of a binary op.
+    BinaryAwaitRhs {
+        lhs: Expr,
+        op: BinaryOp,
+        saved_min_bp: u8,
+    },
+    /// `cond ?` consumed; parsing the then-branch at min_bp = 0 (anchored
+    /// by the upcoming `:`).
+    ConditionalThen { cond: Expr, saved_min_bp: u8 },
+    /// `cond ? then :` consumed; parsing the else-branch at
+    /// min_bp = COND_RBP (so chained `a ? b : c ? d : e` becomes right-
+    /// associative).
+    ConditionalElse {
+        cond: Expr,
+        then: Expr,
+        saved_min_bp: u8,
+    },
+}
+
 #[cfg(test)]
 pub(crate) fn parse_expression(input: &str) -> Result<Expr, String> {
     let tokens = tokenize(input)?;
@@ -632,59 +666,166 @@ impl<'a> Parser<'a> {
         self.parse_expr_bp(0)
     }
 
-    // Pratt-style precedence climb: replaces the previous 12-function
-    // precedence ladder (parse_conditional → parse_logical_or → ... →
-    // parse_power) with one loop driven by `infix_binding_power`. Same parse
-    // tree as before — left-associativity, right-associative `?:`, and the
-    // historical left-to-right `**` are all preserved by the (lbp, rbp)
-    // table at the top of this module.
+    // Iterative shift-reduce Pratt parser. Replaces the recursive Pratt
+    // version (which still recursed for binary RHS, ternary then/else, and
+    // — most importantly — every `(` via parse_primary's LParen branch).
+    // The Rust call stack stays at one frame regardless of expression
+    // depth; the equivalent of the call stack lives on the heap as
+    // `stack: Vec<Pending>`.
     //
-    // `min_bp` is the lowest binding power this call will accept. An infix
-    // operator with `lbp < min_bp` is left for the caller to bind, which is
-    // how the precedence ordering and right-associativity emerge.
+    // The driver alternates between two states:
+    //   - `value.is_none()` — need to read an operand. Collect prefix
+    //     unary ops; if the next token is `(`, push a Group frame
+    //     (carrying the unary ops so they apply *after* `)` closes); else
+    //     read a non-paren primary via parse_primary and wrap with the
+    //     collected unary ops.
+    //   - `value.is_some()` — have an operand. Try to extend with `?`,
+    //     a binary op (lbp >= min_bp), or fall through to "reduce": pop
+    //     a pending frame and combine.
     //
-    // The `?:` ternary is special-cased rather than table-driven because its
-    // right-hand side has two operand slots (`then` and `else`), separated
-    // by `:`. The middle parses at `min_bp = 0` (anchored by the upcoming
-    // `:`), and the else branch parses at `min_bp = COND_RBP` so chained
-    // `a ? b : c ? d : e` becomes `a ? b : (c ? d : e)`.
-    fn parse_expr_bp(&mut self, min_bp: u8) -> Result<Expr, String> {
-        let mut lhs = self.parse_unary()?;
+    // Same parse tree as the recursive version: left-associativity and
+    // right-associative `?:` come from the (lbp, rbp) table; `**` is left-
+    // associative; precedence ordering matches LRM Table 5-4.
+    //
+    // The `min_bp` parameter is kept for API compatibility but only ever
+    // called as `parse_expr_bp(0)` from `parse_expression`. The state
+    // machine's local `min_bp` variable is what does the actual work.
+    fn parse_expr_bp(&mut self, initial_min_bp: u8) -> Result<Expr, String> {
+        let mut min_bp = initial_min_bp;
+        let mut stack: Vec<Pending> = Vec::new();
+        let mut value: Option<Expr> = None;
 
         loop {
-            if matches!(self.peek(), Some(Token::Question)) && COND_LBP >= min_bp {
-                self.index += 1;
-                let then_expr = self.parse_expr_bp(0)?;
-                match self.next() {
-                    Some(Token::Colon) => {}
-                    _ => return Err("expected `:` in conditional expression".to_string()),
+            if value.is_none() {
+                // State: need an operand. Read prefix unary ops, then the
+                // primary (which may be `(...)`).
+                let mut prefix_ops: Vec<UnaryOp> = Vec::new();
+                while let Some(op) = self.peek().and_then(prefix_unary_op) {
+                    self.index += 1;
+                    prefix_ops.push(op);
                 }
-                let else_expr = self.parse_expr_bp(COND_RBP)?;
-                lhs = Expr::Conditional {
-                    cond: Box::new(lhs),
-                    then_expr: Box::new(then_expr),
-                    else_expr: Box::new(else_expr),
-                };
+
+                if matches!(self.peek(), Some(Token::LParen)) {
+                    self.index += 1;
+                    stack.push(Pending::Group {
+                        unary_wrap: prefix_ops,
+                        saved_min_bp: min_bp,
+                    });
+                    min_bp = 0;
+                    continue;
+                }
+
+                // Non-paren primary. parse_primary's LParen branch is
+                // unreachable from here because we just handled `(`
+                // ourselves; everything else (literals, identifiers,
+                // `{...}`, `[...]`, system functions) flows through.
+                let primary = self.parse_primary()?;
+                let mut wrapped = primary;
+                for op in prefix_ops.into_iter().rev() {
+                    wrapped = Expr::Unary {
+                        op,
+                        expr: Box::new(wrapped),
+                    };
+                }
+                value = Some(wrapped);
                 continue;
             }
 
-            let (op, lbp, rbp) = match self.peek().and_then(infix_binding_power) {
-                Some(triple) => triple,
-                None => break,
-            };
-            if lbp < min_bp {
-                break;
+            // State: have an operand. Try to extend.
+            if matches!(self.peek(), Some(Token::Question)) && COND_LBP >= min_bp {
+                self.index += 1;
+                let cond = value.take().expect("value is Some in this branch");
+                stack.push(Pending::ConditionalThen {
+                    cond,
+                    saved_min_bp: min_bp,
+                });
+                min_bp = 0;
+                continue;
             }
-            self.index += 1;
-            let rhs = self.parse_expr_bp(rbp)?;
-            lhs = Expr::Binary {
-                op,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            };
-        }
 
-        Ok(lhs)
+            if let Some((op, lbp, rbp)) = self.peek().and_then(infix_binding_power) {
+                if lbp >= min_bp {
+                    self.index += 1;
+                    let lhs = value.take().expect("value is Some in this branch");
+                    stack.push(Pending::BinaryAwaitRhs {
+                        lhs,
+                        op,
+                        saved_min_bp: min_bp,
+                    });
+                    min_bp = rbp;
+                    continue;
+                }
+            }
+
+            // No extension possible. Reduce: pop a pending frame.
+            match stack.pop() {
+                Some(Pending::Group {
+                    unary_wrap,
+                    saved_min_bp,
+                }) => {
+                    match self.next() {
+                        Some(Token::RParen) => {}
+                        _ => return Err("missing closing parenthesis".to_string()),
+                    }
+                    let inner = value.take().expect("value is Some when reducing");
+                    let mut wrapped = Expr::Grouped(Box::new(inner));
+                    for op in unary_wrap.into_iter().rev() {
+                        wrapped = Expr::Unary {
+                            op,
+                            expr: Box::new(wrapped),
+                        };
+                    }
+                    value = Some(wrapped);
+                    min_bp = saved_min_bp;
+                }
+                Some(Pending::BinaryAwaitRhs {
+                    lhs,
+                    op,
+                    saved_min_bp,
+                }) => {
+                    let rhs = value.take().expect("value is Some when reducing");
+                    value = Some(Expr::Binary {
+                        op,
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    });
+                    min_bp = saved_min_bp;
+                }
+                Some(Pending::ConditionalThen {
+                    cond,
+                    saved_min_bp,
+                }) => {
+                    match self.next() {
+                        Some(Token::Colon) => {}
+                        _ => return Err("expected `:` in conditional expression".to_string()),
+                    }
+                    let then = value.take().expect("value is Some when reducing");
+                    stack.push(Pending::ConditionalElse {
+                        cond,
+                        then,
+                        saved_min_bp,
+                    });
+                    min_bp = COND_RBP;
+                    value = None;
+                }
+                Some(Pending::ConditionalElse {
+                    cond,
+                    then,
+                    saved_min_bp,
+                }) => {
+                    let else_expr = value.take().expect("value is Some when reducing");
+                    value = Some(Expr::Conditional {
+                        cond: Box::new(cond),
+                        then_expr: Box::new(then),
+                        else_expr: Box::new(else_expr),
+                    });
+                    min_bp = saved_min_bp;
+                }
+                None => {
+                    return Ok(value.take().expect("value is Some at end of expression"));
+                }
+            }
+        }
     }
 
     // Statement-level dispatch (LRM A.2.1.3 reg decl / A.6.2 blocking
@@ -875,33 +1016,20 @@ impl<'a> Parser<'a> {
 
     // Position-based disambiguation: `&`/`|`/`^`/`~^` (and the alt
     // spelling `^~`) are binary OR unary depending on parse position.
-    // `parse_unary` claims them at unary position; the binary side of
-    // `infix_binding_power` only sees them after a primary, so dispatch is
-    // unambiguous without a token rewrite. `~&` and `~|` are unary-only —
-    // no binary BP entry consumes them, so a free-standing `a ~& b`
-    // cleanly fails as "unexpected token".
+    // The state machine in `parse_expr_bp` claims them at unary position
+    // via `prefix_unary_op` before reading a primary; the binary side of
+    // `infix_binding_power` only sees them after a primary, so dispatch
+    // is unambiguous without a token rewrite. `~&` and `~|` are
+    // unary-only — no binary BP entry consumes them, so a free-standing
+    // `a ~& b` cleanly fails as "unexpected token".
     //
-    // Iterative: a chain like `!!!!1` accumulates ops in a Vec rather than
-    // recursing once per `!`. With the recursive form a long-enough unary
-    // chain would overflow the stack the same way `(((...)))` does in
-    // `parse_primary`. Wrapping happens in reverse so the outermost
-    // operator (first one read) ends up the outermost `Expr::Unary`.
-    fn parse_unary(&mut self) -> Result<Expr, String> {
-        let mut ops: Vec<UnaryOp> = Vec::new();
-        while let Some(op) = self.peek().and_then(prefix_unary_op) {
-            self.index += 1;
-            ops.push(op);
-        }
-        let mut expr = self.parse_primary()?;
-        while let Some(op) = ops.pop() {
-            expr = Expr::Unary {
-                op,
-                expr: Box::new(expr),
-            };
-        }
-        Ok(expr)
-    }
-
+    // `parse_primary` reads only non-paren primaries: literals,
+    // identifiers (with optional bit/part-select), system function calls,
+    // and `{...}` brace forms. The iterative state machine handles `(`
+    // itself before reaching here, so an LParen at this point would mean
+    // we were called out of context (e.g., from external code that
+    // doesn't first peek for `(`). Surface that as an explicit error
+    // instead of recursing into parse_expression.
     fn parse_primary(&mut self) -> Result<Expr, String> {
         let token = self.next();
         match token {
@@ -925,11 +1053,14 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(Token::LParen) => {
-                let expr = self.parse_expression()?;
-                match self.next() {
-                    Some(Token::RParen) => Ok(Expr::Grouped(Box::new(expr))),
-                    _ => Err("missing closing parenthesis".to_string()),
-                }
+                // Unreachable from the iterative `parse_expr_bp` driver:
+                // it consumes `(` itself and pushes a Group frame before
+                // calling parse_primary. Reaching this arm means the
+                // caller skipped that handling. Treat as an internal-
+                // contract error rather than recursing into
+                // parse_expression (which would re-introduce the deep-
+                // paren stack overflow this refactor exists to fix).
+                Err("internal: parse_primary should not see `(`".to_string())
             }
             Some(Token::LBrace) => self.parse_brace_primary(),
             Some(Token::RParen) => Err("unexpected closing parenthesis".to_string()),

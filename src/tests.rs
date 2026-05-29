@@ -7212,6 +7212,41 @@ fn long_addition_chain_evaluates_without_quadratic_blowup() {
 }
 
 #[test]
+fn parses_deeply_nested_parens_without_overflow() {
+    // Pre-Phase-3, every `(` cost ~14 stack frames in the recursive Pratt
+    // ladder, so input with ~700 nested `(` was enough to overflow the
+    // default 2 MB test thread. The state-machine parser handles `(` via
+    // the `Pending::Group` frame on the heap stack, so paren depth is
+    // bounded by heap rather than Rust call stack.
+    //
+    // 10^4 parens here exercises the iterative path well past any
+    // recursive limit while keeping the test fast.
+    let input: String = "(".repeat(10_000) + "1" + &")".repeat(10_000);
+    let expr = parse_expression(&input).expect("deep parens should parse");
+    // The outermost AST node should be a Grouped (the iterative state
+    // machine wraps each `(` reduce step as Grouped). We can't easily
+    // recurse into the AST to count layers (that walk would itself
+    // overflow), so just check the outermost shape.
+    assert!(matches!(&expr, Expr::Grouped(_)));
+}
+
+#[test]
+fn parses_deep_nested_ternary_without_overflow() {
+    // `a ? b : c ? d : e ? f : ...` — right-associative ternary. In the
+    // recursive Pratt parser, each `?` added two stack frames (one for
+    // the then-branch parse, one for the else-branch recursion). Now both
+    // branches are state-machine frames on the heap.
+    let n = 10_000;
+    let mut input = String::new();
+    for i in 0..n {
+        input.push_str(&format!("{} ? {} : ", i % 10, i % 10));
+    }
+    input.push('0');
+    let expr = parse_expression(&input).expect("deep ternary should parse");
+    assert!(matches!(&expr, Expr::Conditional { .. }));
+}
+
+#[test]
 fn drop_of_deep_grouped_ast_does_not_overflow() {
     // Without `impl Drop for Expr`, dropping a 10^5-deep `Grouped` chain
     // overflows the stack — auto-derived Drop walks each `Box<Expr>`
