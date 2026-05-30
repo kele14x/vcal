@@ -7,6 +7,7 @@ use crate::{RegRange, RegValue, Session};
 use crate::parser::{
     BinaryOp, Expr, LValue, MathFunctionKind, RealConversionKind, SelectKind, UnaryOp,
 };
+use crate::value;
 use crate::value::{
     Base, IntegerValue, LogicBit, Value, bits_to_biguint, bitwise_and_bits, bitwise_not_bit,
     bitwise_or_bits, bitwise_xnor_bits, bitwise_xor_bits,
@@ -1352,7 +1353,13 @@ fn visit_expr_structure<'a>(
     session: &Session,
 ) -> Result<(), String> {
     match node {
-        Expr::Literal(_) | Expr::RealLiteral(_) => {}
+        // MAX_BIT_WIDTH cap was historically gated in the parser, but
+        // `LiteralSpec` defers materialization to eval time precisely so
+        // this check can live in the validator phase. Without this gate,
+        // `9999999999999'd1` would parse cleanly (the spec carries width as
+        // a number, not bits) and only blow up at `materialize()` time.
+        Expr::Literal(spec) => value::ensure_bit_width(spec.width, "literal")?,
+        Expr::RealLiteral(_) => {}
         Expr::Grouped(inner) => work.push(ExprValidateTask::Visit(inner)),
         Expr::Unary { op, expr } => {
             work.push(ExprValidateTask::PostCheck(
@@ -1612,7 +1619,13 @@ fn visit_annotated<'b, 'a: 'b>(
 ) -> Result<(), String> {
     match &annot.kind {
         AnnotatedKind::Leaf => match annot.expr {
-            Expr::Literal(_) | Expr::RealLiteral(_) => {}
+            // Same MAX_BIT_WIDTH cap as the structural validator
+            // (visit_expr_structure) — covers paths that go through the
+            // Annotated tree directly without the structural pass first
+            // (e.g. evaluate_subexpr_as_integer's pre-validated callers
+            // that still hit literal leaves through this driver).
+            Expr::Literal(spec) => value::ensure_bit_width(spec.width, "literal")?,
+            Expr::RealLiteral(_) => {}
             Expr::Identifier(name) => {
                 let reg = session
                     .lookup(name)
@@ -1932,10 +1945,17 @@ fn evaluate_leaf_expr_in_context(
     session: &Session,
 ) -> Result<IntegerValue, String> {
     match expr {
-        Expr::Literal(value) => Ok(match context {
-            Some(context) => value.resized_to_context(context.width, context.signed),
-            None => value.clone(),
-        }),
+        Expr::Literal(spec) => {
+            // First materialization site — the validator has already capped
+            // `spec.width` against MAX_BIT_WIDTH, so this allocation is
+            // bounded. Resize-to-context follows whether the literal sits in
+            // a propagated width/signedness or stands alone (None).
+            let value = spec.materialize();
+            Ok(match context {
+                Some(context) => value.resized_to_context(context.width, context.signed),
+                None => value,
+            })
+        }
         // Reaching the integer pipeline with a real-typed expression at
         // the top means our dispatch missed a real-result case. Surface
         // an error rather than silently fabricating an integer.
@@ -3531,7 +3551,16 @@ fn combine_eval<'b, 'a: 'b>(
             // and extend bits in that order.
             let start = vals.len() - item_count;
             let items: Vec<IntegerValue> = vals.drain(start..).collect();
-            let mut bits = Vec::new();
+            // Cap the sum of operand widths before allocating. Without this,
+            // `{a, a}` with two 16M-bit operands silently produces a 32M-bit
+            // garbage result. Use saturating_add so a usize-overflow degrades
+            // gracefully to the rejection path.
+            let total = items
+                .iter()
+                .fold(0usize, |acc, item| acc.saturating_add(item.bits.len()));
+            value::ensure_bit_width(total, "concatenation")
+                .map_err(|e| format!("Semantic error: {e}"))?;
+            let mut bits = Vec::with_capacity(total);
             for item in items.iter().rev() {
                 bits.extend(item.bits.iter().copied());
             }
@@ -3602,7 +3631,10 @@ fn combine_eval<'b, 'a: 'b>(
                     "concatenation must have at least one operand with positive size".to_string(),
                 );
             }
-            let mut bits = Vec::with_capacity(inner_bits.len().saturating_mul(count));
+            let total = inner_bits.len().saturating_mul(count);
+            value::ensure_bit_width(total, "replication")
+                .map_err(|e| format!("Semantic error: {e}"))?;
+            let mut bits = Vec::with_capacity(total);
             for _ in 0..count {
                 bits.extend(inner_bits.iter().copied());
             }
@@ -4449,9 +4481,17 @@ fn collect_concatenation_bits(items: &[Expr], session: &Session) -> Result<Vec<L
     }
     // Items are in source order (leftmost first → MSB-side). Our bit vectors
     // are LSB-first, so we feed bits starting from the rightmost item.
+    // Cap the running total after each item so a `{a, a, a, ...}` concat
+    // inside replication rejects before the inner buffer ever gets near
+    // the OS allocator. saturating_add keeps usize overflow from masking
+    // the cap.
     let mut bits = Vec::new();
     for item in items.iter().rev() {
-        bits.extend(evaluate_concatenation_item_bits(item, session)?);
+        let item_bits = evaluate_concatenation_item_bits(item, session)?;
+        let total = bits.len().saturating_add(item_bits.len());
+        value::ensure_bit_width(total, "concatenation")
+            .map_err(|e| format!("Semantic error: {e}"))?;
+        bits.extend(item_bits);
     }
     if bits.is_empty() {
         // Every operand collapsed to zero width — the concatenation has no
@@ -4473,7 +4513,10 @@ fn evaluate_concatenation_item_bits(
             return Ok(Vec::new());
         }
         let inner_bits = collect_concatenation_bits(items, session)?;
-        let mut bits = Vec::with_capacity(inner_bits.len().saturating_mul(count));
+        let total = inner_bits.len().saturating_mul(count);
+        value::ensure_bit_width(total, "replication")
+            .map_err(|e| format!("Semantic error: {e}"))?;
+        let mut bits = Vec::with_capacity(total);
         for _ in 0..count {
             bits.extend(inner_bits.iter().copied());
         }
@@ -4630,10 +4673,14 @@ fn visit_bigint_eval<'a>(
     session: &Session,
 ) -> Result<(), String> {
     match expr {
-        Expr::Literal(value) => {
-            if value.has_unknown_bits() {
+        Expr::Literal(spec) => {
+            if spec.has_unknown_bits() {
                 return Err("expression contains unknown bits".to_string());
             }
+            // Validator has gated spec.width against MAX_BIT_WIDTH, so this
+            // materialize is bounded. Numeric payload trivially yields the
+            // bigint; Bits with all 0/1 has to expand to read the value.
+            let value = spec.materialize();
             vals.push(value.as_bigint(value.signed));
         }
         // Reaching this helper with a real-typed expression means the
@@ -5311,9 +5358,11 @@ fn evaluate_indexed_select_width(expr: &Expr, session: &Session) -> Result<usize
     if width.sign() != Sign::Plus {
         return Err("indexed part-select width must be positive".to_string());
     }
-    width
+    let width = width
         .to_usize()
-        .ok_or_else(|| "indexed part-select width too large".to_string())
+        .ok_or_else(|| "indexed part-select width too large".to_string())?;
+    value::ensure_bit_width(width, "part-select")?;
+    Ok(width)
 }
 
 // LRM 5.2.1: "the first expression shall address a more significant bit
@@ -5345,8 +5394,11 @@ fn check_part_select_direction(
 
 fn compute_select_width(msb_sel: &BigInt, lsb_sel: &BigInt) -> Result<usize, String> {
     let diff = (msb_sel - lsb_sel).abs() + BigInt::one();
-    diff.to_usize()
-        .ok_or_else(|| "part-select width too large".to_string())
+    let width = diff
+        .to_usize()
+        .ok_or_else(|| "part-select width too large".to_string())?;
+    value::ensure_bit_width(width, "part-select")?;
+    Ok(width)
 }
 
 // LHS structural validation + width for one `SelectKind` against a

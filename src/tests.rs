@@ -8007,6 +8007,198 @@ fn assign_with_wide_lvalue_concat_does_not_overflow() {
         .expect("wide lvalue concat assignment evaluates without overflow");
 }
 
+// Bug #2 regression suite — bit-vector size cap rejects huge widths
+// before any `Vec<LogicBit>` allocation. Cap is MAX_BIT_WIDTH = 2**24
+// (16,777,216 bits); the boundary is inclusive — exactly cap accepted,
+// cap+1 rejected. All diagnostics use the `Semantic error:` prefix —
+// the literal cap moved to the validator after the lazy `Expr::Literal`
+// refactor, so all paths surface the cap as a semantic check rather than
+// a parse-time check.
+
+#[test]
+fn huge_sized_literal_width_rejected() {
+    // FINDINGS.md #2 repro 1: 10 trillion-bit literal. The parser builds a
+    // LiteralSpec carrying width=9999999999999 without allocating it;
+    // validate_expr_structure runs ensure_bit_width before the evaluator
+    // would try to materialize.
+    let err = evaluate_input("9999999999999'd1").unwrap_err();
+    assert_eq!(
+        err,
+        "Semantic error: literal width 9999999999999 exceeds limit 16777216"
+    );
+}
+
+#[test]
+fn huge_unsized_literal_magnitude_rejected() {
+    // Unsized literal whose magnitude needs > MAX_BIT_WIDTH bits: a
+    // hex value with > 4_194_304 nibbles. The parser allocates a
+    // text-bounded low_bits vec (~16 MB for the digits themselves) but
+    // never the full `width` vec; validator rejects on the derived width.
+    let mut input = String::from("'h");
+    // 2**24 / 4 = 4_194_304 hex digits hit cap; one more digit pushes over.
+    for _ in 0..4_194_305 {
+        input.push('f');
+    }
+    let err = evaluate_input(&input).unwrap_err();
+    assert!(
+        err.starts_with("Semantic error: literal width "),
+        "expected literal-width error, got: {err}"
+    );
+    assert!(
+        err.ends_with(" exceeds limit 16777216"),
+        "expected exceeds-limit suffix, got: {err}"
+    );
+}
+
+#[test]
+fn parser_accepts_huge_literal_width_without_allocating() {
+    // Sanity check that the lazy LiteralSpec is doing its job: parsing
+    // `9999999999999'd1` produces a well-formed AST in O(text) — no
+    // 10 TB `Vec<LogicBit>`. Under the old eager AST this call would
+    // hang the kernel committing pages; under the lazy form it returns
+    // Ok within microseconds and the rendered AST contains the literal
+    // width as a number, not bits.
+    //
+    // parse_input is the right oracle here: it goes through the full
+    // parser + AST renderer but skips eval. If anything tried to expand
+    // the bit vector this test would never return.
+    let rendered = parse_input("9999999999999'd1").expect("parser must accept");
+    assert!(
+        rendered.contains("9999999999999"),
+        "expected the literal width to appear in the AST, got: {rendered}"
+    );
+}
+
+#[test]
+fn parse_input_with_depth_accepts_huge_literal_width() {
+    // The parse-only entry used by `vcal --parse-only` is purely
+    // syntactic — it accepts inputs the validator would reject
+    // (undeclared identifiers, out-of-range literal widths, etc.). The
+    // contract is "did this parse?" not "is this a valid program?".
+    let rendered = parse_input_with_depth("9999999999999'd1", 64)
+        .expect("parse-only must accept syntactically valid input");
+    assert!(rendered.contains("9999999999999"));
+}
+
+#[test]
+fn huge_reg_decl_width_rejected() {
+    // `reg [16777216:0]` = 16,777,217 bits, one over the cap.
+    let err = evaluate_input("reg [16777216:0] r;").unwrap_err();
+    assert_eq!(
+        err,
+        "Semantic error: reg width 16777217 exceeds limit 16777216"
+    );
+}
+
+#[test]
+fn huge_array_dim_rejected() {
+    // Array dimension width also flows through RegRange::width.
+    // 16,777,217-element array of 4-bit regs.
+    let err = evaluate_input("reg [3:0] a [0:16777216];").unwrap_err();
+    assert_eq!(
+        err,
+        "Semantic error: reg width 16777217 exceeds limit 16777216"
+    );
+}
+
+#[test]
+fn huge_replication_count_rejected() {
+    // `{count{1'b0}}` with count one over the cap. Cap is on the
+    // *result* width (inner_bits.len() * count), so a 1-bit element
+    // hits the cap at exactly count = MAX_BIT_WIDTH and trips at +1.
+    let err = evaluate_input("{16777217{1'b0}}").unwrap_err();
+    assert_eq!(
+        err,
+        "Semantic error: replication width 16777217 exceeds limit 16777216"
+    );
+}
+
+#[test]
+fn concatenation_of_wide_operands_rejected() {
+    // `{a, a}` where each `a` is half the cap or more sums past the cap.
+    // Without a gate here, the concat would silently produce a vector
+    // larger than MAX_BIT_WIDTH (32 Mbit garbage in this case). Each
+    // operand individually fits — only the sum exceeds.
+    let mut session = Session::new();
+    session
+        .eval("reg [16777215:0] a;")
+        .expect("16M-bit reg decl at cap is accepted");
+    let err = session.eval("{a, a};").unwrap_err();
+    assert_eq!(
+        err,
+        "Semantic error: concatenation width 33554432 exceeds limit 16777216"
+    );
+}
+
+#[test]
+fn concatenation_of_wide_operands_at_cap_accepted() {
+    // Concatenation total exactly at MAX_BIT_WIDTH must still pass —
+    // the inclusive-accept boundary mirrors the replication / part-
+    // select gates.
+    let mut session = Session::new();
+    session
+        .eval("reg [8388607:0] a;")
+        .expect("8M-bit reg decl is accepted");
+    session
+        .eval("{a, a};")
+        .expect("concatenation result exactly at cap is accepted");
+}
+
+#[test]
+fn nested_concat_inside_replication_rejected_at_inner_concat() {
+    // `{N{...wide concat...}}` would balloon the replication-side
+    // multiplier, but the inner concat itself trips the gate first —
+    // confirming collect_concatenation_bits enforces the running total
+    // before it ever returns to the replication multiplier.
+    let mut session = Session::new();
+    session
+        .eval("reg [9000000:0] a;")
+        .expect("9M-bit reg decl is accepted");
+    let err = session.eval("{4{a, a}};").unwrap_err();
+    assert!(
+        err.starts_with("Semantic error: ")
+            && (err.contains("concatenation width ") || err.contains("replication width ")),
+        "expected concatenation- or replication-width error, got: {err}"
+    );
+}
+
+#[test]
+fn huge_indexed_part_select_width_rejected() {
+    // FINDINGS.md #2 repro 3: `r[0 +: huge]`. Width flows through
+    // evaluate_indexed_select_width.
+    let mut session = Session::new();
+    session.eval("reg [3:0] r;").expect("reg decl evaluates");
+    let err = session.eval("r[0 +: 16777217];").unwrap_err();
+    assert_eq!(
+        err,
+        "Semantic error: part-select width 16777217 exceeds limit 16777216"
+    );
+}
+
+#[test]
+fn at_cap_literal_width_accepted() {
+    // Boundary: exactly 2**24 bits is accepted. Sanity-check the cap
+    // is inclusive on the accept side — otherwise the off-by-one would
+    // surface as a silent regression on the largest legal value.
+    let evaluation =
+        evaluate_input("16777216'd1").expect("at-cap literal width is accepted");
+    assert!(
+        evaluation.output.starts_with("16777216'd"),
+        "expected 16777216-wide output, got: {}",
+        evaluation.output
+    );
+}
+
+#[test]
+fn at_cap_reg_decl_width_accepted() {
+    // `reg [16777215:0]` = exactly 16,777,216 bits = MAX_BIT_WIDTH.
+    // Confirms the reg path's boundary mirrors the literal path's.
+    let mut session = Session::new();
+    session
+        .eval("reg [16777215:0] r;")
+        .expect("at-cap reg decl is accepted");
+}
+
 #[test]
 fn parse_input_returns_ast_without_evaluating() {
     // The --parse-only debug entry point: parser runs, AST renders via

@@ -7,9 +7,94 @@ use crate::value::{
     signed_decimal_bit_len,
 };
 
+// AST literal payload: parse-time representation that never allocates a
+// `Vec<LogicBit>` of length `width`. `width` itself can be huge (e.g.
+// `9999999999999'd1`) — the validator gates it against MAX_BIT_WIDTH before
+// the evaluator calls `materialize()`. Separating spec-from-value lets the
+// parser stay O(text length) and surfaces the cap as a Semantic error rather
+// than a Syntax error.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LiteralSpec {
+    pub(crate) width: usize,
+    pub(crate) signed: bool,
+    pub(crate) base: Base,
+    pub(crate) unsized_literal: bool,
+    pub(crate) payload: LiteralPayload,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum LiteralPayload {
+    // Numeric magnitude only — used by parse_unsized_decimal and the
+    // non-x/non-z arm of parse_based_decimal. Size O(digits). Materializes
+    // via biguint_to_bits_with_width.
+    Numeric { magnitude: BigUint },
+    // Explicit bit pattern from radix digits (binary/octal/hex), plus a fill
+    // bit for sign/zero/x/z extension to `width`. Covers parse_based_radix
+    // and the all-x / all-z short-circuits in parse_based_decimal (empty
+    // low_bits + fill = X|Z). Size O(digits * group_size) — text-bounded.
+    Bits {
+        low_bits: Vec<LogicBit>,
+        fill: LogicBit,
+    },
+}
+
+impl LiteralSpec {
+    // True if any X/Z appears in the materialized bit vector. For Bits we can
+    // answer from (low_bits, fill) without expanding. For Numeric the
+    // magnitude is by construction made of 0/1 digits only — never x/z.
+    pub(crate) fn has_unknown_bits(&self) -> bool {
+        match &self.payload {
+            LiteralPayload::Numeric { .. } => false,
+            LiteralPayload::Bits { low_bits, fill } => {
+                let fill_is_unknown = matches!(fill, LogicBit::X | LogicBit::Z);
+                // If fill is unknown and width extends past low_bits, the
+                // extended positions are unknown — short-circuit true.
+                if fill_is_unknown && self.width > low_bits.len() {
+                    return true;
+                }
+                // Otherwise scan only the live portion (truncated at width
+                // since extra low_bits get dropped at materialize time).
+                let live = low_bits.len().min(self.width);
+                low_bits[..live]
+                    .iter()
+                    .any(|bit| matches!(bit, LogicBit::X | LogicBit::Z))
+            }
+        }
+    }
+
+    // Materializes the full IntegerValue. The only path that allocates
+    // `width` bytes — gated by the validator's MAX_BIT_WIDTH check.
+    pub(crate) fn materialize(&self) -> IntegerValue {
+        match &self.payload {
+            LiteralPayload::Numeric { magnitude } => IntegerValue {
+                width: self.width,
+                signed: self.signed,
+                base: self.base,
+                bits: biguint_to_bits_with_width(magnitude, self.width),
+                unsized_literal: self.unsized_literal,
+            },
+            LiteralPayload::Bits { low_bits, fill } => {
+                let mut bits = low_bits.clone();
+                if bits.len() < self.width {
+                    bits.resize(self.width, *fill);
+                } else if bits.len() > self.width {
+                    bits.truncate(self.width);
+                }
+                IntegerValue {
+                    width: self.width,
+                    signed: self.signed,
+                    base: self.base,
+                    bits,
+                    unsized_literal: self.unsized_literal,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Expr {
-    Literal(IntegerValue),
+    Literal(LiteralSpec),
     // LRM §3.5.2: a real constant is stored as a 64-bit IEEE 754 double.
     // Width / signedness / base / x-z don't apply (Table 5-9 lists real as
     // "Signed, floating point"), so we keep the f64 directly rather than
@@ -1647,31 +1732,31 @@ pub(crate) fn parse_real(input: &str) -> Result<f64, String> {
         .map_err(|_| format!("invalid real literal: {input}"))
 }
 
-pub(crate) fn parse_integer(input: &str) -> Result<IntegerValue, String> {
+pub(crate) fn parse_integer(input: &str) -> Result<LiteralSpec, String> {
     match input.find('\'') {
         Some(apostrophe_index) => parse_based_integer(input, apostrophe_index),
         None => parse_unsized_decimal(input),
     }
 }
 
-fn parse_unsized_decimal(input: &str) -> Result<IntegerValue, String> {
+fn parse_unsized_decimal(input: &str) -> Result<LiteralSpec, String> {
     ensure_no_leading_underscore(input)?;
     let digits = strip_underscores(input);
     ensure_decimal_digits(&digits)?;
 
-    let value = parse_biguint(&digits)?;
-    let width = usize::max(signed_decimal_bit_len(&value), 32);
+    let magnitude = parse_biguint(&digits)?;
+    let width = usize::max(signed_decimal_bit_len(&magnitude), 32);
 
-    Ok(IntegerValue {
+    Ok(LiteralSpec {
         width,
         signed: true,
         base: Base::Decimal,
-        bits: biguint_to_bits_with_width(&value, width),
         unsized_literal: true,
+        payload: LiteralPayload::Numeric { magnitude },
     })
 }
 
-fn parse_based_integer(input: &str, apostrophe_index: usize) -> Result<IntegerValue, String> {
+fn parse_based_integer(input: &str, apostrophe_index: usize) -> Result<LiteralSpec, String> {
     let (size_part, rest) = input.split_at(apostrophe_index);
     let mut rest = &rest[1..];
     let width = if size_part.is_empty() {
@@ -1718,44 +1803,53 @@ fn parse_based_decimal(
     width_hint: Option<usize>,
     signed: bool,
     digits: &str,
-) -> Result<IntegerValue, String> {
+) -> Result<LiteralSpec, String> {
     let digits = strip_underscores(digits);
 
     let unsized_literal = width_hint.is_none();
 
+    // All-x and all-z decimal short-circuits — used to allocate the full
+    // width directly. Now stored as an empty bit prefix plus an X/Z fill;
+    // materialize() expands at eval time after the validator caps width.
     if digits.chars().all(is_x_digit) {
         let width = width_hint.unwrap_or(32);
-        return Ok(IntegerValue {
+        return Ok(LiteralSpec {
             width,
             signed,
             base: Base::Decimal,
-            bits: vec![LogicBit::X; width],
             unsized_literal,
+            payload: LiteralPayload::Bits {
+                low_bits: Vec::new(),
+                fill: LogicBit::X,
+            },
         });
     }
 
     if digits.chars().all(is_z_digit) {
         let width = width_hint.unwrap_or(32);
-        return Ok(IntegerValue {
+        return Ok(LiteralSpec {
             width,
             signed,
             base: Base::Decimal,
-            bits: vec![LogicBit::Z; width],
             unsized_literal,
+            payload: LiteralPayload::Bits {
+                low_bits: Vec::new(),
+                fill: LogicBit::Z,
+            },
         });
     }
 
     ensure_decimal_digits(&digits)?;
 
-    let value = parse_biguint(&digits)?;
-    let width = width_hint.unwrap_or_else(|| usize::max(biguint_bit_len(&value), 32));
+    let magnitude = parse_biguint(&digits)?;
+    let width = width_hint.unwrap_or_else(|| usize::max(biguint_bit_len(&magnitude), 32));
 
-    Ok(IntegerValue {
+    Ok(LiteralSpec {
         width,
         signed,
         base: Base::Decimal,
-        bits: biguint_to_bits_with_width(&value, width),
         unsized_literal,
+        payload: LiteralPayload::Numeric { magnitude },
     })
 }
 
@@ -1764,30 +1858,27 @@ fn parse_based_radix(
     signed: bool,
     base: Base,
     digits: &str,
-) -> Result<IntegerValue, String> {
+) -> Result<LiteralSpec, String> {
     let digits = strip_underscores(digits);
-    let mut bits = Vec::with_capacity(digits.len() * base.group_size());
+    let mut low_bits = Vec::with_capacity(digits.len() * base.group_size());
 
     for digit in digits.chars().rev() {
-        push_digit_bits(digit, base, &mut bits)?;
+        push_digit_bits(digit, base, &mut low_bits)?;
     }
 
     let unsized_literal = width_hint.is_none();
-    let width = width_hint.unwrap_or_else(|| usize::max(bits.len(), 32));
-    let extension = extension_bit(digits.chars().next().expect("digits is not empty"));
+    let width = width_hint.unwrap_or_else(|| usize::max(low_bits.len(), 32));
+    let fill = extension_bit(digits.chars().next().expect("digits is not empty"));
 
-    if bits.len() < width {
-        bits.resize(width, extension);
-    } else if bits.len() > width {
-        bits.truncate(width);
-    }
-
-    Ok(IntegerValue {
+    // No `bits.resize(width, fill)` here — materialization happens at eval
+    // time, after the validator gates `width` against MAX_BIT_WIDTH. low_bits
+    // stays text-bounded so a `9999999999999'h1` parses in O(text).
+    Ok(LiteralSpec {
         width,
         signed,
         base,
-        bits,
         unsized_literal,
+        payload: LiteralPayload::Bits { low_bits, fill },
     })
 }
 

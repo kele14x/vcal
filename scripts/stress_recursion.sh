@@ -233,6 +233,20 @@ run_case "eval lvalue-wide-concat   {a,a,..,a} = ..."  "n=$EVAL_DEPTH; print('re
 run_case "eval paren-wrapped-finish ((( \$finish )))"  "n=$EVAL_DEPTH; print('(' * n + '\$finish' + ')' * n)"
 
 # ============================================================
+# Bug #2: MAX_BIT_WIDTH cap rejects huge widths before allocation.
+# Each case used to hang the kernel for minutes (10 TB / 2 GB / 4 GB
+# virtual allocations being page-faulted into anonymous memory);
+# they now exit in milliseconds with a clean diagnostic. The
+# at-cap case checks the inclusive-accept boundary still works.
+# ============================================================
+run_case "eval huge-literal-width    9999999999999'd1"       "print(\"9999999999999'd1\")"
+run_case "eval huge-replication      {2147483647{1'b1}}"     "print(\"{2147483647{1'b1}}\")"
+run_case "eval huge-indexed-select   r[3 +: 4294967296]"     "print('reg [3:0] r;'); print('r[3 +: 4294967296];')"
+run_case "eval huge-concat-sum       {a, a} a=16M+1 bits"    "print('reg [16777215:0] a;'); print('{a, a};')"
+run_case "eval at-cap-literal-width  16777216'd1"            "print(\"16777216'd1\")"
+run_case "eval at-cap-concat-sum     {a, a} a=8M bits"       "print('reg [8388607:0] a;'); print('{a, a};')"
+
+# ============================================================
 # Summary
 # ============================================================
 echo

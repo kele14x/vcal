@@ -300,6 +300,12 @@ pub fn parse_input_with_depth(input: &str, max_depth: usize) -> Result<String, S
     }
     let mut statements =
         parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
+    // Parse-only is a permissive "did it parse?" probe — undeclared
+    // identifiers, unknown system calls, and out-of-range literal widths
+    // all pass through. Anything that would be a Semantic error in eval
+    // mode lives in the validator, not here; this entry point is purely
+    // syntactic. The lazy `Expr::Literal(LiteralSpec)` shape lets even
+    // `9999999999999'd1` produce a well-formed AST without allocating.
     for stmt in &mut statements {
         parser::truncate_stmt_for_display(stmt, max_depth);
     }
@@ -707,16 +713,18 @@ fn evaluate_reg_range(
     let msb = evaluate_range_endpoint(msb_expr, session, "msb")?;
     let lsb = evaluate_range_endpoint(lsb_expr, session, "lsb")?;
     let range = RegRange { msb, lsb };
-    let _ = range.width().map_err(|e| format!("Semantic error: {e}"))?;
+    let _ = range.width()?;
     Ok(range)
 }
 
 impl RegRange {
     fn width(&self) -> Result<usize, String> {
         let width = (&self.msb - &self.lsb).abs() + BigInt::from(1u8);
-        width
+        let width = width
             .to_usize()
-            .ok_or_else(|| "reg range width too large".to_string())
+            .ok_or_else(|| "Semantic error: reg range width too large".to_string())?;
+        value::ensure_bit_width(width, "reg").map_err(|e| format!("Semantic error: {e}"))?;
+        Ok(width)
     }
 }
 

@@ -98,6 +98,23 @@ pub enum LogicBit {
     Z,
 }
 
+// LogicBit is a `Copy` enum laid out as 1 byte per Verilog bit, so a
+// `Vec<LogicBit>` of width N costs N bytes. Without a cap, a tiny input
+// like `9999999999999'd1` asks for ~10 TB and the kernel hangs committing
+// pages. Cap at 16 Mbit (16 MB per vector) — comfortably above any
+// realistic calculator use, comfortably below "the box freezes".
+pub(crate) const MAX_BIT_WIDTH: usize = 1 << 24;
+
+pub(crate) fn ensure_bit_width(width: usize, kind: &str) -> Result<(), String> {
+    if width > MAX_BIT_WIDTH {
+        Err(format!(
+            "{kind} width {width} exceeds limit {MAX_BIT_WIDTH}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Base {
     Binary,
