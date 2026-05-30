@@ -743,12 +743,16 @@ pub(crate) fn evaluate_constant_expr(
 }
 
 // Self-determined integer evaluation that goes through the iterative
-// `annotate` + `evaluate_annotated` pipeline. Used by select-leaf
-// evaluators (bit-select index, indexed-base) where the legacy walker
-// would recurse on a deep chain inside `a[1+1+...+1]`. The index has
-// already been validated by `validate_select_kind_structure` so we skip
+// `annotate` + `evaluate_annotated` pipeline. Used wherever a leaf-side
+// helper would otherwise call the recursive `evaluate_expr_in_context`
+// on a user-supplied sub-expression: bit-select index, indexed-base,
+// part-select range halves, and the bigint-exponent walker's fallback
+// for non-arith / leaf-ish shapes. The enclosing expression has
+// already been validated (either by `validate_annotated` at the top of
+// `evaluate_expr`/`evaluate_assignment_rhs`, or by per-form structural
+// checks like `validate_select_kind_structure`), so we skip
 // `validate_annotated` here.
-fn evaluate_select_subexpr(expr: &Expr, session: &Session) -> Result<IntegerValue, String> {
+fn evaluate_subexpr_as_integer(expr: &Expr, session: &Session) -> Result<IntegerValue, String> {
     let annotated = annotate(expr, session)?;
     evaluate_annotated(&annotated, None, session)
 }
@@ -937,32 +941,6 @@ fn logical_value_of_real(value: f64) -> LogicBit {
         LogicBit::Zero
     } else {
         LogicBit::One
-    }
-}
-
-// Thin wrappers preserving the legacy `evaluate_expr_as_real` /
-// `logical_value_of_expr` signatures: previously these were the entry
-// points for the recursive real-eval driver; the iterative driver now
-// walks `&Annotated`, so we annotate at the boundary and dispatch to
-// the unified loop. These remain reachable only from the legacy
-// recursive walker (`evaluate_expr_in_context` and friends), which
-// itself is no longer reached from user input via the iterative path —
-// `visit_eval`'s Leaf arm only sees Literal / RealLiteral / Identifier /
-// Select / SystemTask, none of which dispatch to these helpers. Kept
-// alive so the legacy walker still compiles.
-fn evaluate_expr_as_real(expr: &Expr, session: &Session) -> Result<f64, String> {
-    let annotated = annotate(expr, session)?;
-    evaluate_annotated_as_real(&annotated, session)
-}
-
-fn logical_value_of_expr(expr: &Expr, session: &Session) -> Result<LogicBit, String> {
-    let annotated = annotate(expr, session)?;
-    if annotated.is_real() {
-        Ok(logical_value_of_real(evaluate_annotated_as_real(
-            &annotated, session,
-        )?))
-    } else {
-        Ok(logical_value(&evaluate_annotated(&annotated, None, session)?))
     }
 }
 
@@ -1855,7 +1833,18 @@ fn binary_op_name(op: BinaryOp) -> &'static str {
     }
 }
 
-fn evaluate_expr_in_context(
+// Leaf-shape integer evaluator. Reached only via `visit_eval`'s
+// `AnnotatedKind::Leaf` arm, which `annotate` emits for `Literal`,
+// `RealLiteral`, `SystemTask`, `Identifier`, and `Select` only. All
+// other Expr shapes go through dedicated `AnnotatedKind` arms in the
+// iterative CES driver, never through here — they can't appear as a
+// leaf in the annotated tree, and the bigint-exponent walker now
+// routes its sub-expressions through `evaluate_subexpr_as_integer`
+// (annotate + evaluate_annotated) rather than re-entering the legacy
+// per-shape helpers. Surface an `unreachable!` on anything else so a
+// future regression that wires a non-leaf shape into the Leaf path
+// fails loudly instead of silently re-introducing the recursive walker.
+fn evaluate_leaf_expr_in_context(
     expr: &Expr,
     context: Option<ExprMeta>,
     session: &Session,
@@ -1870,26 +1859,6 @@ fn evaluate_expr_in_context(
         // an error rather than silently fabricating an integer.
         Expr::RealLiteral(_) => {
             Err("real value cannot be used as an integer expression here".to_string())
-        }
-        Expr::Grouped(expr) => evaluate_expr_in_context(expr, context, session),
-        Expr::Unary { op, expr } => evaluate_unary_expr(*op, expr, context, session),
-        Expr::Binary { op, lhs, rhs } => evaluate_binary_expr(*op, lhs, rhs, context, session),
-        Expr::Conditional {
-            cond,
-            then_expr,
-            else_expr,
-        } => evaluate_conditional_expr(cond, then_expr, else_expr, context, session),
-        Expr::Concatenation { items } => evaluate_concatenation_expr(items, context, session),
-        Expr::Replication { count, items } => {
-            evaluate_replication_expr(count, items, context, session)
-        }
-        Expr::SignCast { signed, arg } => evaluate_sign_cast_expr(*signed, arg, context, session),
-        Expr::BaseCast { base, arg } => evaluate_base_cast_expr(*base, arg, context, session),
-        Expr::RealConversion { kind, arg } => {
-            evaluate_real_conversion_expr(*kind, arg, context, session)
-        }
-        Expr::MathFunction { kind, args } => {
-            evaluate_math_function_expr(*kind, args, context, session)
         }
         Expr::SystemTask { name } => Err(task_in_expression_error(name)),
         // LRM A.8.3: a primary identifier resolves to its declared reg's
@@ -1924,8 +1893,21 @@ fn evaluate_expr_in_context(
                 None => value,
             })
         }
+        Expr::Grouped(_)
+        | Expr::Unary { .. }
+        | Expr::Binary { .. }
+        | Expr::Conditional { .. }
+        | Expr::Concatenation { .. }
+        | Expr::Replication { .. }
+        | Expr::SignCast { .. }
+        | Expr::BaseCast { .. }
+        | Expr::RealConversion { .. }
+        | Expr::MathFunction { .. } => unreachable!(
+            "evaluate_leaf_expr_in_context only handles AnnotatedKind::Leaf shapes; \
+             {expr:?} should have its own AnnotatedKind arm in visit_eval"
+        ),
         Expr::Truncated => unreachable!(
-            "Expr::Truncated is a display-only sentinel; never reaches evaluate_expr_in_context"
+            "Expr::Truncated is a display-only sentinel; never reaches evaluate_leaf_expr_in_context"
         ),
     }
 }
@@ -2719,12 +2701,13 @@ fn visit_eval<'b, 'a: 'b>(
             }
         }
         // Leaves (Literal, Identifier, Select, SystemTask) are evaluated
-        // by the legacy walker. They have no children deeper than the
-        // select index/range, which the walker routes through the
-        // iterative `evaluate_select_subexpr`. RealLiteral can't reach
-        // here — it's real-typed and goes through `visit_real_eval`.
+        // by `evaluate_leaf_expr_in_context`. They have no children deeper
+        // than the select index/range, which the leaf evaluator routes
+        // through the iterative `evaluate_subexpr_as_integer`. RealLiteral
+        // can't reach here — it's real-typed and goes through
+        // `visit_real_eval`.
         AnnotatedKind::Leaf => {
-            vals.push(evaluate_expr_in_context(node.expr, ctx, session)?);
+            vals.push(evaluate_leaf_expr_in_context(node.expr, ctx, session)?);
         }
     }
     Ok(())
@@ -4182,444 +4165,6 @@ fn combine_binary_meta(op: BinaryOp, lhs_meta: ExprMeta, rhs_meta: ExprMeta) -> 
     }
 }
 
-fn evaluate_unary_expr(
-    op: UnaryOp,
-    expr: &Expr,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    // LRM Table 5-3: bitwise ~ and reductions are illegal on reals.
-    // LRM Table 5-2: !, unary +, and unary - are legal on reals; +/- are
-    // only reachable here when the *result* type is integer (an
-    // arithmetic +/- on a real operand has real result, handled by the
-    // real path), so a real operand to + or - here is a structural
-    // surprise and we reject it consistently with the operator-name
-    // diagnostic shape used elsewhere.
-    if expression_is_real(expr, session) {
-        match op {
-            UnaryOp::LogicalNot => {
-                let value = evaluate_expr_as_real(expr, session)?;
-                let bit = match logical_value_of_real(value) {
-                    LogicBit::One => LogicBit::Zero,
-                    LogicBit::Zero => LogicBit::One,
-                    LogicBit::X | LogicBit::Z => LogicBit::X,
-                };
-                return Ok(widen_relational_result(
-                    comparison_result_value(bit),
-                    context,
-                ));
-            }
-            UnaryOp::BitwiseNot
-            | UnaryOp::ReductionAnd
-            | UnaryOp::ReductionNand
-            | UnaryOp::ReductionOr
-            | UnaryOp::ReductionNor
-            | UnaryOp::ReductionXor
-            | UnaryOp::ReductionXnor => {
-                // Per LRM Table 5-3, the validator
-                // (`validate_expr_structure` Unary arm) rejects these
-                // operators on a real operand before evaluation runs.
-                unreachable!(
-                    "validator rejects real operand of {} before evaluation",
-                    unary_op_name(op)
-                );
-            }
-            UnaryOp::Plus | UnaryOp::Minus => {
-                unreachable!("unary +/- on real is handled by the real path")
-            }
-        }
-    }
-
-    if op == UnaryOp::LogicalNot {
-        // LRM 5.4: logical operands are self-determined — evaluate without
-        // pushing a context down, reduce to the operand's logical value, then
-        // apply the !-truth table from §5.1.9.
-        let operand = evaluate_expr_in_context(expr, None, session)?;
-        let bit = match logical_value(&operand) {
-            LogicBit::One => LogicBit::Zero,
-            LogicBit::Zero => LogicBit::One,
-            LogicBit::X | LogicBit::Z => LogicBit::X,
-        };
-        return Ok(widen_relational_result(
-            comparison_result_value(bit),
-            context,
-        ));
-    }
-
-    if is_reduction_op(op) {
-        // LRM 5.1.11: reduction operands are self-determined (LRM Table 5-22)
-        // and the result is always 1-bit unsigned. Same outer-context
-        // widening shape as `!`/`&&`/`||`/relational/equality.
-        let operand = evaluate_expr_in_context(expr, None, session)?;
-        let bit = reduce_bits(op, &operand.bits);
-        return Ok(widen_relational_result(
-            comparison_result_value(bit),
-            context,
-        ));
-    }
-
-    let meta = infer_expr_meta(expr, session)?;
-    // LRM 5.5.2: unary +/-/~ is context-determined — propagated size AND
-    // signedness must reach the inner primary. Falling back to the operand's
-    // own signedness here would sign-extend a signed leaf even when the
-    // surrounding comparison/arithmetic unified to unsigned, mis-encoding
-    // the value before negation.
-    let effective_meta = ExprMeta {
-        width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
-        signed: context.map_or(meta.signed, |ctx| ctx.signed),
-        base: meta.base,
-    };
-    let operand = evaluate_expr_in_context(expr, Some(effective_meta), session)?;
-
-    if op == UnaryOp::Plus {
-        return Ok(operand);
-    }
-
-    if op == UnaryOp::BitwiseNot {
-        // Per-bit flip: x and z both fold to x; no all-x short-circuit since
-        // bitwise ops mix known and unknown bits per position.
-        let bits: Vec<LogicBit> = operand.bits.iter().copied().map(bitwise_not_bit).collect();
-        return Ok(IntegerValue::computed(
-            effective_meta.width,
-            effective_meta.signed,
-            meta.base,
-            bits,
-        ));
-    }
-
-    if operand.has_unknown_bits() {
-        return Ok(IntegerValue::all_x(
-            effective_meta.width,
-            effective_meta.signed,
-            meta.base,
-        ));
-    }
-
-    // Only UnaryOp::Minus reaches here: Plus is returned above, LogicalNot,
-    // BitwiseNot, and the six reductions are all early-returned from their
-    // own paths.
-    debug_assert!(op == UnaryOp::Minus);
-    let result = -operand.as_bigint(effective_meta.signed);
-
-    Ok(IntegerValue::from_bigint(
-        result,
-        effective_meta.width,
-        effective_meta.signed,
-        meta.base,
-    ))
-}
-
-fn evaluate_binary_expr(
-    op: BinaryOp,
-    lhs: &Expr,
-    rhs: &Expr,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    // LRM Table 5-3: %, ===, !==, bitwise, and shift are all illegal on
-    // reals. Arithmetic with a real operand is real-typed and handled by
-    // the real path before reaching this evaluator. Relational, equality,
-    // and logical ops are 1-bit-integer-typed even with real operands, so
-    // they branch into a real-comparison path inside their helpers.
-    if expression_is_real(lhs, session) || expression_is_real(rhs, session) {
-        match op {
-            BinaryOp::Add
-            | BinaryOp::Subtract
-            | BinaryOp::Multiply
-            | BinaryOp::Divide
-            | BinaryOp::Power => {
-                unreachable!("real arithmetic should be handled by the real path")
-            }
-            BinaryOp::Modulus
-            | BinaryOp::CaseEqual
-            | BinaryOp::CaseNotEqual
-            | BinaryOp::BitwiseAnd
-            | BinaryOp::BitwiseOr
-            | BinaryOp::BitwiseXor
-            | BinaryOp::BitwiseXnor
-            | BinaryOp::LogicalShiftLeft
-            | BinaryOp::LogicalShiftRight
-            | BinaryOp::ArithmeticShiftLeft
-            | BinaryOp::ArithmeticShiftRight => {
-                // Per LRM Table 5-3, the validator
-                // (`validate_expr_structure` Binary arm) rejects these
-                // operators on a real operand before evaluation runs.
-                unreachable!(
-                    "validator rejects real operand of {} before evaluation",
-                    binary_op_name(op)
-                );
-            }
-            BinaryOp::LessThan
-            | BinaryOp::GreaterThan
-            | BinaryOp::LessThanOrEqual
-            | BinaryOp::GreaterThanOrEqual => {
-                return evaluate_real_relational_expr(op, lhs, rhs, context, session);
-            }
-            BinaryOp::Equal | BinaryOp::NotEqual => {
-                return evaluate_real_equality_expr(op, lhs, rhs, context, session);
-            }
-            BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
-                return evaluate_real_logical_expr(op, lhs, rhs, context, session);
-            }
-        }
-    }
-
-    let lhs_meta = infer_expr_meta(lhs, session)?;
-    let rhs_meta = infer_expr_meta(rhs, session)?;
-
-    if matches!(
-        op,
-        BinaryOp::LessThan
-            | BinaryOp::GreaterThan
-            | BinaryOp::LessThanOrEqual
-            | BinaryOp::GreaterThanOrEqual
-    ) {
-        return evaluate_relational_expr(op, lhs, rhs, lhs_meta, rhs_meta, context, session);
-    }
-
-    if matches!(
-        op,
-        BinaryOp::Equal | BinaryOp::NotEqual | BinaryOp::CaseEqual | BinaryOp::CaseNotEqual
-    ) {
-        return evaluate_equality_expr(op, lhs, rhs, lhs_meta, rhs_meta, context, session);
-    }
-
-    if matches!(op, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
-        return evaluate_logical_expr(op, lhs, rhs, context, session);
-    }
-
-    if matches!(
-        op,
-        BinaryOp::LogicalShiftLeft
-            | BinaryOp::LogicalShiftRight
-            | BinaryOp::ArithmeticShiftLeft
-            | BinaryOp::ArithmeticShiftRight
-    ) {
-        return evaluate_shift_expr(op, lhs, rhs, lhs_meta, context, session);
-    }
-
-    let meta = combine_binary_meta(op, lhs_meta, rhs_meta);
-    let effective_meta = ExprMeta {
-        width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
-        signed: meta.signed,
-        base: meta.base,
-    };
-
-    match op {
-        BinaryOp::Add
-        | BinaryOp::Subtract
-        | BinaryOp::Multiply
-        | BinaryOp::Divide
-        | BinaryOp::Modulus => {
-            let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta), session)?;
-            let rhs_value = evaluate_expr_in_context(rhs, Some(effective_meta), session)?;
-
-            if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
-                return Ok(IntegerValue::all_x(
-                    effective_meta.width,
-                    meta.signed,
-                    meta.base,
-                ));
-            }
-
-            let lhs_int = lhs_value.as_bigint(meta.signed);
-            let rhs_int = rhs_value.as_bigint(meta.signed);
-            let result = match op {
-                BinaryOp::Add => lhs_int + rhs_int,
-                BinaryOp::Subtract => lhs_int - rhs_int,
-                BinaryOp::Multiply => lhs_int * rhs_int,
-                BinaryOp::Divide => {
-                    if rhs_int.is_zero() {
-                        return Ok(IntegerValue::all_x(
-                            effective_meta.width,
-                            meta.signed,
-                            meta.base,
-                        ));
-                    }
-                    lhs_int / rhs_int
-                }
-                BinaryOp::Modulus => {
-                    if rhs_int.is_zero() {
-                        return Ok(IntegerValue::all_x(
-                            effective_meta.width,
-                            meta.signed,
-                            meta.base,
-                        ));
-                    }
-                    lhs_int % rhs_int
-                }
-                _ => unreachable!("handled by outer match"),
-            };
-
-            Ok(IntegerValue::from_bigint(
-                result,
-                effective_meta.width,
-                meta.signed,
-                meta.base,
-            ))
-        }
-        BinaryOp::Power => {
-            let lhs_context = ExprMeta {
-                width: effective_meta.width,
-                signed: lhs_meta.signed,
-                base: lhs_meta.base,
-            };
-            let lhs_value = evaluate_expr_in_context(lhs, Some(lhs_context), session)?;
-            let rhs_value = evaluate_expr_in_context(rhs, Some(rhs_meta), session)?;
-
-            if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
-                return Ok(IntegerValue::all_x(
-                    effective_meta.width,
-                    lhs_meta.signed,
-                    lhs_meta.base,
-                ));
-            }
-
-            let base_value = lhs_value.as_bigint(lhs_meta.signed);
-            let exponent_value = evaluate_expr_as_math_bigint(rhs, session)?;
-            let result = match evaluate_power(base_value, exponent_value) {
-                Ok(result) => result,
-                Err(_) => {
-                    return Ok(IntegerValue::all_x(
-                        effective_meta.width,
-                        lhs_meta.signed,
-                        lhs_meta.base,
-                    ));
-                }
-            };
-
-            Ok(IntegerValue::from_bigint(
-                result,
-                effective_meta.width,
-                lhs_meta.signed,
-                lhs_meta.base,
-            ))
-        }
-        BinaryOp::BitwiseAnd | BinaryOp::BitwiseOr | BinaryOp::BitwiseXor | BinaryOp::BitwiseXnor => {
-            // Both operands inherit the unified width/sign context, so each
-            // side's leaf primary extends consistently before we zip bits.
-            let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta), session)?;
-            let rhs_value = evaluate_expr_in_context(rhs, Some(effective_meta), session)?;
-
-            let combine = match op {
-                BinaryOp::BitwiseAnd => bitwise_and_bits,
-                BinaryOp::BitwiseOr => bitwise_or_bits,
-                BinaryOp::BitwiseXor => bitwise_xor_bits,
-                BinaryOp::BitwiseXnor => bitwise_xnor_bits,
-                _ => unreachable!("guarded by outer match"),
-            };
-
-            let bits: Vec<LogicBit> = lhs_value
-                .bits
-                .iter()
-                .zip(rhs_value.bits.iter())
-                .map(|(l, r)| combine(*l, *r))
-                .collect();
-
-            Ok(IntegerValue::computed(
-                effective_meta.width,
-                meta.signed,
-                meta.base,
-                bits,
-            ))
-        }
-        BinaryOp::LessThan
-        | BinaryOp::GreaterThan
-        | BinaryOp::LessThanOrEqual
-        | BinaryOp::GreaterThanOrEqual => {
-            unreachable!("relational ops dispatched to evaluate_relational_expr")
-        }
-        BinaryOp::Equal | BinaryOp::NotEqual | BinaryOp::CaseEqual | BinaryOp::CaseNotEqual => {
-            unreachable!("equality ops dispatched to evaluate_equality_expr")
-        }
-        BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
-            unreachable!("logical ops dispatched to evaluate_logical_expr")
-        }
-        BinaryOp::LogicalShiftLeft
-        | BinaryOp::LogicalShiftRight
-        | BinaryOp::ArithmeticShiftLeft
-        | BinaryOp::ArithmeticShiftRight => {
-            unreachable!("shift ops dispatched to evaluate_shift_expr")
-        }
-    }
-}
-
-// LRM 5.1.12: the LHS is context-determined like arithmetic — its width
-// widens to max(L(lhs), L(context)) and the propagated signedness drives
-// extension at its leaf primary. The RHS is self-determined (LRM Table 5-22)
-// and "always treated as an unsigned number ... has no effect on the
-// signedness of the result", so we pass it `None` for the context and read
-// its bits as unsigned regardless of the operand's declared signedness.
-//
-// `>>>` (arithmetic right shift) fills vacated MSB positions with the LHS
-// sign bit only when the propagated context is signed. Under an unsigned
-// outer context the same operator zero-fills. The other three shift forms
-// always zero-fill.
-fn evaluate_shift_expr(
-    op: BinaryOp,
-    lhs: &Expr,
-    rhs: &Expr,
-    lhs_meta: ExprMeta,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let effective_meta = ExprMeta {
-        width: context.map_or(lhs_meta.width, |ctx| usize::max(ctx.width, lhs_meta.width)),
-        signed: context.map_or(lhs_meta.signed, |ctx| ctx.signed),
-        base: lhs_meta.base,
-    };
-
-    let lhs_value = evaluate_expr_in_context(lhs, Some(effective_meta), session)?;
-    // RHS is self-determined: do NOT push effective_meta; let it evaluate at
-    // its own width, then reinterpret its bits as unsigned for the count.
-    let rhs_value = evaluate_expr_in_context(rhs, None, session)?;
-
-    if rhs_value.has_unknown_bits() {
-        return Ok(IntegerValue::all_x(
-            effective_meta.width,
-            effective_meta.signed,
-            lhs_meta.base,
-        ));
-    }
-
-    let shift_count = bits_to_biguint(&rhs_value.bits);
-    // BigUint shift counts can dwarf usize; clamp to the result width since
-    // any larger count produces the same all-fill output.
-    let max_shift = BigUint::from(effective_meta.width);
-    let clamped_shift = if shift_count >= max_shift {
-        effective_meta.width
-    } else {
-        shift_count
-            .to_usize()
-            .expect("shift count smaller than width fits in usize")
-    };
-
-    let result_bits = match op {
-        BinaryOp::LogicalShiftLeft | BinaryOp::ArithmeticShiftLeft => {
-            shift_bits_left(&lhs_value.bits, clamped_shift)
-        }
-        BinaryOp::LogicalShiftRight => {
-            shift_bits_right(&lhs_value.bits, clamped_shift, LogicBit::Zero)
-        }
-        BinaryOp::ArithmeticShiftRight => {
-            let fill = if effective_meta.signed {
-                lhs_value.bits.last().copied().unwrap_or(LogicBit::Zero)
-            } else {
-                LogicBit::Zero
-            };
-            shift_bits_right(&lhs_value.bits, clamped_shift, fill)
-        }
-        _ => unreachable!("evaluate_shift_expr called with non-shift op"),
-    };
-
-    Ok(IntegerValue::computed(
-        effective_meta.width,
-        effective_meta.signed,
-        lhs_meta.base,
-        result_bits,
-    ))
-}
-
 fn shift_bits_left(bits: &[LogicBit], shift: usize) -> Vec<LogicBit> {
     let width = bits.len();
     (0..width)
@@ -4643,37 +4188,6 @@ fn shift_bits_right(bits: &[LogicBit], shift: usize, fill: LogicBit) -> Vec<Logi
         .collect()
 }
 
-// LRM 5.5.2: relational/equality operands form a shared context — size =
-// max(L(i), L(j)), signed iff both signed. The propagated type drives extension
-// at the leaf primary (sign-extend only when propagated type is signed), so the
-// unified `comparison_signed` is what each operand sees.
-fn unify_comparison_operands(
-    lhs: &Expr,
-    rhs: &Expr,
-    lhs_meta: ExprMeta,
-    rhs_meta: ExprMeta,
-    session: &Session,
-) -> Result<(IntegerValue, IntegerValue, bool), String> {
-    let operand_width = usize::max(lhs_meta.width, rhs_meta.width);
-    let comparison_signed = lhs_meta.signed && rhs_meta.signed;
-
-    let lhs_context = ExprMeta {
-        width: operand_width,
-        signed: comparison_signed,
-        base: lhs_meta.base,
-    };
-    let rhs_context = ExprMeta {
-        width: operand_width,
-        signed: comparison_signed,
-        base: rhs_meta.base,
-    };
-
-    let lhs_value = evaluate_expr_in_context(lhs, Some(lhs_context), session)?;
-    let rhs_value = evaluate_expr_in_context(rhs, Some(rhs_context), session)?;
-
-    Ok((lhs_value, rhs_value, comparison_signed))
-}
-
 fn comparison_result_value(bit: LogicBit) -> IntegerValue {
     IntegerValue::computed(1, false, Base::Binary, vec![bit])
 }
@@ -4690,274 +4204,6 @@ fn logical_value(value: &IntegerValue) -> LogicBit {
     } else {
         LogicBit::X
     }
-}
-
-fn evaluate_logical_expr(
-    op: BinaryOp,
-    lhs: &Expr,
-    rhs: &Expr,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    // LRM 5.4: each operand is self-determined, so we evaluate them in
-    // isolation rather than unifying widths the way relational/equality do.
-    let lhs_logical = logical_value(&evaluate_expr_in_context(lhs, None, session)?);
-    let rhs_logical = logical_value(&evaluate_expr_in_context(rhs, None, session)?);
-
-    // LRM 5.1.9 Table 5-7: a definite false defeats x in &&, a definite true
-    // defeats x in ||.
-    let bit = match op {
-        BinaryOp::LogicalAnd => match (lhs_logical, rhs_logical) {
-            (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
-            (LogicBit::One, LogicBit::One) => LogicBit::One,
-            _ => LogicBit::X,
-        },
-        BinaryOp::LogicalOr => match (lhs_logical, rhs_logical) {
-            (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
-            (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
-            _ => LogicBit::X,
-        },
-        _ => unreachable!("non-logical op in evaluate_logical_expr"),
-    };
-
-    Ok(widen_relational_result(comparison_result_value(bit), context))
-}
-
-// LRM §5.1.7: with at least one real operand, relational comparison runs
-// in real space — the integer side is converted via §3.5.3 conversion
-// rules (handled by `integer_value_to_f64`). NaN comparisons follow IEEE
-// 754: every ordered comparison is false, so e.g. `NaN < x` is `1'b0`.
-fn evaluate_real_relational_expr(
-    op: BinaryOp,
-    lhs: &Expr,
-    rhs: &Expr,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let lhs_val = evaluate_expr_as_real(lhs, session)?;
-    let rhs_val = evaluate_expr_as_real(rhs, session)?;
-    let result = match op {
-        BinaryOp::LessThan => lhs_val < rhs_val,
-        BinaryOp::GreaterThan => lhs_val > rhs_val,
-        BinaryOp::LessThanOrEqual => lhs_val <= rhs_val,
-        BinaryOp::GreaterThanOrEqual => lhs_val >= rhs_val,
-        _ => unreachable!("non-relational op in evaluate_real_relational_expr"),
-    };
-    let bit = if result { LogicBit::One } else { LogicBit::Zero };
-    Ok(widen_relational_result(comparison_result_value(bit), context))
-}
-
-// `==` and `!=` on reals follow f64 equality: both NaN-tainted ops are
-// false for `==` and true for `!=` (IEEE 754 unordered semantics). LRM
-// Table 5-3 forbids `===`/`!==` on reals — those are rejected upstream
-// in evaluate_binary_expr.
-fn evaluate_real_equality_expr(
-    op: BinaryOp,
-    lhs: &Expr,
-    rhs: &Expr,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let lhs_val = evaluate_expr_as_real(lhs, session)?;
-    let rhs_val = evaluate_expr_as_real(rhs, session)?;
-    let result = match op {
-        BinaryOp::Equal => lhs_val == rhs_val,
-        BinaryOp::NotEqual => lhs_val != rhs_val,
-        _ => unreachable!("non-equality op in evaluate_real_equality_expr"),
-    };
-    let bit = if result { LogicBit::One } else { LogicBit::Zero };
-    Ok(widen_relational_result(comparison_result_value(bit), context))
-}
-
-// `&&` and `||` on reals follow the §5.1.9 truth table after each
-// operand reduces to a 1-bit logical value via `logical_value_of_expr`.
-// NaN reduces to x, so NaN || 1 is 1, NaN && 0 is 0, mirroring how the
-// integer path treats unknown bits.
-fn evaluate_real_logical_expr(
-    op: BinaryOp,
-    lhs: &Expr,
-    rhs: &Expr,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let lhs_logical = logical_value_of_expr(lhs, session)?;
-    let rhs_logical = logical_value_of_expr(rhs, session)?;
-    let bit = match op {
-        BinaryOp::LogicalAnd => match (lhs_logical, rhs_logical) {
-            (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
-            (LogicBit::One, LogicBit::One) => LogicBit::One,
-            _ => LogicBit::X,
-        },
-        BinaryOp::LogicalOr => match (lhs_logical, rhs_logical) {
-            (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
-            (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
-            _ => LogicBit::X,
-        },
-        _ => unreachable!("non-logical op in evaluate_real_logical_expr"),
-    };
-    Ok(widen_relational_result(comparison_result_value(bit), context))
-}
-
-fn evaluate_relational_expr(
-    op: BinaryOp,
-    lhs: &Expr,
-    rhs: &Expr,
-    lhs_meta: ExprMeta,
-    rhs_meta: ExprMeta,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let (lhs_value, rhs_value, comparison_signed) =
-        unify_comparison_operands(lhs, rhs, lhs_meta, rhs_meta, session)?;
-
-    if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
-        return Ok(widen_relational_result(
-            IntegerValue::all_x(1, false, Base::Binary),
-            context,
-        ));
-    }
-
-    let lhs_int = lhs_value.as_bigint(comparison_signed);
-    let rhs_int = rhs_value.as_bigint(comparison_signed);
-
-    let comparison_result = match op {
-        BinaryOp::LessThan => lhs_int < rhs_int,
-        BinaryOp::GreaterThan => lhs_int > rhs_int,
-        BinaryOp::LessThanOrEqual => lhs_int <= rhs_int,
-        BinaryOp::GreaterThanOrEqual => lhs_int >= rhs_int,
-        _ => unreachable!("non-relational op in evaluate_relational_expr"),
-    };
-
-    let bit = if comparison_result {
-        LogicBit::One
-    } else {
-        LogicBit::Zero
-    };
-    Ok(widen_relational_result(comparison_result_value(bit), context))
-}
-
-fn evaluate_equality_expr(
-    op: BinaryOp,
-    lhs: &Expr,
-    rhs: &Expr,
-    lhs_meta: ExprMeta,
-    rhs_meta: ExprMeta,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    // Bit-level comparison; the unified signedness only matters for operand
-    // extension (already done inside `unify_comparison_operands`), not for the
-    // comparison itself.
-    let (lhs_value, rhs_value, _comparison_signed) =
-        unify_comparison_operands(lhs, rhs, lhs_meta, rhs_meta, session)?;
-
-    let bit = match op {
-        // LRM 5.1.8: ==/!= are 1-bit x only when the relation is *ambiguous*.
-        // A single definite bit mismatch (0 vs 1) makes the operands unequal
-        // regardless of any x/z elsewhere; only when no bit definitively
-        // mismatches AND at least one bit involves x or z is the result x.
-        BinaryOp::Equal | BinaryOp::NotEqual => {
-            let mut definite_mismatch = false;
-            let mut has_unknown = false;
-            for (lb, rb) in lhs_value.bits.iter().zip(rhs_value.bits.iter()) {
-                match (lb, rb) {
-                    (LogicBit::Zero, LogicBit::One) | (LogicBit::One, LogicBit::Zero) => {
-                        definite_mismatch = true;
-                    }
-                    (LogicBit::X | LogicBit::Z, _) | (_, LogicBit::X | LogicBit::Z) => {
-                        has_unknown = true;
-                    }
-                    _ => {}
-                }
-            }
-            if !definite_mismatch && has_unknown {
-                return Ok(widen_relational_result(
-                    IntegerValue::all_x(1, false, Base::Binary),
-                    context,
-                ));
-            }
-            let equal = !definite_mismatch;
-            let result = if matches!(op, BinaryOp::Equal) {
-                equal
-            } else {
-                !equal
-            };
-            if result { LogicBit::One } else { LogicBit::Zero }
-        }
-        // LRM 5.1.8: ===/!== compare bit-for-bit including x and z; the result
-        // is always a known 0 or 1, never x. Operands are already the same
-        // length after unification.
-        BinaryOp::CaseEqual | BinaryOp::CaseNotEqual => {
-            let equal = lhs_value.bits == rhs_value.bits;
-            let result = if matches!(op, BinaryOp::CaseEqual) {
-                equal
-            } else {
-                !equal
-            };
-            if result { LogicBit::One } else { LogicBit::Zero }
-        }
-        _ => unreachable!("non-equality op in evaluate_equality_expr"),
-    };
-
-    Ok(widen_relational_result(comparison_result_value(bit), context))
-}
-
-// LRM 5.1.13: cond is self-determined and reduced to a 1-bit logical the
-// way `&&`/`||`/`!` reduce their operands. then/else are context-determined
-// and unify width/sign with each other AND with the propagated outer
-// context. As with the shift path, signedness must consult the propagated
-// context — if the surrounding expression is unsigned (§5.5.1), the leaf
-// primaries of then/else must zero-fill rather than sign-fill.
-//
-// When cond is x or z, evaluate both branches and merge per bit: agreeing
-// bits stay, disagreeing bits become x. This preserves x/z agreement
-// (e.g. x ∩ x → x) and reduces any disagreement (including 0 vs x) to x.
-fn evaluate_conditional_expr(
-    cond: &Expr,
-    then_expr: &Expr,
-    else_expr: &Expr,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    if expression_is_real(then_expr, session) || expression_is_real(else_expr, session) {
-        unreachable!("real-typed conditional should be handled by the real path")
-    }
-    let then_meta = infer_expr_meta(then_expr, session)?;
-    let else_meta = infer_expr_meta(else_expr, session)?;
-    let meta = ExprMeta {
-        width: usize::max(then_meta.width, else_meta.width),
-        signed: then_meta.signed && else_meta.signed,
-        base: then_meta.base,
-    };
-    let effective_meta = ExprMeta {
-        width: context.map_or(meta.width, |ctx| usize::max(ctx.width, meta.width)),
-        signed: context.map_or(meta.signed, |ctx| ctx.signed),
-        base: meta.base,
-    };
-
-    let cond_logical = logical_value_of_expr(cond, session)?;
-
-    let bits = match cond_logical {
-        LogicBit::One => evaluate_expr_in_context(then_expr, Some(effective_meta), session)?.bits,
-        LogicBit::Zero => evaluate_expr_in_context(else_expr, Some(effective_meta), session)?.bits,
-        LogicBit::X | LogicBit::Z => {
-            let then_value = evaluate_expr_in_context(then_expr, Some(effective_meta), session)?;
-            let else_value = evaluate_expr_in_context(else_expr, Some(effective_meta), session)?;
-            then_value
-                .bits
-                .iter()
-                .zip(else_value.bits.iter())
-                .map(|(t, e)| if t == e { *t } else { LogicBit::X })
-                .collect()
-        }
-    };
-
-    Ok(IntegerValue::computed(
-        effective_meta.width,
-        effective_meta.signed,
-        meta.base,
-        bits,
-    ))
 }
 
 // LRM 5.1.14: every concatenation operand "shall be sized" — an operand
@@ -5069,7 +4315,9 @@ fn evaluate_replication_count_allow_zero(
     count_expr: &Expr,
     session: &Session,
 ) -> Result<usize, String> {
-    let value = evaluate_expr_in_context(count_expr, None, session)?;
+    // Route through the iterative annotated driver so a deep
+    // `{(1+1+...+1){...}}` count chain stays off the C stack.
+    let value = evaluate_subexpr_as_integer(count_expr, session)?;
     if value.has_unknown_bits() {
         return Err("replication count contains unknown bits".to_string());
     }
@@ -5103,47 +4351,6 @@ fn unwrap_grouped(expr: &Expr) -> &Expr {
         cur = inner;
     }
     cur
-}
-
-// LRM 5.1.14: each operand is self-determined (no context propagated down)
-// and must have a definite width — bare unsized literals (and any expression
-// whose width derives from one) are rejected. Bits are joined MSB-first: the
-// leftmost item ends up in the high bits of the result. Result is always
-// unsigned; outer context can only widen the joined value (zero-extending),
-// never reach into the operands.
-fn evaluate_concatenation_expr(
-    items: &[Expr],
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    // LRM Table 5-3 rejection of real items is handled by `semantic_check`
-    // before evaluation begins.
-    let bits = collect_concatenation_bits(items, session)?;
-    let leftmost_base = infer_expr_meta(&items[0], session)?.base;
-    let natural_width = bits.len();
-    let result = IntegerValue::computed(natural_width, false, leftmost_base, bits);
-    Ok(extend_to_outer_context(result, context))
-}
-
-fn evaluate_replication_expr(
-    count_expr: &Expr,
-    items: &[Expr],
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    // Real-count and real-item rejection is handled by `semantic_check`
-    // before evaluation begins.
-    let count = evaluate_replication_count(count_expr, session)?;
-    let inner_bits = collect_concatenation_bits(items, session)?;
-    let leftmost_base = infer_expr_meta(&items[0], session)?.base;
-
-    let mut bits = Vec::with_capacity(inner_bits.len().saturating_mul(count));
-    for _ in 0..count {
-        bits.extend(inner_bits.iter().copied());
-    }
-    let natural_width = bits.len();
-    let result = IntegerValue::computed(natural_width, false, leftmost_base, bits);
-    Ok(extend_to_outer_context(result, context))
 }
 
 // Joins the bit patterns of every item in a concatenation list (used both
@@ -5197,7 +4404,10 @@ fn evaluate_concatenation_item_bits(
         }
         return Ok(bits);
     }
-    let value = evaluate_expr_in_context(item, None, session)?;
+    // Route through the iterative annotated driver so a deep concat
+    // item (e.g. `{1+1+...+1}` in a validator pre-collect) stays off
+    // the C stack.
+    let value = evaluate_subexpr_as_integer(item, session)?;
     Ok(value.bits)
 }
 
@@ -5224,73 +4434,6 @@ fn extend_cast_to_outer_context(value: IntegerValue, context: Option<ExprMeta>) 
     }
 }
 
-// LRM 5.5: `$signed(e)` / `$unsigned(e)` evaluates `e` as a self-determined
-// expression and returns a value with the same size and bit pattern but with
-// the type set by the cast. The cast's type only feeds back into LRM 5.5.1's
-// "all operands signed?" check (which determines the propagated type of the
-// surrounding expression); extension at the cast leaf still follows the
-// propagated context per §5.5.2 ("each operand shall be sign-/zero-extended"
-// based on the propagated type), not the cast's own signedness. So
-// `$signed(4'b1111) + 8'b0` zero-extends the cast result (unsigned propagated
-// type) rather than sign-extending it.
-fn evaluate_sign_cast_expr(
-    signed: bool,
-    arg: &Expr,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    // $signed/$unsigned are integer-only — applying them to a real value
-    // has no meaning under §5.5 (signedness is a property of the integer
-    // value set, not the floating-point one). The validator
-    // (`validate_expr_structure` SignCast arm) rejects a real arg before
-    // evaluation, so a real arg cannot reach here.
-    if expression_is_real(arg, session) {
-        unreachable!(
-            "validator rejects real {} arg before evaluation",
-            if signed { "$signed" } else { "$unsigned" }
-        );
-    }
-    let arg_value = evaluate_expr_in_context(arg, None, session)?;
-    let cast_value = IntegerValue::computed(
-        arg_value.width,
-        signed,
-        arg_value.base,
-        arg_value.bits,
-    );
-    Ok(extend_cast_to_outer_context(cast_value, context))
-}
-
-// vcal-specific display-base cast (`$bin` / `$oct` / `$dec` / `$hex`).
-// Mirrors `evaluate_sign_cast_expr`: argument is evaluated self-determined,
-// width/signedness/bits pass through unchanged, only the `Base` field is
-// overridden. Outer-context width still flows back through the cast result
-// per §5.5.2 via `extend_cast_to_outer_context` — the same shape the sign
-// casts use, so chained casts and arithmetic on the cast result behave
-// consistently. Real arguments are rejected (a real has no display base).
-fn evaluate_base_cast_expr(
-    base: Base,
-    arg: &Expr,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    // The validator (`validate_expr_structure` BaseCast arm) rejects a
-    // real arg before evaluation, so a real arg cannot reach here.
-    if expression_is_real(arg, session) {
-        unreachable!(
-            "validator rejects real {} arg before evaluation",
-            base_cast_name(base)
-        );
-    }
-    let arg_value = evaluate_expr_in_context(arg, None, session)?;
-    let cast_value = IntegerValue::computed(
-        arg_value.width,
-        arg_value.signed,
-        base,
-        arg_value.bits,
-    );
-    Ok(extend_cast_to_outer_context(cast_value, context))
-}
-
 fn base_cast_name(base: Base) -> &'static str {
     match base {
         Base::Binary => "$bin",
@@ -5298,44 +4441,6 @@ fn base_cast_name(base: Base) -> &'static str {
         Base::Decimal => "$dec",
         Base::Hex => "$hex",
     }
-}
-
-// LRM 17.8: dispatch the integer-result real conversions ($rtoi and
-// $realtobits). The real-result variants ($itor, $bitstoreal) are handled
-// by `evaluate_expr_as_real`. Outer-context widening mirrors $signed /
-// $unsigned: the cast's natural width drives the result, but a wider
-// propagated context extends per its own signedness (§5.5.2).
-fn evaluate_real_conversion_expr(
-    kind: RealConversionKind,
-    arg: &Expr,
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let result = match kind {
-        RealConversionKind::RealToInteger => {
-            // LRM 17.8: "$rtoi converts real values to integers by
-            // truncating the real value." Argument is real (or auto-promotes
-            // from integer per §3.5.3). NaN / ±∞ have no integer image, so
-            // we return 32 bits of x to surface "no defined integer";
-            // out-of-range finite values wrap mod 2^32, consistent with the
-            // rest of the integer pipeline's overflow handling.
-            let real_val = evaluate_expr_as_real(arg, session)?;
-            real_to_integer_value(real_val)
-        }
-        RealConversionKind::RealToBits => {
-            // LRM 17.8: bitcast a real to its 64-bit IEEE 754
-            // representation. Display the result in hex since the value is a
-            // bit pattern, not a magnitude.
-            let real_val = evaluate_expr_as_real(arg, session)?;
-            let bits = real_val.to_bits();
-            IntegerValue::from_bigint(BigInt::from(bits), 64, false, Base::Hex)
-        }
-        RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => {
-            unreachable!("real-result conversions handled by evaluate_expr_as_real")
-        }
-    };
-
-    Ok(extend_cast_to_outer_context(result, context))
 }
 
 fn real_to_integer_value(value: f64) -> IntegerValue {
@@ -5346,47 +4451,6 @@ fn real_to_integer_value(value: f64) -> IntegerValue {
     let bigint = BigInt::from_f64(truncated)
         .expect("finite f64 truncates to a representable BigInt");
     IntegerValue::from_bigint(bigint, 32, true, Base::Decimal)
-}
-
-// LRM 17.11: dispatch the integer-result math functions. Today only
-// $clog2 lands here; real-result kinds are handled by
-// `evaluate_expr_as_real`. Outer-context widening mirrors
-// `evaluate_real_conversion_expr` for $rtoi / $realtobits.
-fn evaluate_math_function_expr(
-    kind: MathFunctionKind,
-    args: &[Expr],
-    context: Option<ExprMeta>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let result = match kind {
-        MathFunctionKind::Clog2 => evaluate_clog2(&args[0], session)?,
-        _ => unreachable!("real-result math functions handled by evaluate_expr_as_real"),
-    };
-
-    Ok(extend_cast_to_outer_context(result, context))
-}
-
-// LRM 17.11.1: $clog2 returns the ceiling of log base 2 of the unsigned
-// argument; $clog2(0) is defined to be 0. The argument is integer or
-// vector — real arguments are rejected by the validator
-// (`validate_expr_structure` MathFunction arm).
-//
-// Bits with x/z anywhere collapse the result to 32'sdx. The LRM is silent
-// on x/z in $clog2; vcal surfaces "no defined image" rather than silently
-// mapping x/z → 0, matching the $rtoi NaN/±∞ rule. The width used for the
-// unsigned interpretation is the operand's natural width, so
-// $clog2(64'hFFFF…F) is 64.
-fn evaluate_clog2(arg: &Expr, session: &Session) -> Result<IntegerValue, String> {
-    if expression_is_real(arg, session) {
-        unreachable!("validator rejects real $clog2 arg before evaluation");
-    }
-
-    let value = evaluate_expr_in_context(arg, None, session)?;
-    if value.has_unknown_bits() {
-        return Ok(IntegerValue::all_x(32, true, Base::Decimal));
-    }
-    let unsigned = bits_to_biguint(&value.bits);
-    Ok(clog2_result_value(unsigned))
 }
 
 fn clog2_result_value(value: BigUint) -> IntegerValue {
@@ -5439,13 +4503,17 @@ fn widen_relational_result(result: IntegerValue, context: Option<ExprMeta>) -> I
 // we have no way to represent unknown bits, so any unknown surfaces a
 // clean "expression contains unknown bits" error.
 // Iterative bigint evaluator. CES driver with `Vec<BigInt>` value stack,
-// mirroring `evaluate_expr_as_real`'s shape. The recursive arms (Grouped,
+// mirroring `evaluate_annotated_as_real`'s shape. Recursive arms (Grouped,
 // Unary +/-, Binary arith) become Combine variants; non-arith / non-recursive
-// shapes fall back to the now-iterative `evaluate_expr_in_context` and the
-// width-collapse helper `value_to_math_bigint`.
+// shapes route through `evaluate_subexpr_as_integer` (annotate +
+// `evaluate_annotated`) and collapse the resulting `IntegerValue` to a
+// BigInt via `value_to_math_bigint`.
 //
 // Used by integer Power exponents (LRM 5.1.6 / Table 5-3) — the exponent
-// must keep arbitrary precision. Now safe under deep `2 ** (1+1+...+1)`.
+// must keep arbitrary precision. Safe under deep `2 ** (...)` for any
+// shape the parser accepts (arith chain, relational chain, conditional
+// chain, concat, etc.) because every nested integer subtree is dispatched
+// onto the heap-allocated work stack of the iterative driver.
 enum BigintEvalTask<'a> {
     Visit(&'a Expr),
     Combine(BigintCombiner),
@@ -5510,8 +4578,8 @@ fn visit_bigint_eval<'a>(
                 work.push(BigintEvalTask::Visit(operand));
             }
             // Other unary ops have width-dependent results that can't be
-            // reconstructed in bigint alone — route them through the
-            // materialised integer pipeline and collapse the value.
+            // reconstructed in bigint alone — route the operand through
+            // the iterative integer pipeline and collapse the result.
             UnaryOp::LogicalNot
             | UnaryOp::BitwiseNot
             | UnaryOp::ReductionAnd
@@ -5520,8 +4588,8 @@ fn visit_bigint_eval<'a>(
             | UnaryOp::ReductionNor
             | UnaryOp::ReductionXor
             | UnaryOp::ReductionXnor => {
-                vals.push(value_to_math_bigint(evaluate_unary_expr(
-                    *op, operand, None, session,
+                vals.push(value_to_math_bigint(evaluate_subexpr_as_integer(
+                    expr, session,
                 )?)?);
             }
         },
@@ -5541,19 +4609,20 @@ fn visit_bigint_eval<'a>(
             } else {
                 // Non-arithmetic binary ops (relational/equality/logical/
                 // bitwise/shift) have width- or 1-bit-unsigned-by-
-                // construction results — route through the integer
-                // pipeline so the materialised value carries the correct
-                // shape, then collapse to bigint.
-                vals.push(value_to_math_bigint(evaluate_binary_expr(
-                    *op, lhs, rhs, None, session,
+                // construction results — route the whole binary through
+                // the iterative integer pipeline so a deep operand chain
+                // stays off the C stack, then collapse to bigint.
+                vals.push(value_to_math_bigint(evaluate_subexpr_as_integer(
+                    expr, session,
                 )?)?);
             }
         }
         // Conditional, concatenation/replication, sign casts, real
-        // conversions, and math functions: the recursive walker delegated
-        // these to the integer pipeline + bigint collapse. The integer
-        // pipeline is iterative now (P3), so a deep child here stays on
-        // the iterative path.
+        // conversions, and math functions: route the whole subtree
+        // through the iterative integer pipeline (`evaluate_subexpr_as_integer`
+        // = annotate + evaluate_annotated), then collapse to bigint.
+        // Using the legacy `evaluate_expr_in_context` here would re-enter
+        // the recursive walker and overflow on a deep child.
         Expr::Conditional { .. }
         | Expr::Concatenation { .. }
         | Expr::Replication { .. }
@@ -5563,8 +4632,8 @@ fn visit_bigint_eval<'a>(
         | Expr::MathFunction { .. }
         | Expr::Identifier(_)
         | Expr::Select { .. } => {
-            vals.push(value_to_math_bigint(evaluate_expr_in_context(
-                expr, None, session,
+            vals.push(value_to_math_bigint(evaluate_subexpr_as_integer(
+                expr, session,
             )?)?);
         }
         Expr::SystemTask { name } => return Err(task_in_expression_error(name)),
@@ -5710,23 +4779,11 @@ fn reduce_bits(op: UnaryOp, bits: &[LogicBit]) -> LogicBit {
     }
 }
 
-fn is_reduction_op(op: UnaryOp) -> bool {
-    matches!(
-        op,
-        UnaryOp::ReductionAnd
-            | UnaryOp::ReductionNand
-            | UnaryOp::ReductionOr
-            | UnaryOp::ReductionNor
-            | UnaryOp::ReductionXor
-            | UnaryOp::ReductionXnor
-    )
-}
-
 // LRM 4.2.1 / 5.2.1 / 5.2.2 bit-/part-select dispatch. The reg lookup
 // happens once here so each kind helper receives `&RegValue` directly
 // rather than re-resolving the name. Every helper produces an unsigned
 // self-determined IntegerValue; outer-context widening is applied by
-// the `Expr::Select` arm of `evaluate_expr_in_context`.
+// the `Expr::Select` arm of `evaluate_leaf_expr_in_context`.
 //
 // `inner` carries the second select in `a[i][...]`. It is only meaningful
 // when `reg` is an array (the outer `kind` must then be a `Bit` element
@@ -5868,7 +4925,7 @@ pub(crate) fn resolve_real_array_element_index(
     if expression_is_real(index, session) {
         unreachable!("validator rejects real array-element index before evaluation");
     }
-    let index_value = evaluate_select_subexpr(index, session)?;
+    let index_value = evaluate_subexpr_as_integer(index, session)?;
     if index_value.has_unknown_bits() {
         return Ok(None);
     }
@@ -5924,7 +4981,7 @@ fn evaluate_array_element_select(
     // decl time), so `elements[0]` always exists.
     debug_assert!(!elements.is_empty());
     let template = &elements[0];
-    let index_value = evaluate_select_subexpr(index, session)?;
+    let index_value = evaluate_subexpr_as_integer(index, session)?;
     if index_value.has_unknown_bits() {
         return Ok(IntegerValue::all_x(
             template.width,
@@ -5987,7 +5044,7 @@ fn evaluate_array_chained_select(
     debug_assert!(!elements.is_empty());
     let template = &elements[0];
     let element = {
-        let index_value = evaluate_select_subexpr(index, session)?;
+        let index_value = evaluate_subexpr_as_integer(index, session)?;
         if index_value.has_unknown_bits() {
             IntegerValue::all_x(template.width, template.signed, template.base)
         } else {
@@ -6018,7 +5075,7 @@ fn evaluate_bit_select(
     if expression_is_real(index, session) {
         unreachable!("validator rejects real bit-select index before evaluation");
     }
-    let index_value = evaluate_select_subexpr(index, session)?;
+    let index_value = evaluate_subexpr_as_integer(index, session)?;
     if index_value.has_unknown_bits() {
         return Ok(IntegerValue::all_x(1, false, result_base));
     }
@@ -6070,7 +5127,7 @@ fn evaluate_part_indexed_select(
     if expression_is_real(base_expr, session) {
         unreachable!("validator rejects real indexed part-select base before evaluation");
     }
-    let base_value = evaluate_select_subexpr(base_expr, session)?;
+    let base_value = evaluate_subexpr_as_integer(base_expr, session)?;
     if base_value.has_unknown_bits() {
         return Ok(IntegerValue::all_x(width, false, result_base));
     }
@@ -6630,7 +5687,7 @@ fn select_positions(
 ) -> Result<Vec<Option<usize>>, String> {
     match kind {
         SelectKind::Bit { index } => {
-            let index_value = evaluate_select_subexpr(index, session)?;
+            let index_value = evaluate_subexpr_as_integer(index, session)?;
             if index_value.has_unknown_bits() {
                 // LRM 4.2.1: x/z index → no assignment performed.
                 return Ok(vec![None]);
@@ -6657,7 +5714,7 @@ fn select_positions(
         } => {
             let is_up = matches!(kind, SelectKind::PartIndexedUp { .. });
             let width = evaluate_indexed_select_width(width_expr, session)?;
-            let base_value = evaluate_select_subexpr(base_expr, session)?;
+            let base_value = evaluate_subexpr_as_integer(base_expr, session)?;
             if base_value.has_unknown_bits() {
                 // LRM 5.2.2 / 4.2.1: x/z in the base means every
                 // position is unresolved → all dropped.
@@ -6721,7 +5778,7 @@ fn leaf_target(leaf: &LValue, session: &Session) -> Result<LeafTarget, String> {
                 let SelectKind::Bit { index } = kind else {
                     unreachable!("lvalue_meta rejected non-Bit outer select on array");
                 };
-                let index_value = evaluate_select_subexpr(index, session)?;
+                let index_value = evaluate_subexpr_as_integer(index, session)?;
                 let element = if index_value.has_unknown_bits() {
                     None
                 } else {

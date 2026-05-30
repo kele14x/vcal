@@ -7893,6 +7893,59 @@ fn evaluate_of_itor_with_deep_integer_arg_does_not_overflow() {
 }
 
 #[test]
+fn evaluate_of_power_with_deep_non_arith_exponent_does_not_overflow() {
+    // `2 ** (1<1<...<1)` — pre-fix the bigint-exponent walker's
+    // non-arith fallback called the recursive `evaluate_binary_expr`
+    // for each chain link. Re-routed through the iterative
+    // `evaluate_subexpr_as_integer` (annotate + evaluate_annotated)
+    // so depth stays off the C stack.
+    let mut chain = Expr::Literal(parse_integer("1").expect("seed literal"));
+    for _ in 0..50_000 {
+        chain = Expr::Binary {
+            op: BinaryOp::LessThan,
+            lhs: Box::new(chain),
+            rhs: Box::new(Expr::Literal(parse_integer("1").expect("step literal"))),
+        };
+    }
+    let e = Expr::Binary {
+        op: BinaryOp::Power,
+        lhs: Box::new(Expr::Literal(parse_integer("2").expect("base"))),
+        rhs: Box::new(Expr::Grouped(Box::new(chain))),
+    };
+    let session = Session::new();
+    let value = crate::eval::evaluate_expr(&e, &session)
+        .expect("`2 ** (deep < chain)` evaluates without overflow");
+    assert!(matches!(value, crate::value::Value::Integer(_)));
+}
+
+#[test]
+fn evaluate_of_replication_with_deep_count_does_not_overflow() {
+    // `{(1+1+...+1){1'b1}}` — pre-fix
+    // `evaluate_replication_count_allow_zero` evaluated the count
+    // through the recursive `evaluate_expr_in_context`. Re-routed
+    // through `evaluate_subexpr_as_integer` so the deep count chain
+    // doesn't overflow.
+    let mut count_chain = Expr::Literal(parse_integer("1").expect("seed literal"));
+    for _ in 0..50_000 {
+        count_chain = Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(count_chain),
+            rhs: Box::new(Expr::Literal(parse_integer("1").expect("step literal"))),
+        };
+    }
+    let e = Expr::Replication {
+        count: Box::new(Expr::Grouped(Box::new(count_chain))),
+        items: vec![Expr::Literal(
+            parse_integer("1'b1").expect("inner bit literal"),
+        )],
+    };
+    let session = Session::new();
+    let _ = crate::eval::evaluate_expr(&e, &session);
+    // Result is a 50_001-bit vector of 1s; we only need to confirm
+    // no crash. (The reified value would be huge, so don't materialise.)
+}
+
+#[test]
 fn assign_with_deeply_nested_lvalue_concat_does_not_overflow() {
     // `{{{...{a}...}}} = 1'b1` — pre-fix this crashed at ~50K depth
     // because `expression_to_lvalue` recursed on Concat items,
