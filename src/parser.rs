@@ -46,54 +46,21 @@ pub(crate) enum Expr {
         count: Box<Expr>,
         items: Vec<Expr>,
     },
-    // LRM 5.5: `$signed(expr)` / `$unsigned(expr)`. The argument is evaluated
-    // as a self-determined expression; the result has the same width and bits
-    // but with signedness set to `signed`. Outer-context width still flows
-    // back through it (handled in eval).
-    SignCast {
-        signed: bool,
-        arg: Box<Expr>,
-    },
-    // vcal-specific (non-LRM) display-base cast: `$bin(e)`, `$oct(e)`,
-    // `$dec(e)`, `$hex(e)`. The argument is evaluated as a self-determined
-    // expression; the result has the same width, signedness, and bits but
-    // with the display base set to `base`. Outer-context width still flows
-    // back through it (handled in eval), mirroring `SignCast`.
-    BaseCast {
-        base: Base,
-        arg: Box<Expr>,
-    },
-    // LRM 17.8: real-conversion system functions. Each maps between the
-    // integer and real domains with a specific semantic — see
-    // RealConversionKind for the four variants.
-    RealConversion {
-        kind: RealConversionKind,
-        arg: Box<Expr>,
-    },
-    // LRM 17.11: math system functions. `$clog2` returns a 32-bit signed
-    // integer; the other 21 are real-typed (1- or 2-arg) and follow the
-    // C standard library semantics — Rust's `f64::*` methods wrap libm,
-    // so the implementation matches by construction. Arity is validated
-    // at parse time; see `MathFunctionKind::arity`.
-    MathFunction {
-        kind: MathFunctionKind,
-        args: Vec<Expr>,
-    },
-    // LRM 17.4: simulation control system tasks (`$finish`, `$stop`).
-    // These are statements, not expressions — they have no return value.
-    // Parsed here so the parser handles `$finish`/`$stop` identifier-matching
-    // uniformly with system functions; the lib-level driver checks for a bare
-    // SystemTask at the top of the AST and exits, while the integer/real
-    // evaluators reject any nested occurrence with the task-in-expression
-    // error.
+    // Every `$name` / `$name()` / `$name(args)` parses to this one shape —
+    // the parser is purely syntactic for system identifiers. The
+    // validator (`classify_system_call` in eval.rs) owns the name table
+    // and decides whether `name` is a math function (with arity), a real
+    // conversion, a sign cast, a base cast, a system task, or unknown.
+    // Math system functions today (LRM 17.11) carry the typed kind on
+    // `AnnotatedKind` after the annotate pass resolves the name.
     //
-    // LRM allows an optional `(n)` argument controlling exit-message
-    // verbosity (n ∈ {0,1,2}). vcal does not print exit diagnostics, so the
-    // argument is meaningless: the parser accepts any number of arguments
-    // (including none) and discards them. Arguments are parsed for
-    // syntactic validity only; their values are never evaluated.
-    SystemTask {
+    // For system tasks (LRM 17.4: `$finish`, `$stop`) the args are parsed
+    // for syntactic validity and stored on the AST, but the evaluator
+    // never reads them — vcal does not print exit diagnostics, so the
+    // verbosity argument has no observable effect.
+    SystemCall {
         name: String,
+        args: Vec<Expr>,
     },
     // LRM A.8.3: a simple identifier as a `primary` — a reference to a
     // previously-declared `reg` (the only variable type vcal currently
@@ -190,7 +157,6 @@ fn truncate_expr_inner(expr: &mut Expr, depth: usize, max_depth: usize) {
         Expr::Literal(_)
         | Expr::RealLiteral(_)
         | Expr::Identifier(_)
-        | Expr::SystemTask { .. }
         | Expr::Truncated => {}
         Expr::Grouped(inner) => truncate_expr_inner(inner.as_mut(), depth + 1, max_depth),
         Expr::Unary { expr: inner, .. } => {
@@ -220,12 +186,7 @@ fn truncate_expr_inner(expr: &mut Expr, depth: usize, max_depth: usize) {
                 truncate_expr_inner(item, depth + 1, max_depth);
             }
         }
-        Expr::SignCast { arg, .. }
-        | Expr::BaseCast { arg, .. }
-        | Expr::RealConversion { arg, .. } => {
-            truncate_expr_inner(arg.as_mut(), depth + 1, max_depth);
-        }
-        Expr::MathFunction { args, .. } => {
+        Expr::SystemCall { args, .. } => {
             for arg in args {
                 truncate_expr_inner(arg, depth + 1, max_depth);
             }
@@ -317,7 +278,6 @@ pub(crate) fn truncate_stmt_for_display(stmt: &mut Stmt, max_depth: usize) {
             truncate_lvalue_for_display(lvalue, max_depth);
             truncate_expr_for_display(rhs, max_depth);
         }
-        Stmt::Task(_) => {}
     }
 }
 
@@ -359,7 +319,6 @@ fn steal_expr_children(expr: &mut Expr, out: &mut Vec<Expr>) {
         Expr::Literal(_)
         | Expr::RealLiteral(_)
         | Expr::Identifier(_)
-        | Expr::SystemTask { .. }
         | Expr::Truncated => {}
         Expr::Grouped(inner) => {
             out.push(std::mem::replace(inner.as_mut(), placeholder()));
@@ -387,12 +346,7 @@ fn steal_expr_children(expr: &mut Expr, out: &mut Vec<Expr>) {
             out.push(std::mem::replace(count.as_mut(), placeholder()));
             out.append(items);
         }
-        Expr::SignCast { arg, .. }
-        | Expr::BaseCast { arg, .. }
-        | Expr::RealConversion { arg, .. } => {
-            out.push(std::mem::replace(arg.as_mut(), placeholder()));
-        }
-        Expr::MathFunction { args, .. } => {
+        Expr::SystemCall { args, .. } => {
             out.append(args);
         }
         Expr::Select { kind, inner, .. } => {
@@ -494,9 +448,6 @@ pub(crate) enum Stmt {
         lvalue: LValue,
         rhs: Expr,
     },
-    // LRM 17.4: `$finish` / `$stop` hoisted to the statement level so the
-    // driver can exit without going through the expression evaluator.
-    Task(String),
 }
 
 // Which variable-decl keyword introduced this `Stmt::Decl`. LRM 4.8 lists
@@ -843,111 +794,17 @@ enum Pending {
         unary_wrap: Vec<UnaryOp>,
         saved_min_bp: u8,
     },
-    /// `$func(` consumed; collecting comma-separated args. Closes with
-    /// `)`. `kind` says which `Expr` variant to build at finalization;
-    /// arity is enforced in the closer arm.
-    SystemArgs {
+    /// `$name(` consumed; collecting comma-separated args. Closes with
+    /// `)`. No name dispatch happens here — every `$name(args)` builds
+    /// `Expr::SystemCall { name, args }`. Name validation, arity, and
+    /// real-arg checks all live in the validator (`classify_system_call`
+    /// in eval.rs).
+    SystemCallArgs {
         name: String,
-        kind: SystemFnKind,
         args: Vec<Expr>,
         unary_wrap: Vec<UnaryOp>,
         saved_min_bp: u8,
     },
-    /// `$finish(` or `$stop(` consumed with at least one argument
-    /// pending. Args are parsed for syntactic validity then dropped
-    /// (LRM 17.4: vcal prints no exit diagnostic, so the message-
-    /// verbosity argument has no effect).
-    SystemTask {
-        name: String,
-        unary_wrap: Vec<UnaryOp>,
-        saved_min_bp: u8,
-    },
-}
-
-// Discriminant for system-function call frames. Mirrors the local
-// `SystemFn` enum that used to live inside the recursive
-// `parse_system_function_call`; lifting it to module scope lets the
-// `Pending::SystemArgs` frame hold it without a lifetime parameter.
-enum SystemFnKind {
-    /// `$signed` (true) / `$unsigned` (false). LRM 5.5.
-    SignCast(bool),
-    /// `$bin` / `$oct` / `$dec` / `$hex`.
-    BaseCast(Base),
-    /// `$rtoi` / `$itor` / `$realtobits` / `$bitstoreal`. LRM 17.8.
-    RealConversion(RealConversionKind),
-    /// `$pow`, `$ln`, `$clog2`, etc. — arity enforced at finalization
-    /// per `MathFunctionKind::arity()`.
-    MathFunction(MathFunctionKind),
-}
-
-// Resolve a `$name` token to the system-function kind, or fail with the
-// "unsupported system function" diagnostic. Pure name → kind mapping
-// used by the iterative parser before consuming the opening `(`.
-fn resolve_system_fn_kind(name: &str) -> Result<SystemFnKind, String> {
-    Ok(match name {
-        "$signed" => SystemFnKind::SignCast(true),
-        "$unsigned" => SystemFnKind::SignCast(false),
-        "$bin" => SystemFnKind::BaseCast(Base::Binary),
-        "$oct" => SystemFnKind::BaseCast(Base::Octal),
-        "$dec" => SystemFnKind::BaseCast(Base::Decimal),
-        "$hex" => SystemFnKind::BaseCast(Base::Hex),
-        "$rtoi" => SystemFnKind::RealConversion(RealConversionKind::RealToInteger),
-        "$itor" => SystemFnKind::RealConversion(RealConversionKind::IntegerToReal),
-        "$realtobits" => SystemFnKind::RealConversion(RealConversionKind::RealToBits),
-        "$bitstoreal" => SystemFnKind::RealConversion(RealConversionKind::BitsToReal),
-        _ => match MathFunctionKind::from_name(name) {
-            Some(math_kind) => SystemFnKind::MathFunction(math_kind),
-            None => return Err(format!("unsupported system function: {name}")),
-        },
-    })
-}
-
-// Build the final `Expr` for a system-function call once all args are
-// collected and the closing `)` has been consumed. Math functions
-// enforce arity via `MathFunctionKind::arity()`; the single-arg
-// variants reject anything other than exactly one argument with the
-// same "expected `)` after <name> argument" diagnostic the recursive
-// helper emitted when a comma followed the first arg.
-fn build_system_fn_expr(
-    name: &str,
-    kind: SystemFnKind,
-    args: Vec<Expr>,
-) -> Result<Expr, String> {
-    match kind {
-        SystemFnKind::MathFunction(math_kind) => {
-            let expected = math_kind.arity();
-            if args.len() != expected {
-                return Err(format!(
-                    "{} expects {expected} argument{plural}, got {actual}",
-                    math_kind.name(),
-                    plural = if expected == 1 { "" } else { "s" },
-                    actual = args.len()
-                ));
-            }
-            Ok(Expr::MathFunction { kind: math_kind, args })
-        }
-        SystemFnKind::SignCast(signed) => {
-            if args.len() != 1 {
-                return Err(format!("expected `)` after {name} argument"));
-            }
-            let arg = args.into_iter().next().expect("len == 1");
-            Ok(Expr::SignCast { signed, arg: Box::new(arg) })
-        }
-        SystemFnKind::BaseCast(base) => {
-            if args.len() != 1 {
-                return Err(format!("expected `)` after {name} argument"));
-            }
-            let arg = args.into_iter().next().expect("len == 1");
-            Ok(Expr::BaseCast { base, arg: Box::new(arg) })
-        }
-        SystemFnKind::RealConversion(conv) => {
-            if args.len() != 1 {
-                return Err(format!("expected `)` after {name} argument"));
-            }
-            let arg = args.into_iter().next().expect("len == 1");
-            Ok(Expr::RealConversion { kind: conv, arg: Box::new(arg) })
-        }
-    }
 }
 
 // Wrap an `Expr` with a chain of prefix unary operators in source
@@ -1081,50 +938,30 @@ impl<'a> Parser<'a> {
                         Some(Token::SystemIdentifier(n)) => n.clone(),
                         _ => unreachable!("matches! guard guarantees SystemIdentifier"),
                     };
-                    // LRM 17.4: `$finish` / `$stop` are statements but
-                    // also accepted in expression position so the
-                    // top-level driver can distinguish task-at-AST-root
-                    // (exit) from task-nested-in-expression (rejected by
-                    // the evaluator). Without a `(` they're a bare
-                    // `Expr::SystemTask`; with `()` they're the same
-                    // value with no args; with `(args)` we collect the
-                    // args for syntactic validation and discard them.
-                    if matches!(name.as_str(), "$finish" | "$stop") {
-                        if !matches!(self.peek(), Some(Token::LParen)) {
-                            value = Some(apply_prefix_unary_ops(
-                                Expr::SystemTask { name },
-                                prefix_ops,
-                            ));
-                            continue;
-                        }
-                        self.index += 1; // consume `(`
-                        if matches!(self.peek(), Some(Token::RParen)) {
-                            self.index += 1;
-                            value = Some(apply_prefix_unary_ops(
-                                Expr::SystemTask { name },
-                                prefix_ops,
-                            ));
-                            continue;
-                        }
-                        stack.push(Pending::SystemTask {
-                            name,
-                            unary_wrap: prefix_ops,
-                            saved_min_bp: min_bp,
-                        });
-                        min_bp = 0;
+                    // Every `$name` / `$name()` / `$name(args)` builds
+                    // the same generic `Expr::SystemCall { name, args }`.
+                    // The validator (`classify_system_call`) owns the
+                    // name → kind table and decides whether the name is
+                    // a math fn (with arity check), real conversion,
+                    // sign cast, base cast, task, or unknown.
+                    if !matches!(self.peek(), Some(Token::LParen)) {
+                        value = Some(apply_prefix_unary_ops(
+                            Expr::SystemCall { name, args: Vec::new() },
+                            prefix_ops,
+                        ));
                         continue;
                     }
-                    // Real system functions: resolve the kind, expect
-                    // `(`, then push a SystemArgs frame and parse the
-                    // first arg. The arity check fires at finalization.
-                    let kind = resolve_system_fn_kind(&name)?;
-                    match self.next() {
-                        Some(Token::LParen) => {}
-                        _ => return Err(format!("expected `(` after {name}")),
+                    self.index += 1; // consume `(`
+                    if matches!(self.peek(), Some(Token::RParen)) {
+                        self.index += 1;
+                        value = Some(apply_prefix_unary_ops(
+                            Expr::SystemCall { name, args: Vec::new() },
+                            prefix_ops,
+                        ));
+                        continue;
                     }
-                    stack.push(Pending::SystemArgs {
+                    stack.push(Pending::SystemCallArgs {
                         name,
-                        kind,
                         args: Vec::new(),
                         unary_wrap: prefix_ops,
                         saved_min_bp: min_bp,
@@ -1331,56 +1168,35 @@ impl<'a> Parser<'a> {
                         return Err("missing closing brace in concatenation".to_string());
                     }
                 }
-                Some(Pending::SystemArgs { name, .. }) => {
+                Some(Pending::SystemCallArgs { name, .. }) => {
                     if matches!(self.peek(), Some(Token::Comma)) {
                         self.index += 1;
                         let v = value.take().expect("value is Some when reducing");
-                        let Some(Pending::SystemArgs { args, .. }) = stack.last_mut() else {
-                            unreachable!("matched SystemArgs above");
+                        let Some(Pending::SystemCallArgs { args, .. }) = stack.last_mut() else {
+                            unreachable!("matched SystemCallArgs above");
                         };
                         args.push(v);
                     } else if matches!(self.peek(), Some(Token::RParen)) {
                         self.index += 1;
                         let v = value.take().expect("value is Some when reducing");
                         let frame = stack.pop().expect("just inspected via last()");
-                        let Pending::SystemArgs {
+                        let Pending::SystemCallArgs {
                             name,
-                            kind,
                             mut args,
                             unary_wrap,
                             saved_min_bp,
                         } = frame
                         else {
-                            unreachable!("matched SystemArgs above");
+                            unreachable!("matched SystemCallArgs above");
                         };
                         args.push(v);
-                        let expr = build_system_fn_expr(&name, kind, args)?;
-                        value = Some(apply_prefix_unary_ops(expr, unary_wrap));
-                        min_bp = saved_min_bp;
-                    } else {
-                        return Err(format!("expected `)` after {name} argument"));
-                    }
-                }
-                Some(Pending::SystemTask { name, .. }) => {
-                    if matches!(self.peek(), Some(Token::Comma)) {
-                        // Discard the value; $finish / $stop args are
-                        // parsed for syntactic validity only.
-                        self.index += 1;
-                        let _ = value.take();
-                    } else if matches!(self.peek(), Some(Token::RParen)) {
-                        self.index += 1;
-                        let _ = value.take();
-                        let frame = stack.pop().expect("just inspected via last()");
-                        let Pending::SystemTask { name, unary_wrap, saved_min_bp } = frame else {
-                            unreachable!("matched SystemTask above");
-                        };
                         value = Some(apply_prefix_unary_ops(
-                            Expr::SystemTask { name },
+                            Expr::SystemCall { name, args },
                             unary_wrap,
                         ));
                         min_bp = saved_min_bp;
                     } else {
-                        return Err(format!("expected `)` after {name} arguments"));
+                        return Err(format!("expected `)` after {name} argument"));
                     }
                 }
             }
@@ -1422,19 +1238,16 @@ impl<'a> Parser<'a> {
                 let rhs = self.parse_expression()?;
                 return Ok(Stmt::Assign { lvalue, rhs });
             }
-            if let Some(name) = top_level_task_name(&expr) {
-                return Ok(Stmt::Task(name));
-            }
             return Ok(Stmt::Expr(expr));
         }
 
+        // Top-level system tasks (`$finish`, optionally wrapped in
+        // parens) are no longer hoisted here — the lib driver
+        // (`apply_stmt`) walks the parsed expression through the
+        // iterative `unwrap_grouped` + `classify_system_call` to spot
+        // the task and exit. Keeping that recognition out of the parser
+        // means `((($finish)))` doesn't pay for a recursive walker.
         let expr = self.parse_expression()?;
-        // Hoist a top-level system task (or one wrapped in redundant
-        // parentheses) so the driver can exit without invoking the
-        // expression evaluator's task-in-expression rejection.
-        if let Some(name) = top_level_task_name(&expr) {
-            return Ok(Stmt::Task(name));
-        }
         Ok(Stmt::Expr(expr))
     }
 
@@ -1725,25 +1538,12 @@ impl<'a> Parser<'a> {
     }
 }
 
-// LRM 17.4: `$finish` / `$stop` are statements that exit. The parser
-// produces `Expr::SystemTask` for them so identifier dispatch is uniform;
-// this helper hoists a top-level task (optionally wrapped in redundant
-// parentheses) up to the `Stmt::Task` layer so the driver can exit before
-// the expression evaluator's task-in-expression rule fires.
-fn top_level_task_name(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Grouped(inner) => top_level_task_name(inner),
-        Expr::SystemTask { name } => Some(name.clone()),
-        _ => None,
-    }
-}
-
 // LRM A.8.5 `variable_lvalue`. Called after `parse_statement` has parsed
 // the LHS as an `Expr` and confirmed `=` follows. Accept only the shapes
 // the LRM production allows; reject everything else with a uniform
 // "invalid lvalue" diagnostic. Leading `Grouped` layers are unwrapped so
-// `(a) = 1` works (matches how `top_level_task_name` walks through parens
-// for `($finish)`).
+// `(a) = 1` works (mirroring how the lib driver walks parens around a
+// top-level `$finish` via `unwrap_grouped`).
 //
 // Now that `Expr` has a custom `Drop` (for the deep-AST overflow fix
 // further up), Rust forbids moving owned fields out of `Expr` via

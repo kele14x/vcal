@@ -49,8 +49,8 @@ pub(crate) struct Annotated<'a> {
 
 #[derive(Debug)]
 enum AnnotatedKind<'a> {
-    // `Literal`, `RealLiteral`, `Identifier`, `SystemTask`, `Select`. The
-    // evaluator reads sub-data from `Annotated::expr` directly.
+    // `Literal`, `RealLiteral`, `Identifier`, `Select`. The evaluator
+    // reads sub-data from `Annotated::expr` directly.
     Leaf,
     Grouped(Box<Annotated<'a>>),
     Unary(Box<Annotated<'a>>),
@@ -68,10 +68,71 @@ enum AnnotatedKind<'a> {
         count: Box<Annotated<'a>>,
         items: Vec<Annotated<'a>>,
     },
-    SignCast(Box<Annotated<'a>>),
-    BaseCast(Box<Annotated<'a>>),
-    RealConversion(Box<Annotated<'a>>),
-    MathFunction(Vec<Annotated<'a>>),
+    // System-call result classes. `annotate` resolves the parsed name
+    // via `classify_system_call` and stores the typed kind here so the
+    // evaluator reads it off the node without re-classifying.
+    SignCast {
+        signed: bool,
+        arg: Box<Annotated<'a>>,
+    },
+    BaseCast {
+        base: Base,
+        arg: Box<Annotated<'a>>,
+    },
+    RealConversion {
+        kind: RealConversionKind,
+        arg: Box<Annotated<'a>>,
+    },
+    MathFunction {
+        kind: MathFunctionKind,
+        args: Vec<Annotated<'a>>,
+    },
+    // `$finish` / `$stop` in expression position. Leaf-shaped — args
+    // were parsed for syntactic validity and dropped by `annotate`
+    // since they're never evaluated (LRM 17.4: vcal prints no exit
+    // diagnostic). At the AST root the lib driver hoists this to an
+    // exit; anywhere else, every walker rejects it as
+    // "task in expression position".
+    SystemTask,
+}
+
+// Name → semantic kind classification for `Expr::SystemCall { name, ... }`.
+// The only place the system-identifier name table lives. Driven by the
+// parser's existing `MathFunctionKind::from_name` plus the cast / real-
+// conversion / task name set. Used by:
+//   - the validator (arity check per kind, real-arg rules, unknown-name
+//     diagnostic)
+//   - `annotate` (resolves name → typed `AnnotatedKind` variant)
+//   - `apply_stmt` in lib.rs (top-level task recognition)
+#[derive(Clone, Copy)]
+pub(crate) enum SystemCallKind {
+    Math(MathFunctionKind),
+    RealConversion(RealConversionKind),
+    SignCast { signed: bool },
+    BaseCast(Base),
+    // LRM 17.4 simulation-control tasks: `$finish`, `$stop`. Any arity
+    // accepted; args parsed for syntactic validity then dropped.
+    Task,
+}
+
+pub(crate) fn classify_system_call(name: &str) -> Result<SystemCallKind, String> {
+    Ok(match name {
+        "$signed" => SystemCallKind::SignCast { signed: true },
+        "$unsigned" => SystemCallKind::SignCast { signed: false },
+        "$bin" => SystemCallKind::BaseCast(Base::Binary),
+        "$oct" => SystemCallKind::BaseCast(Base::Octal),
+        "$dec" => SystemCallKind::BaseCast(Base::Decimal),
+        "$hex" => SystemCallKind::BaseCast(Base::Hex),
+        "$rtoi" => SystemCallKind::RealConversion(RealConversionKind::RealToInteger),
+        "$itor" => SystemCallKind::RealConversion(RealConversionKind::IntegerToReal),
+        "$realtobits" => SystemCallKind::RealConversion(RealConversionKind::RealToBits),
+        "$bitstoreal" => SystemCallKind::RealConversion(RealConversionKind::BitsToReal),
+        "$finish" | "$stop" => SystemCallKind::Task,
+        _ => match MathFunctionKind::from_name(name) {
+            Some(math_kind) => SystemCallKind::Math(math_kind),
+            None => return Err(format!("unknown system identifier: {name}")),
+        },
+    })
 }
 
 impl<'a> Annotated<'a> {
@@ -111,13 +172,14 @@ fn steal_annotated_children<'a>(annot: &mut Annotated<'a>, out: &mut Vec<Annotat
         kind: AnnotatedKind::Leaf,
     };
     match &mut annot.kind {
-        AnnotatedKind::Leaf => {}
-        AnnotatedKind::Grouped(inner)
-        | AnnotatedKind::Unary(inner)
-        | AnnotatedKind::SignCast(inner)
-        | AnnotatedKind::BaseCast(inner)
-        | AnnotatedKind::RealConversion(inner) => {
+        AnnotatedKind::Leaf | AnnotatedKind::SystemTask => {}
+        AnnotatedKind::Grouped(inner) | AnnotatedKind::Unary(inner) => {
             out.push(std::mem::replace(inner.as_mut(), placeholder()));
+        }
+        AnnotatedKind::SignCast { arg, .. }
+        | AnnotatedKind::BaseCast { arg, .. }
+        | AnnotatedKind::RealConversion { arg, .. } => {
+            out.push(std::mem::replace(arg.as_mut(), placeholder()));
         }
         AnnotatedKind::Binary { lhs, rhs } => {
             out.push(std::mem::replace(lhs.as_mut(), placeholder()));
@@ -132,7 +194,7 @@ fn steal_annotated_children<'a>(annot: &mut Annotated<'a>, out: &mut Vec<Annotat
             out.push(std::mem::replace(then_arm.as_mut(), placeholder()));
             out.push(std::mem::replace(else_arm.as_mut(), placeholder()));
         }
-        AnnotatedKind::Concatenation(items) | AnnotatedKind::MathFunction(items) => {
+        AnnotatedKind::Concatenation(items) | AnnotatedKind::MathFunction { args: items, .. } => {
             out.append(items);
         }
         AnnotatedKind::Replication { count, items } => {
@@ -180,15 +242,9 @@ enum AnnotateCombiner<'a> {
         count_expr: &'a Expr,
         item_count: usize,
     },
-    SignCast { expr: &'a Expr, signed: bool },
-    BaseCast { expr: &'a Expr, base: Base },
-    RealConversion {
+    SystemCall {
         expr: &'a Expr,
-        kind: RealConversionKind,
-    },
-    MathFunction {
-        expr: &'a Expr,
-        kind: MathFunctionKind,
+        kind: SystemCallKind,
         arg_count: usize,
     },
 }
@@ -263,46 +319,34 @@ pub(crate) fn annotate<'a>(root: &'a Expr, session: &Session) -> Result<Annotate
                     }
                     work.push(AnnotateTask::Visit(count));
                 }
-                Expr::SignCast { signed, arg } => {
-                    work.push(AnnotateTask::Combine(AnnotateCombiner::SignCast {
-                        expr,
-                        signed: *signed,
-                    }));
-                    work.push(AnnotateTask::Visit(arg));
-                }
-                Expr::BaseCast { base, arg } => {
-                    work.push(AnnotateTask::Combine(AnnotateCombiner::BaseCast {
-                        expr,
-                        base: *base,
-                    }));
-                    work.push(AnnotateTask::Visit(arg));
-                }
-                Expr::RealConversion { kind, arg } => {
-                    work.push(AnnotateTask::Combine(AnnotateCombiner::RealConversion {
-                        expr,
-                        kind: *kind,
-                    }));
-                    work.push(AnnotateTask::Visit(arg));
-                }
-                Expr::MathFunction { kind, args } => {
-                    work.push(AnnotateTask::Combine(AnnotateCombiner::MathFunction {
-                        expr,
-                        kind: *kind,
-                        arg_count: args.len(),
-                    }));
-                    for arg in args.iter().rev() {
-                        work.push(AnnotateTask::Visit(arg));
+                // One arm for every `$name(args)` shape. `classify_system_call`
+                // resolves the name into the typed `SystemCallKind`; arity is
+                // enforced at combine time. Unknown name → "unknown system
+                // identifier" error (the only place the name table lives).
+                // Tasks (`$finish` / `$stop`) become a leaf SystemTask with
+                // args discarded — LRM 17.4 message-verbosity argument has no
+                // observable effect in vcal, and the args were parsed for
+                // syntactic validity by the parser already.
+                Expr::SystemCall { name, args } => {
+                    let kind = classify_system_call(name)?;
+                    match kind {
+                        SystemCallKind::Task => vals.push(Annotated {
+                            expr,
+                            meta: None,
+                            kind: AnnotatedKind::SystemTask,
+                        }),
+                        _ => {
+                            work.push(AnnotateTask::Combine(AnnotateCombiner::SystemCall {
+                                expr,
+                                kind,
+                                arg_count: args.len(),
+                            }));
+                            for arg in args.iter().rev() {
+                                work.push(AnnotateTask::Visit(arg));
+                            }
+                        }
                     }
                 }
-                // SystemTask: not really an expression. The validator rejects
-                // it at any nested expression position; we annotate as a
-                // None-meta Leaf so the validator can read `is_real` without
-                // distinguishing the case.
-                Expr::SystemTask { .. } => vals.push(Annotated {
-                    expr,
-                    meta: None,
-                    kind: AnnotatedKind::Leaf,
-                }),
                 Expr::Identifier(name) => {
                     let reg = session
                         .lookup(name)
@@ -526,79 +570,118 @@ fn annotate_combine<'a>(
                 },
             })
         }
-        AnnotateCombiner::SignCast { expr, signed } => {
-            let arg = vals.pop().expect("SignCast: arg missing");
-            // LRM 5.5: width / base from arg, signedness from cast. Real
-            // arg rejected by validator; meta computed here is a no-op for
-            // real cases (validator surfaces the error first).
-            let meta = arg.meta.map(|arg_meta| ExprMeta {
-                width: arg_meta.width,
-                signed,
-                base: arg_meta.base,
-            });
-            Ok(Annotated {
-                expr,
-                meta,
-                kind: AnnotatedKind::SignCast(Box::new(arg)),
-            })
-        }
-        AnnotateCombiner::BaseCast { expr, base } => {
-            let arg = vals.pop().expect("BaseCast: arg missing");
-            let meta = arg.meta.map(|arg_meta| ExprMeta {
-                width: arg_meta.width,
-                signed: arg_meta.signed,
-                base,
-            });
-            Ok(Annotated {
-                expr,
-                meta,
-                kind: AnnotatedKind::BaseCast(Box::new(arg)),
-            })
-        }
-        AnnotateCombiner::RealConversion { expr, kind } => {
-            let arg = vals.pop().expect("RealConversion: arg missing");
-            // LRM 17.8: $rtoi is 32-bit signed decimal; $realtobits is
-            // 64-bit unsigned hex; $itor and $bitstoreal are real-typed.
-            let meta = match kind {
-                RealConversionKind::RealToInteger => Some(ExprMeta {
-                    width: 32,
-                    signed: true,
-                    base: Base::Decimal,
-                }),
-                RealConversionKind::RealToBits => Some(ExprMeta {
-                    width: 64,
-                    signed: false,
-                    base: Base::Hex,
-                }),
-                RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => None,
+        AnnotateCombiner::SystemCall { expr, kind, arg_count } => {
+            // Pop args first so the early-return arity-error path drops
+            // them at end of scope (via Annotated's iterative Drop) rather
+            // than leaving them on the value stack.
+            let mut arg_annots = pop_n(vals, arg_count);
+            let system_call_name = match expr {
+                Expr::SystemCall { name, .. } => name.as_str(),
+                _ => unreachable!("AnnotateCombiner::SystemCall wraps only Expr::SystemCall"),
             };
-            Ok(Annotated {
-                expr,
-                meta,
-                kind: AnnotatedKind::RealConversion(Box::new(arg)),
-            })
-        }
-        AnnotateCombiner::MathFunction {
-            expr,
-            kind,
-            arg_count,
-        } => {
-            let arg_annots = pop_n(vals, arg_count);
-            // LRM 17.11: $clog2 → 32-bit signed decimal; the rest yield real.
-            let meta = if kind.is_real_result() {
-                None
-            } else {
-                Some(ExprMeta {
-                    width: 32,
-                    signed: true,
-                    base: Base::Decimal,
-                })
-            };
-            Ok(Annotated {
-                expr,
-                meta,
-                kind: AnnotatedKind::MathFunction(arg_annots),
-            })
+            // Single source for the "wrong arity" diagnostic. Reads slightly
+            // off the kind to keep the wording consistent across all four
+            // function-shape classes.
+            fn expect_arity(name: &str, got: usize, want: usize) -> Result<(), String> {
+                if got == want {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{name} expects {want} argument{plural}, got {got}",
+                        plural = if want == 1 { "" } else { "s" }
+                    ))
+                }
+            }
+            match kind {
+                SystemCallKind::Task => {
+                    unreachable!("Task kind is built as a leaf in annotate's Visit arm")
+                }
+                SystemCallKind::SignCast { signed } => {
+                    expect_arity(system_call_name, arg_annots.len(), 1)?;
+                    let arg = arg_annots.pop().expect("len == 1");
+                    // LRM 5.5: width / base from arg, signedness from cast.
+                    // Real arg rejected by validator; meta computed here is a
+                    // no-op for real cases (validator surfaces the error first).
+                    let meta = arg.meta.map(|arg_meta| ExprMeta {
+                        width: arg_meta.width,
+                        signed,
+                        base: arg_meta.base,
+                    });
+                    Ok(Annotated {
+                        expr,
+                        meta,
+                        kind: AnnotatedKind::SignCast {
+                            signed,
+                            arg: Box::new(arg),
+                        },
+                    })
+                }
+                SystemCallKind::BaseCast(base) => {
+                    expect_arity(system_call_name, arg_annots.len(), 1)?;
+                    let arg = arg_annots.pop().expect("len == 1");
+                    let meta = arg.meta.map(|arg_meta| ExprMeta {
+                        width: arg_meta.width,
+                        signed: arg_meta.signed,
+                        base,
+                    });
+                    Ok(Annotated {
+                        expr,
+                        meta,
+                        kind: AnnotatedKind::BaseCast {
+                            base,
+                            arg: Box::new(arg),
+                        },
+                    })
+                }
+                SystemCallKind::RealConversion(conv_kind) => {
+                    expect_arity(system_call_name, arg_annots.len(), 1)?;
+                    let arg = arg_annots.pop().expect("len == 1");
+                    // LRM 17.8: $rtoi is 32-bit signed decimal; $realtobits is
+                    // 64-bit unsigned hex; $itor and $bitstoreal are real-typed.
+                    let meta = match conv_kind {
+                        RealConversionKind::RealToInteger => Some(ExprMeta {
+                            width: 32,
+                            signed: true,
+                            base: Base::Decimal,
+                        }),
+                        RealConversionKind::RealToBits => Some(ExprMeta {
+                            width: 64,
+                            signed: false,
+                            base: Base::Hex,
+                        }),
+                        RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => None,
+                    };
+                    Ok(Annotated {
+                        expr,
+                        meta,
+                        kind: AnnotatedKind::RealConversion {
+                            kind: conv_kind,
+                            arg: Box::new(arg),
+                        },
+                    })
+                }
+                SystemCallKind::Math(math_kind) => {
+                    expect_arity(system_call_name, arg_annots.len(), math_kind.arity())?;
+                    // LRM 17.11: $clog2 → 32-bit signed decimal; the rest yield real.
+                    let meta = if math_kind.is_real_result() {
+                        None
+                    } else {
+                        Some(ExprMeta {
+                            width: 32,
+                            signed: true,
+                            base: Base::Decimal,
+                        })
+                    };
+                    Ok(Annotated {
+                        expr,
+                        meta,
+                        kind: AnnotatedKind::MathFunction {
+                            kind: math_kind,
+                            args: arg_annots,
+                        },
+                    })
+                }
+            }
         }
     }
 }
@@ -838,32 +921,24 @@ pub(crate) fn expression_is_real(expr: &Expr, session: &Session) -> bool {
                 work.push(then_expr);
                 work.push(else_expr);
             }
-            Expr::Concatenation { .. }
-            | Expr::Replication { .. }
-            | Expr::SignCast { .. }
-            | Expr::BaseCast { .. } => {}
-            // LRM 17.8: $itor and $bitstoreal yield real values; $rtoi and
-            // $realtobits yield integers (32-bit signed and 64-bit unsigned
-            // respectively), so only the first two participate in real-result
-            // type propagation.
-            Expr::RealConversion { kind, .. } => {
-                if matches!(
-                    kind,
-                    RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal
-                ) {
-                    return true;
-                }
-            }
-            // LRM 17.11: every math function except $clog2 returns real.
-            Expr::MathFunction { kind, .. } => {
-                if kind.is_real_result() {
-                    return true;
-                }
-            }
-            // System tasks have no type — they are not values. Reporting
-            // "not real" routes the rejection through the integer pipeline,
-            // which surfaces the task-in-expression diagnostic.
-            Expr::SystemTask { .. } => {}
+            Expr::Concatenation { .. } | Expr::Replication { .. } => {}
+            // `$name(args)`: classify by name to decide result-type.
+            //   - SignCast / BaseCast / unknown name → integer-typed
+            //     (unknowns surface their diagnostic at validate time).
+            //   - RealConversion: $itor / $bitstoreal yield real; $rtoi /
+            //     $realtobits yield integer (LRM 17.8).
+            //   - MathFunction: every kind except $clog2 returns real
+            //     (LRM 17.11).
+            //   - Task: not really an expression — reporting "not real"
+            //     routes the rejection through the integer pipeline,
+            //     which surfaces the task-in-expression diagnostic.
+            Expr::SystemCall { name, .. } => match classify_system_call(name) {
+                Ok(SystemCallKind::RealConversion(
+                    RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal,
+                )) => return true,
+                Ok(SystemCallKind::Math(kind)) if kind.is_real_result() => return true,
+                _ => {}
+            },
             // An identifier is real-typed iff it resolves to a `real` reg
             // (LRM 4.8). Unknown names resolve to integer here so the
             // downstream integer pipeline can surface the "undeclared
@@ -1316,47 +1391,60 @@ fn visit_expr_structure<'a>(
         Expr::Replication { count, items } => {
             push_replication_validation_expr(count, items, evaluate_replication_count, work);
         }
-        Expr::SignCast { signed, arg } => {
-            work.push(ExprValidateTask::PostCheck(
-                ExprValidatePostCheck::SignCastArgReal { signed: *signed, arg },
-            ));
-            work.push(ExprValidateTask::Visit(arg));
-        }
-        Expr::BaseCast { base, arg } => {
-            work.push(ExprValidateTask::PostCheck(
-                ExprValidatePostCheck::BaseCastArgReal { base: *base, arg },
-            ));
-            work.push(ExprValidateTask::Visit(arg));
-        }
-        Expr::RealConversion { kind, arg } => {
+        Expr::SystemCall { name, args } => {
+            // Classify resolves the name (surfacing "unknown system
+            // identifier" up front) and selects the per-kind structural
+            // checks. Arity is already enforced by `annotate` before
+            // structural validation runs, so a wrong-arity SystemCall
+            // never reaches here.
+            let kind = classify_system_call(name)?;
             match kind {
-                RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {}
-                RealConversionKind::IntegerToReal => {
+                SystemCallKind::SignCast { signed } => {
+                    let arg = &args[0];
                     work.push(ExprValidateTask::PostCheck(
-                        ExprValidatePostCheck::ItorArgReal { arg },
+                        ExprValidatePostCheck::SignCastArgReal { signed, arg },
                     ));
+                    work.push(ExprValidateTask::Visit(arg));
                 }
-                RealConversionKind::BitsToReal => {
+                SystemCallKind::BaseCast(base) => {
+                    let arg = &args[0];
                     work.push(ExprValidateTask::PostCheck(
-                        ExprValidatePostCheck::BitsToRealArgChecks { arg },
+                        ExprValidatePostCheck::BaseCastArgReal { base, arg },
                     ));
+                    work.push(ExprValidateTask::Visit(arg));
                 }
+                SystemCallKind::RealConversion(conv_kind) => {
+                    let arg = &args[0];
+                    match conv_kind {
+                        RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {}
+                        RealConversionKind::IntegerToReal => {
+                            work.push(ExprValidateTask::PostCheck(
+                                ExprValidatePostCheck::ItorArgReal { arg },
+                            ));
+                        }
+                        RealConversionKind::BitsToReal => {
+                            work.push(ExprValidateTask::PostCheck(
+                                ExprValidatePostCheck::BitsToRealArgChecks { arg },
+                            ));
+                        }
+                    }
+                    work.push(ExprValidateTask::Visit(arg));
+                }
+                SystemCallKind::Math(math_kind) => {
+                    work.push(ExprValidateTask::PostCheck(
+                        ExprValidatePostCheck::MathFunctionArgChecks {
+                            kind: math_kind,
+                            first_arg: &args[0],
+                            whole: node,
+                        },
+                    ));
+                    for arg in args.iter().rev() {
+                        work.push(ExprValidateTask::Visit(arg));
+                    }
+                }
+                SystemCallKind::Task => return Err(task_in_expression_error(name)),
             }
-            work.push(ExprValidateTask::Visit(arg));
         }
-        Expr::MathFunction { kind, args } => {
-            work.push(ExprValidateTask::PostCheck(
-                ExprValidatePostCheck::MathFunctionArgChecks {
-                    kind: *kind,
-                    first_arg: &args[0],
-                    whole: node,
-                },
-            ));
-            for arg in args.iter().rev() {
-                work.push(ExprValidateTask::Visit(arg));
-            }
-        }
-        Expr::SystemTask { name } => return Err(task_in_expression_error(name)),
         Expr::Identifier(name) => {
             let reg = session
                 .lookup(name)
@@ -1525,7 +1613,6 @@ fn visit_annotated<'b, 'a: 'b>(
     match &annot.kind {
         AnnotatedKind::Leaf => match annot.expr {
             Expr::Literal(_) | Expr::RealLiteral(_) => {}
-            Expr::SystemTask { name } => return Err(task_in_expression_error(name)),
             Expr::Identifier(name) => {
                 let reg = session
                     .lookup(name)
@@ -1539,6 +1626,17 @@ fn visit_annotated<'b, 'a: 'b>(
             }
             _ => unreachable!("AnnotatedKind::Leaf only wraps leaf-shaped Expr variants"),
         },
+        AnnotatedKind::SystemTask => {
+            // `$finish` / `$stop` in expression position. The lib driver
+            // (`apply_stmt`) catches the top-level case before evaluation
+            // runs and exits cleanly; any nested occurrence reaches here
+            // and is rejected with the task-in-expression diagnostic.
+            let name = match annot.expr {
+                Expr::SystemCall { name, .. } => name.as_str(),
+                _ => unreachable!("AnnotatedKind::SystemTask wraps only Expr::SystemCall"),
+            };
+            return Err(task_in_expression_error(name));
+        }
         AnnotatedKind::Grouped(inner) => work.push(AnnValidateTask::Visit(inner)),
         AnnotatedKind::Unary(operand) => {
             let op = match annot.expr {
@@ -1629,34 +1727,22 @@ fn visit_annotated<'b, 'a: 'b>(
                 session,
             )?;
         }
-        AnnotatedKind::SignCast(arg) => {
-            let signed = match annot.expr {
-                Expr::SignCast { signed, .. } => *signed,
-                _ => unreachable!(),
-            };
+        AnnotatedKind::SignCast { signed, arg } => {
             if arg.is_real() {
                 return Err(format!(
                     "{} argument cannot be real",
-                    if signed { "$signed" } else { "$unsigned" }
+                    if *signed { "$signed" } else { "$unsigned" }
                 ));
             }
             work.push(AnnValidateTask::Visit(arg));
         }
-        AnnotatedKind::BaseCast(arg) => {
-            let base = match annot.expr {
-                Expr::BaseCast { base, .. } => *base,
-                _ => unreachable!(),
-            };
+        AnnotatedKind::BaseCast { base, arg } => {
             if arg.is_real() {
-                return Err(format!("{} argument cannot be real", base_cast_name(base)));
+                return Err(format!("{} argument cannot be real", base_cast_name(*base)));
             }
             work.push(AnnValidateTask::Visit(arg));
         }
-        AnnotatedKind::RealConversion(arg) => {
-            let kind = match annot.expr {
-                Expr::RealConversion { kind, .. } => *kind,
-                _ => unreachable!(),
-            };
+        AnnotatedKind::RealConversion { kind, arg } => {
             match kind {
                 RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {}
                 RealConversionKind::IntegerToReal => {
@@ -1679,11 +1765,7 @@ fn visit_annotated<'b, 'a: 'b>(
             }
             work.push(AnnValidateTask::Visit(arg));
         }
-        AnnotatedKind::MathFunction(args) => {
-            let kind = match annot.expr {
-                Expr::MathFunction { kind, .. } => *kind,
-                _ => unreachable!(),
-            };
+        AnnotatedKind::MathFunction { kind, args } => {
             if !kind.is_real_result() && args[0].is_real() {
                 return Err(format!("{} argument cannot be real", kind.name()));
             }
@@ -1860,7 +1942,18 @@ fn evaluate_leaf_expr_in_context(
         Expr::RealLiteral(_) => {
             Err("real value cannot be used as an integer expression here".to_string())
         }
-        Expr::SystemTask { name } => Err(task_in_expression_error(name)),
+        // System-call leaves only arrive here for the task case
+        // (`AnnotatedKind::SystemTask`). The annotate pass routes math
+        // / cast / real-conversion calls through their own typed
+        // `AnnotatedKind` arms, so a non-task `Expr::SystemCall`
+        // reaching here would be a dispatch bug.
+        Expr::SystemCall { name, .. } => {
+            debug_assert!(matches!(
+                classify_system_call(name),
+                Ok(SystemCallKind::Task)
+            ));
+            Err(task_in_expression_error(name))
+        }
         // LRM A.8.3: a primary identifier resolves to its declared reg's
         // current value, then follows the same context-extension path a
         // literal does. An unknown name is the user's first sign that they
@@ -1898,11 +1991,7 @@ fn evaluate_leaf_expr_in_context(
         | Expr::Binary { .. }
         | Expr::Conditional { .. }
         | Expr::Concatenation { .. }
-        | Expr::Replication { .. }
-        | Expr::SignCast { .. }
-        | Expr::BaseCast { .. }
-        | Expr::RealConversion { .. }
-        | Expr::MathFunction { .. } => unreachable!(
+        | Expr::Replication { .. } => unreachable!(
             "evaluate_leaf_expr_in_context only handles AnnotatedKind::Leaf shapes; \
              {expr:?} should have its own AnnotatedKind arm in visit_eval"
         ),
@@ -2353,42 +2442,32 @@ fn visit_real_eval<'b, 'a: 'b>(
         AnnotatedKind::Concatenation(_) | AnnotatedKind::Replication { .. } => {
             unreachable!("concatenation/replication never has real result type");
         }
-        AnnotatedKind::SignCast(_) | AnnotatedKind::BaseCast(_) => {
+        AnnotatedKind::SignCast { .. } | AnnotatedKind::BaseCast { .. } => {
             unreachable!("$signed/$unsigned/$bin/$oct/$dec/$hex never has real result type");
         }
-        AnnotatedKind::RealConversion(arg) => {
-            let kind = match node.expr {
-                Expr::RealConversion { kind, .. } => *kind,
-                _ => unreachable!(),
-            };
-            match kind {
-                RealConversionKind::IntegerToReal => {
-                    // $itor: pop 1 IntegerValue (self-determined arg
-                    // evaluated via integer pipeline), push 1 f64 via
-                    // LRM 3.5.3 implicit conversion.
-                    work.push(EvalTask::RealCombine(RealCombiner::ItorFromInt));
-                    work.push(EvalTask::Visit {
-                        node: arg,
-                        ctx: None,
-                    });
-                }
-                RealConversionKind::BitsToReal => {
-                    work.push(EvalTask::RealCombine(RealCombiner::BitstoRealFromInt));
-                    work.push(EvalTask::Visit {
-                        node: arg,
-                        ctx: None,
-                    });
-                }
-                RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {
-                    unreachable!("integer-result conversions handled by integer pipeline");
-                }
+        AnnotatedKind::RealConversion { kind, arg } => match kind {
+            RealConversionKind::IntegerToReal => {
+                // $itor: pop 1 IntegerValue (self-determined arg
+                // evaluated via integer pipeline), push 1 f64 via
+                // LRM 3.5.3 implicit conversion.
+                work.push(EvalTask::RealCombine(RealCombiner::ItorFromInt));
+                work.push(EvalTask::Visit {
+                    node: arg,
+                    ctx: None,
+                });
             }
-        }
-        AnnotatedKind::MathFunction(args) => {
-            let kind = match node.expr {
-                Expr::MathFunction { kind, .. } => *kind,
-                _ => unreachable!(),
-            };
+            RealConversionKind::BitsToReal => {
+                work.push(EvalTask::RealCombine(RealCombiner::BitstoRealFromInt));
+                work.push(EvalTask::Visit {
+                    node: arg,
+                    ctx: None,
+                });
+            }
+            RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {
+                unreachable!("integer-result conversions handled by integer pipeline");
+            }
+        },
+        AnnotatedKind::MathFunction { kind, args } => {
             debug_assert!(
                 kind.is_real_result(),
                 "integer-result math function `{}` reached real driver",
@@ -2398,12 +2477,19 @@ fn visit_real_eval<'b, 'a: 'b>(
             // reverse — so args[0] visits first and lands at the bottom
             // of the popped slice.
             work.push(EvalTask::RealCombine(RealCombiner::MathFunction {
-                kind,
+                kind: *kind,
                 arity: args.len(),
             }));
             for arg in args.iter().rev() {
                 push_visit_as_real(arg, work);
             }
+        }
+        AnnotatedKind::SystemTask => {
+            let name = match node.expr {
+                Expr::SystemCall { name, .. } => name.as_str(),
+                _ => unreachable!("AnnotatedKind::SystemTask wraps only Expr::SystemCall"),
+            };
+            return Err(task_in_expression_error(name));
         }
         AnnotatedKind::Leaf => match node.expr {
             Expr::RealLiteral(value) => real_vals.push(*value),
@@ -2425,11 +2511,10 @@ fn visit_real_eval<'b, 'a: 'b>(
                 };
                 real_vals.push(evaluate_real_array_element_select(name, index, session)?);
             }
-            Expr::SystemTask { name } => return Err(task_in_expression_error(name)),
             Expr::Literal(_) => {
                 unreachable!("integer literal Leaf isn't real-typed; would be coerced earlier");
             }
-            _ => unreachable!("Leaf annotated kind only wraps Literal / RealLiteral / Identifier / Select / SystemTask"),
+            _ => unreachable!("Leaf annotated kind only wraps Literal / RealLiteral / Identifier / Select"),
         },
     }
     Ok(())
@@ -2585,29 +2670,21 @@ fn visit_eval<'b, 'a: 'b>(
         } => {
             visit_conditional_eval(cond, then_arm, else_arm, ctx, work, vals, real_vals, session)?;
         }
-        AnnotatedKind::SignCast(arg) => {
+        AnnotatedKind::SignCast { signed, arg } => {
             // LRM 5.5: argument is evaluated self-determined; the cast
             // re-stamps signedness; the result is then extended to the
             // outer context (extension follows propagated signedness per
             // §5.5.2). Visit arg with ctx=None; Combine does the rest.
-            let signed = match node.expr {
-                Expr::SignCast { signed, .. } => *signed,
-                _ => unreachable!(),
-            };
-            work.push(EvalTask::Combine(EvalCombiner::SignCast { signed, ctx }));
+            work.push(EvalTask::Combine(EvalCombiner::SignCast { signed: *signed, ctx }));
             work.push(EvalTask::Visit {
                 node: arg,
                 ctx: None,
             });
         }
-        AnnotatedKind::BaseCast(arg) => {
+        AnnotatedKind::BaseCast { base, arg } => {
             // Same shape as SignCast: arg self-determined, base re-stamped,
             // outer-context extended at combine time.
-            let base = match node.expr {
-                Expr::BaseCast { base, .. } => *base,
-                _ => unreachable!(),
-            };
-            work.push(EvalTask::Combine(EvalCombiner::BaseCast { base, ctx }));
+            work.push(EvalTask::Combine(EvalCombiner::BaseCast { base: *base, ctx }));
             work.push(EvalTask::Visit {
                 node: arg,
                 ctx: None,
@@ -2658,47 +2735,42 @@ fn visit_eval<'b, 'a: 'b>(
         // `real_vals` ready for the bridge to pop. Iterative across
         // any depth — alternating `$rtoi($itor(...))` is the case the
         // unified driver was added to handle.
-        AnnotatedKind::RealConversion(arg) => {
-            let kind = match node.expr {
-                Expr::RealConversion { kind, .. } => *kind,
-                _ => unreachable!("AnnotatedKind::RealConversion only wraps Expr::RealConversion"),
-            };
-            match kind {
-                RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {
-                    work.push(EvalTask::Combine(EvalCombiner::RealConversionToInt {
-                        kind,
-                        ctx,
-                    }));
-                    push_visit_as_real(arg, work);
-                }
-                RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => {
-                    unreachable!(
-                        "$itor / $bitstoreal are real-result; integer driver should not see them"
-                    );
-                }
+        AnnotatedKind::RealConversion { kind, arg } => match kind {
+            RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {
+                work.push(EvalTask::Combine(EvalCombiner::RealConversionToInt {
+                    kind: *kind,
+                    ctx,
+                }));
+                push_visit_as_real(arg, work);
             }
-        }
+            RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => {
+                unreachable!(
+                    "$itor / $bitstoreal are real-result; integer driver should not see them"
+                );
+            }
+        },
         // Math function: the only integer-result kind is `$clog2`. Real-
         // result math functions (Pow, Atan2, ..., real-arity-1 family)
         // are handled by the real driver, never by `visit_eval`.
-        AnnotatedKind::MathFunction(args) => {
-            let kind = match node.expr {
-                Expr::MathFunction { kind, .. } => *kind,
-                _ => unreachable!("AnnotatedKind::MathFunction only wraps Expr::MathFunction"),
-            };
-            match kind {
-                MathFunctionKind::Clog2 => {
-                    debug_assert_eq!(args.len(), 1, "$clog2 has arity 1");
-                    work.push(EvalTask::Combine(EvalCombiner::Clog2 { ctx }));
-                    work.push(EvalTask::Visit {
-                        node: &args[0],
-                        ctx: None,
-                    });
-                }
-                _ => unreachable!(
-                    "real-result math functions handled by evaluate_annotated_as_real"
-                ),
+        AnnotatedKind::MathFunction { kind, args } => match kind {
+            MathFunctionKind::Clog2 => {
+                debug_assert_eq!(args.len(), 1, "$clog2 has arity 1");
+                work.push(EvalTask::Combine(EvalCombiner::Clog2 { ctx }));
+                work.push(EvalTask::Visit {
+                    node: &args[0],
+                    ctx: None,
+                });
             }
+            _ => unreachable!(
+                "real-result math functions handled by evaluate_annotated_as_real"
+            ),
+        },
+        AnnotatedKind::SystemTask => {
+            let name = match node.expr {
+                Expr::SystemCall { name, .. } => name.as_str(),
+                _ => unreachable!("AnnotatedKind::SystemTask wraps only Expr::SystemCall"),
+            };
+            return Err(task_in_expression_error(name));
         }
         // Leaves (Literal, Identifier, Select, SystemTask) are evaluated
         // by `evaluate_leaf_expr_in_context`. They have no children deeper
@@ -3857,53 +3929,57 @@ fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
                         work.push(InferMetaTask::Visit(item));
                     }
                 }
-                // LRM 5.5: width / base from the argument; signedness from
-                // the cast.
-                Expr::SignCast { signed, arg } => {
-                    work.push(InferMetaTask::Combine(InferMetaCombiner::SignCast {
-                        signed: *signed,
-                    }));
-                    work.push(InferMetaTask::Visit(arg));
-                }
-                // Display-base cast: width / signedness from the argument,
-                // only the base flips to the cast target.
-                Expr::BaseCast { base, arg } => {
-                    work.push(InferMetaTask::Combine(InferMetaCombiner::BaseCast {
-                        base: *base,
-                    }));
-                    work.push(InferMetaTask::Visit(arg));
-                }
+                // `$name(args)`: dispatch by classified kind. Sign /
+                // base casts inherit width / base from the argument.
                 // LRM 17.8: $rtoi → 32-bit signed; $realtobits → 64-bit
-                // unsigned. Real-result variants ($itor / $bitstoreal)
-                // shouldn't reach the integer pipeline.
-                Expr::RealConversion { kind, .. } => match kind {
-                    RealConversionKind::RealToInteger => vals.push(ExprMeta {
-                        width: 32,
-                        signed: true,
-                        base: Base::Decimal,
-                    }),
-                    RealConversionKind::RealToBits => vals.push(ExprMeta {
-                        width: 64,
-                        signed: false,
-                        base: Base::Hex,
-                    }),
-                    RealConversionKind::IntegerToReal | RealConversionKind::BitsToReal => {
-                        return Err("real value has no integer width or signedness".to_string());
+                // unsigned hex; the real-result variants ($itor / $bitstoreal)
+                // shouldn't reach the integer pipeline. LRM 17.11:
+                // $clog2 yields 32-bit signed; real-result math functions
+                // have no integer meta. Tasks reject up-front.
+                Expr::SystemCall { name, args } => {
+                    let kind = classify_system_call(name)?;
+                    match kind {
+                        SystemCallKind::SignCast { signed } => {
+                            work.push(InferMetaTask::Combine(InferMetaCombiner::SignCast { signed }));
+                            work.push(InferMetaTask::Visit(&args[0]));
+                        }
+                        SystemCallKind::BaseCast(base) => {
+                            work.push(InferMetaTask::Combine(InferMetaCombiner::BaseCast { base }));
+                            work.push(InferMetaTask::Visit(&args[0]));
+                        }
+                        SystemCallKind::RealConversion(conv_kind) => match conv_kind {
+                            RealConversionKind::RealToInteger => vals.push(ExprMeta {
+                                width: 32,
+                                signed: true,
+                                base: Base::Decimal,
+                            }),
+                            RealConversionKind::RealToBits => vals.push(ExprMeta {
+                                width: 64,
+                                signed: false,
+                                base: Base::Hex,
+                            }),
+                            RealConversionKind::IntegerToReal
+                            | RealConversionKind::BitsToReal => {
+                                return Err(
+                                    "real value has no integer width or signedness".to_string(),
+                                );
+                            }
+                        },
+                        SystemCallKind::Math(math_kind) => {
+                            if math_kind.is_real_result() {
+                                return Err(
+                                    "real value has no integer width or signedness".to_string(),
+                                );
+                            }
+                            vals.push(ExprMeta {
+                                width: 32,
+                                signed: true,
+                                base: Base::Decimal,
+                            });
+                        }
+                        SystemCallKind::Task => return Err(task_in_expression_error(name)),
                     }
-                },
-                // LRM 17.11: $clog2 yields 32-bit signed; real-result math
-                // functions have no integer meta.
-                Expr::MathFunction { kind, .. } => {
-                    if kind.is_real_result() {
-                        return Err("real value has no integer width or signedness".to_string());
-                    }
-                    vals.push(ExprMeta {
-                        width: 32,
-                        signed: true,
-                        base: Base::Decimal,
-                    });
                 }
-                Expr::SystemTask { name } => return Err(task_in_expression_error(name)),
                 // A reg's meta is exactly the IntegerValue's stored
                 // (width, signed, base) — same shape `Expr::Literal`
                 // produces from its value.
@@ -4282,17 +4358,14 @@ fn is_indefinite_width(expr: &Expr) -> bool {
                 work.push(then_expr);
                 work.push(else_expr);
             }
-            // Concat/replication, casts, conversions, math functions,
-            // system tasks, identifiers, and selects all have definite
-            // widths fixed by their form (LRM 5.1.14, 17.7-17.11) — see
-            // the original recursive comments for per-arm reasoning.
+            // Concat/replication, system calls (casts, conversions, math
+            // functions, tasks), identifiers, and selects all have
+            // definite widths fixed by their form (LRM 5.1.14, 17.7-17.11).
+            // Per-form reasoning lives on the original recursive walker;
+            // here we just collapse them all into "no indefinite width".
             Expr::Concatenation { .. }
             | Expr::Replication { .. }
-            | Expr::SignCast { .. }
-            | Expr::BaseCast { .. }
-            | Expr::RealConversion { .. }
-            | Expr::MathFunction { .. }
-            | Expr::SystemTask { .. }
+            | Expr::SystemCall { .. }
             | Expr::Identifier(_)
             | Expr::Select { .. } => {}
             Expr::Truncated => unreachable!(
@@ -4344,8 +4417,10 @@ fn evaluate_replication_count(count_expr: &Expr, session: &Session) -> Result<us
 
 // Walk through `Grouped` wrappers without evaluating. Used so that
 // `({0{1'b1}})` is treated the same as `{0{1'b1}}` when the parent is
-// looking for a Replication child to allow zero replication on.
-fn unwrap_grouped(expr: &Expr) -> &Expr {
+// looking for a Replication child to allow zero replication on, and
+// by `apply_stmt` in lib.rs to spot a top-level `$finish` / `$stop`
+// wrapped in redundant parens.
+pub(crate) fn unwrap_grouped(expr: &Expr) -> &Expr {
     let mut cur = expr;
     while let Expr::Grouped(inner) = cur {
         cur = inner;
@@ -4626,17 +4701,21 @@ fn visit_bigint_eval<'a>(
         Expr::Conditional { .. }
         | Expr::Concatenation { .. }
         | Expr::Replication { .. }
-        | Expr::SignCast { .. }
-        | Expr::BaseCast { .. }
-        | Expr::RealConversion { .. }
-        | Expr::MathFunction { .. }
         | Expr::Identifier(_)
         | Expr::Select { .. } => {
             vals.push(value_to_math_bigint(evaluate_subexpr_as_integer(
                 expr, session,
             )?)?);
         }
-        Expr::SystemTask { name } => return Err(task_in_expression_error(name)),
+        // `$name(args)`: route through the iterative integer pipeline,
+        // which surfaces "task in expression position" for $finish /
+        // $stop via the annotated SystemTask arm. Math / cast /
+        // conversion calls all collapse to a bigint here.
+        Expr::SystemCall { .. } => {
+            vals.push(value_to_math_bigint(evaluate_subexpr_as_integer(
+                expr, session,
+            )?)?);
+        }
         Expr::Truncated => unreachable!(
             "Expr::Truncated is a display-only sentinel; never reaches evaluate_expr_as_math_bigint"
         ),

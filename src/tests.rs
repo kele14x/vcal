@@ -4,7 +4,7 @@ use num_bigint::BigInt;
 
 use crate::lexer::{Token, tokenize};
 use crate::parser::{
-    BinaryOp, Expr, MathFunctionKind, RealConversionKind, UnaryOp, parse_expression,
+    BinaryOp, Expr, UnaryOp, parse_expression,
     parse_integer,
 };
 use crate::{Session, evaluate_input, parse_input, parse_input_with_depth, run_repl};
@@ -503,17 +503,18 @@ fn grouped_system_task_still_exits() {
 
 // Identifier match is exact: `$finisher` is a valid system_function_identifier
 // per LRM A.9.3 but is not in vcal's supported set, so it surfaces the
-// generic "unsupported" message rather than the task-in-expression one.
+// validator's "unknown system identifier" message rather than the
+// task-in-expression one.
 #[test]
 fn task_like_identifier_with_trailing_chars_is_unknown_function() {
     let error = evaluate_input("$finisher").expect_err("$finisher is not supported");
     assert!(
-        error.contains("unsupported system function: $finisher"),
+        error.contains("unknown system identifier: $finisher"),
         "got: {error}"
     );
     let error = evaluate_input("$stop_clock").expect_err("$stop_clock is not supported");
     assert!(
-        error.contains("unsupported system function: $stop_clock"),
+        error.contains("unknown system identifier: $stop_clock"),
         "got: {error}"
     );
 }
@@ -2926,15 +2927,19 @@ fn sign_cast_propagates_unknown_bits() {
 #[test]
 fn rejects_unknown_system_function() {
     let err = evaluate_input("$bogus(1)").expect_err("unknown $-function should error");
-    assert_eq!(err, "Syntax error: unsupported system function: $bogus");
+    assert_eq!(err, "Semantic error: unknown system identifier: $bogus");
 }
 
 #[test]
 fn rejects_sign_cast_missing_parenthesis() {
+    // Parser no longer demands `(` after `$signed` — bare `$signed`
+    // parses as a zero-arg call, then the validator surfaces the arity
+    // error. `$signed 1` has trailing input after the zero-arg call,
+    // which the statement-level parser flags as the leftover.
     let missing_open = evaluate_input("$signed 1").expect_err("missing `(` should error");
     let missing_close = evaluate_input("$signed(1").expect_err("missing `)` should error");
 
-    assert_eq!(missing_open, "Syntax error: expected `(` after $signed");
+    assert_eq!(missing_open, "Syntax error: unexpected token after end of statement");
     assert_eq!(missing_close, "Syntax error: expected `)` after $signed argument");
 }
 
@@ -3027,10 +3032,12 @@ fn rejects_base_cast_on_real() {
 
 #[test]
 fn rejects_base_cast_missing_parenthesis() {
+    // See `rejects_sign_cast_missing_parenthesis` for the rationale —
+    // bare `$bin` is a zero-arg call now; `1` is leftover.
     let missing_open = evaluate_input("$bin 1").expect_err("missing `(` should error");
     let missing_close = evaluate_input("$bin(1").expect_err("missing `)` should error");
 
-    assert_eq!(missing_open, "Syntax error: expected `(` after $bin");
+    assert_eq!(missing_open, "Syntax error: unexpected token after end of statement");
     assert_eq!(missing_close, "Syntax error: expected `)` after $bin argument");
 }
 
@@ -3932,13 +3939,14 @@ fn real_conversions_widen_per_outer_context() {
     );
 }
 
-// Parentheses are required after each new $-function, mirroring
-// $signed/$unsigned diagnostics.
+// Same parser/validator split as the sign-cast diagnostics: bare
+// `$rtoi` parses as a zero-arg call; the leftover `1.0` is the
+// statement-level trailing-token error.
 #[test]
 fn rejects_real_conversion_missing_parenthesis() {
     assert_eq!(
         evaluate_input("$rtoi 1.0").expect_err("missing `(`"),
-        "Syntax error: expected `(` after $rtoi"
+        "Syntax error: unexpected token after end of statement"
     );
     assert_eq!(
         evaluate_input("$itor(1").expect_err("missing `)`"),
@@ -4210,12 +4218,16 @@ fn real_math_nan_and_infinity_propagate() {
     );
 }
 
-// Parser: missing parens, wrong arity.
+// Parser + validator diagnostics for $name(args). Parser is purely
+// syntactic (parses bare `$name` as a zero-arg call, leaves arity /
+// name-table checks to the validator), so `$sqrt 4.0` lands as
+// `$sqrt` + leftover `4.0`. Arity / unknown-name errors come from
+// `Semantic error:` (validator), unchanged in wording.
 #[test]
 fn math_function_parser_errors() {
     assert_eq!(
-        evaluate_input("$sqrt 4.0").expect_err("missing `(`"),
-        "Syntax error: expected `(` after $sqrt"
+        evaluate_input("$sqrt 4.0").expect_err("missing `(`, trailing input"),
+        "Syntax error: unexpected token after end of statement"
     );
     assert_eq!(
         evaluate_input("$pow(2.0").expect_err("missing `)`"),
@@ -4223,15 +4235,15 @@ fn math_function_parser_errors() {
     );
     assert_eq!(
         evaluate_input("$pow(1.0)").expect_err("$pow 1 arg"),
-        "Syntax error: $pow expects 2 arguments, got 1"
+        "Semantic error: $pow expects 2 arguments, got 1"
     );
     assert_eq!(
         evaluate_input("$sqrt(1.0, 2.0)").expect_err("$sqrt 2 args"),
-        "Syntax error: $sqrt expects 1 argument, got 2"
+        "Semantic error: $sqrt expects 1 argument, got 2"
     );
     assert_eq!(
         evaluate_input("$clog2(1, 2)").expect_err("$clog2 2 args"),
-        "Syntax error: $clog2 expects 1 argument, got 2"
+        "Semantic error: $clog2 expects 1 argument, got 2"
     );
 }
 
@@ -7257,7 +7269,7 @@ fn parses_deeply_nested_system_function_without_overflow() {
     // `Pending::SystemArgs` frame; depth is bounded by heap.
     let input: String = "$signed(".repeat(100_000) + "4'sd1" + &")".repeat(100_000);
     let expr = parse_expression(&input).expect("deep $signed should parse");
-    assert!(matches!(&expr, Expr::SignCast { .. }));
+    assert!(matches!(&expr, Expr::SystemCall { name, .. } if name == "$signed"));
 }
 
 #[test]
@@ -7276,7 +7288,7 @@ fn parses_deeply_nested_math_function_without_overflow() {
         input.push(')');
     }
     let expr = parse_expression(&input).expect("deep $pow should parse");
-    assert!(matches!(&expr, Expr::MathFunction { .. }));
+    assert!(matches!(&expr, Expr::SystemCall { name, .. } if name == "$pow"));
 }
 
 #[test]
@@ -7295,7 +7307,7 @@ fn parses_deeply_nested_concat_inside_replication_inside_signed_without_overflow
         input.push_str("}})");
     }
     let expr = parse_expression(&input).expect("deep mixed should parse");
-    assert!(matches!(&expr, Expr::SignCast { .. }));
+    assert!(matches!(&expr, Expr::SystemCall { name, .. } if name == "$signed"));
 }
 
 #[test]
@@ -7745,8 +7757,8 @@ fn evaluate_of_deep_real_math_chain_does_not_overflow() {
     // work-stack growth, not Rust-stack growth.
     let mut e = Expr::RealLiteral(1.0);
     for _ in 0..50_000 {
-        e = Expr::MathFunction {
-            kind: MathFunctionKind::Ln,
+        e = Expr::SystemCall {
+            name: "$ln".to_string(),
             args: vec![e],
         };
     }
@@ -7765,8 +7777,8 @@ fn evaluate_of_deep_pow_chain_does_not_overflow() {
     // crashed pre-fix at ~10K depth.
     let mut e = Expr::Literal(parse_integer("1").expect("inner literal"));
     for _ in 0..50_000 {
-        e = Expr::MathFunction {
-            kind: MathFunctionKind::Pow,
+        e = Expr::SystemCall {
+            name: "$pow".to_string(),
             args: vec![Expr::Literal(parse_integer("2").expect("base literal")), e],
         };
     }
@@ -7783,8 +7795,8 @@ fn evaluate_of_deep_clog2_chain_does_not_overflow() {
     // `EvalCombiner::Clog2` bridge.
     let mut e = Expr::Literal(parse_integer("4").expect("inner literal"));
     for _ in 0..50_000 {
-        e = Expr::MathFunction {
-            kind: MathFunctionKind::Clog2,
+        e = Expr::SystemCall {
+            name: "$clog2".to_string(),
             args: vec![e],
         };
     }
@@ -7802,14 +7814,14 @@ fn evaluate_of_deep_rtoi_itor_alternation_does_not_overflow() {
     let mut e = Expr::Literal(parse_integer("1").expect("inner literal"));
     for i in 0..50_000usize {
         e = if i.is_multiple_of(2) {
-            Expr::RealConversion {
-                kind: RealConversionKind::IntegerToReal,
-                arg: Box::new(e),
+            Expr::SystemCall {
+                name: "$itor".to_string(),
+                args: vec![e],
             }
         } else {
-            Expr::RealConversion {
-                kind: RealConversionKind::RealToInteger,
-                arg: Box::new(e),
+            Expr::SystemCall {
+                name: "$rtoi".to_string(),
+                args: vec![e],
             }
         };
     }
@@ -7827,14 +7839,14 @@ fn evaluate_of_deep_realtobits_bitstoreal_alternation_does_not_overflow() {
     let mut e = Expr::RealLiteral(1.0);
     for i in 0..30_000usize {
         e = if i.is_multiple_of(2) {
-            Expr::RealConversion {
-                kind: RealConversionKind::RealToBits,
-                arg: Box::new(e),
+            Expr::SystemCall {
+                name: "$realtobits".to_string(),
+                args: vec![e],
             }
         } else {
-            Expr::RealConversion {
-                kind: RealConversionKind::BitsToReal,
-                arg: Box::new(e),
+            Expr::SystemCall {
+                name: "$bitstoreal".to_string(),
+                args: vec![e],
             }
         };
     }
@@ -7860,8 +7872,8 @@ fn evaluate_of_pow_with_deep_integer_arg_does_not_overflow() {
             rhs: Box::new(Expr::Literal(parse_integer("1").expect("step literal"))),
         };
     }
-    let e = Expr::MathFunction {
-        kind: MathFunctionKind::Pow,
+    let e = Expr::SystemCall {
+        name: "$pow".to_string(),
         args: vec![Expr::Literal(parse_integer("2").expect("base literal")), chain],
     };
     let session = Session::new();
@@ -7882,9 +7894,9 @@ fn evaluate_of_itor_with_deep_integer_arg_does_not_overflow() {
             rhs: Box::new(Expr::Literal(parse_integer("1").expect("step literal"))),
         };
     }
-    let e = Expr::RealConversion {
-        kind: RealConversionKind::IntegerToReal,
-        arg: Box::new(chain),
+    let e = Expr::SystemCall {
+        name: "$itor".to_string(),
+        args: vec![chain],
     };
     let session = Session::new();
     let value =

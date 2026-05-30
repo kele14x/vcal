@@ -225,6 +225,14 @@ run_case "eval lvalue-concat        {{{..a}}} = 1"     "n=$EVAL_DEPTH; print('re
 run_case "eval lvalue-wide-concat   {a,a,..,a} = ..."  "n=$EVAL_DEPTH; print('reg a;'); print('{a' + ',a'*n + '}=' + str(n+1) + \"'b\" + '0'*(n+1) + ';')"
 
 # ============================================================
+# Top-level system task wrapped in parens. After the system-
+# identifier parser unification, the lib driver walks parens
+# iteratively via `unwrap_grouped` to spot a top-level `$finish`
+# / `$stop` and exit — no more recursive `top_level_task_name`.
+# ============================================================
+run_case "eval paren-wrapped-finish ((( \$finish )))"  "n=$EVAL_DEPTH; print('(' * n + '\$finish' + ')' * n)"
+
+# ============================================================
 # Summary
 # ============================================================
 echo

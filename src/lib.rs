@@ -343,14 +343,25 @@ fn evaluate_input_with_session(
 // Drives a single top-level Stmt. Decls mutate the session and emit no Out
 // text (mirroring how `$finish`/`$stop` show an empty Out line). Assignments
 // mutate the session and emit the reg's new canonical form. Expression
-// statements just evaluate.
+// statements just evaluate — except that an `Expr::SystemCall` whose name
+// classifies as a task (LRM 17.4: `$finish` / `$stop`) is hoisted to an
+// exit here, since tasks have no expression value. The hoist walks
+// through `Grouped` layers via the iterative `unwrap_grouped` so
+// `((($finish)))` exits cleanly without paying for a recursive walker.
+// Args on the SystemCall are parsed for syntactic validity but never
+// evaluated — vcal does not print exit diagnostics, so the message-
+// verbosity argument (LRM 17.4) has no observable effect.
 fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), String> {
     match stmt {
         Stmt::Expr(expr) => {
+            if let Expr::SystemCall { name, .. } = eval::unwrap_grouped(expr)
+                && matches!(eval::classify_system_call(name), Ok(eval::SystemCallKind::Task))
+            {
+                return Ok((String::new(), true));
+            }
             let value = eval::evaluate_expr(expr, session)?;
             Ok((value.canonical(), false))
         }
-        Stmt::Task(_) => Ok((String::new(), true)),
         Stmt::Decl {
             kind,
             signed,
