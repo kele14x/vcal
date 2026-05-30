@@ -209,16 +209,15 @@ run_case "eval signed-of-concat     \$signed({1+1+..+1})"      "n=$EVAL_DEPTH; p
 run_case "eval mixed-binary-ops     1+1*1-1&1|1^1.."   "n=$EVAL_DEPTH; ops=['+','*','-','&','|','^']; print('1' + ''.join(ops[i%len(ops)]+'1' for i in range(n)))"
 
 # ============================================================
-# LValue concat: noted as out-of-scope by the iterative-eval
-# plan — `expression_to_lvalue` / `lvalue_meta` /
-# `flatten_lvalue_leaves` still recurse, and there is no
-# `impl Drop for LValue`. Kept here so the harness records the
-# regression site; will start passing once that work lands.
+# LValue concat: `{{{..a}}} = 1` exercises `expression_to_lvalue`
+# (parser-side Expr→LValue), `lvalue_meta` (LRM 5.6 LHS context
+# derivation), and `flatten_lvalue_leaves` (bit-distribution walker).
+# All three are now iterative; `impl Drop for LValue` mirrors
+# `impl Drop for Expr` so the resulting deep `Box<LValue>` chain drops
+# without overflow.
 # ============================================================
-echo
-echo "=== known-failing (out-of-scope: LValue concat recursion) ==="
-
 run_case "eval lvalue-concat        {{{..a}}} = 1"     "n=$EVAL_DEPTH; print('reg a;'); print('{'*n + 'a' + '}'*n + '=1;')"
+run_case "eval lvalue-wide-concat   {a,a,..,a} = ..."  "n=$EVAL_DEPTH; print('reg a;'); print('{a' + ',a'*n + '}=' + str(n+1) + \"'b\" + '0'*(n+1) + ';')"
 
 # ============================================================
 # Summary

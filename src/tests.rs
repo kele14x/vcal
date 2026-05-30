@@ -7893,6 +7893,56 @@ fn evaluate_of_itor_with_deep_integer_arg_does_not_overflow() {
 }
 
 #[test]
+fn assign_with_deeply_nested_lvalue_concat_does_not_overflow() {
+    // `{{{...{a}...}}} = 1'b1` — pre-fix this crashed at ~50K depth
+    // because `expression_to_lvalue` recursed on Concat items,
+    // `lvalue_meta` walked Concat layers recursively, and
+    // `flatten_lvalue_leaves` did too. Plus the resulting
+    // `Box<LValue>` chain dropped recursively at end of scope without
+    // an `impl Drop for LValue`. All four sites are now iterative.
+    let depth = 50_000usize;
+    let mut input = String::with_capacity(depth * 2 + 16);
+    input.push_str("reg a;");
+    for _ in 0..depth {
+        input.push('{');
+    }
+    input.push('a');
+    for _ in 0..depth {
+        input.push('}');
+    }
+    input.push_str("=1'b1");
+    let mut session = Session::new();
+    session
+        .eval(&input)
+        .expect("deep lvalue concat assignment evaluates without overflow");
+}
+
+#[test]
+fn assign_with_wide_lvalue_concat_does_not_overflow() {
+    // `{a,a,...,a} = N'b0...0` — the wide-flat shape of the same
+    // path. Exercises `flatten_lvalue_leaves` over a single Concat
+    // with thousands of sibling items rather than a deep stack.
+    let count = 30_000usize;
+    let mut input = String::with_capacity(count * 4 + 32);
+    input.push_str("reg a;");
+    input.push('{');
+    input.push('a');
+    for _ in 0..count {
+        input.push_str(",a");
+    }
+    input.push_str("}=");
+    input.push_str(&(count + 1).to_string());
+    input.push_str("'b");
+    for _ in 0..(count + 1) {
+        input.push('0');
+    }
+    let mut session = Session::new();
+    session
+        .eval(&input)
+        .expect("wide lvalue concat assignment evaluates without overflow");
+}
+
+#[test]
 fn parse_input_returns_ast_without_evaluating() {
     // The --parse-only debug entry point: parser runs, AST renders via
     // {:#?}, validation/evaluation are skipped. We just check the render

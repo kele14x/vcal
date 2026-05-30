@@ -6316,7 +6316,80 @@ pub(crate) fn evaluate_lvalue_assignment(
 // even looked at. Returning an `ExprMeta` keeps the call shape parallel
 // to `infer_expr_meta` so the surrounding context-propagation story
 // stays one-paradigm.
-fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
+//
+// Iterative CES driver to handle `{{{...a}}}` deep-concat lvalues
+// without overflowing the C stack on a recursive `lvalue_meta(item)`.
+// Concat layers push a `BuildConcat(n)` followed by Visit tasks for
+// each item; non-Concat shapes (Name / Select) compute their leaf meta
+// inline and push the result on `vals`.
+fn lvalue_meta(root: &LValue, session: &Session) -> Result<ExprMeta, String> {
+    let mut work: Vec<LValueMetaTask> = vec![LValueMetaTask::Visit(root)];
+    let mut vals: Vec<ExprMeta> = Vec::new();
+    while let Some(task) = work.pop() {
+        match task {
+            LValueMetaTask::Visit(lvalue) => visit_lvalue_meta(lvalue, &mut work, &mut vals, session)?,
+            LValueMetaTask::BuildConcat(count) => {
+                let start = vals.len() - count;
+                let mut total_width = 0usize;
+                let mut leftmost_base = Base::Binary;
+                for (idx, item_meta) in vals.drain(start..).enumerate() {
+                    total_width = total_width.saturating_add(item_meta.width);
+                    if idx == 0 {
+                        leftmost_base = item_meta.base;
+                    }
+                }
+                if total_width == 0 {
+                    return Err(
+                        "lvalue must have at least one operand with positive size".to_string(),
+                    );
+                }
+                vals.push(ExprMeta {
+                    width: total_width,
+                    signed: false,
+                    base: leftmost_base,
+                });
+            }
+        }
+    }
+    debug_assert_eq!(
+        vals.len(),
+        1,
+        "lvalue_meta produced {} values",
+        vals.len()
+    );
+    Ok(vals.pop().expect("driver invariant: one root produces one ExprMeta"))
+}
+
+enum LValueMetaTask<'a> {
+    Visit(&'a LValue),
+    BuildConcat(usize),
+}
+
+fn visit_lvalue_meta<'a>(
+    lvalue: &'a LValue,
+    work: &mut Vec<LValueMetaTask<'a>>,
+    vals: &mut Vec<ExprMeta>,
+    session: &Session,
+) -> Result<(), String> {
+    if let LValue::Concat(items) = lvalue {
+        if items.is_empty() {
+            return Err("lvalue concatenation requires at least one operand".to_string());
+        }
+        work.push(LValueMetaTask::BuildConcat(items.len()));
+        for item in items.iter().rev() {
+            work.push(LValueMetaTask::Visit(item));
+        }
+        return Ok(());
+    }
+    let meta = leaf_lvalue_meta(lvalue, session)?;
+    vals.push(meta);
+    Ok(())
+}
+
+// Leaf-only LValue meta: Name and Select. Concat is dispatched by
+// `visit_lvalue_meta` onto the iterative work stack; Truncated never
+// reaches here.
+fn leaf_lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
     match lvalue {
         LValue::Name(name) => {
             let reg = session
@@ -6447,27 +6520,8 @@ fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
                 })
             }
         }
-        LValue::Concat(items) => {
-            if items.is_empty() {
-                return Err("lvalue concatenation requires at least one operand".to_string());
-            }
-            let mut total_width = 0usize;
-            let mut leftmost_base = Base::Binary;
-            for (idx, item) in items.iter().enumerate() {
-                let item_meta = lvalue_meta(item, session)?;
-                total_width = total_width.saturating_add(item_meta.width);
-                if idx == 0 {
-                    leftmost_base = item_meta.base;
-                }
-            }
-            if total_width == 0 {
-                return Err("lvalue must have at least one operand with positive size".to_string());
-            }
-            Ok(ExprMeta {
-                width: total_width,
-                signed: false,
-                base: leftmost_base,
-            })
+        LValue::Concat(_) => {
+            unreachable!("Concat is dispatched iteratively by visit_lvalue_meta")
         }
         LValue::Truncated => {
             unreachable!("LValue::Truncated is a display-only sentinel; never reaches lvalue_meta")
@@ -6479,17 +6533,25 @@ fn lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, String> {
 // write-collision pass and the bit-distribution pass; both walk the
 // resulting slice in reverse so the rightmost leaf consumes the LSB end
 // of the RHS bit stream.
-fn flatten_lvalue_leaves<'a>(lvalue: &'a LValue, out: &mut Vec<&'a LValue>) {
-    match lvalue {
-        LValue::Name(_) | LValue::Select { .. } => out.push(lvalue),
-        LValue::Concat(items) => {
-            for item in items {
-                flatten_lvalue_leaves(item, out);
+//
+// Iterative to handle `{{{...a}}} = 1` deep-nested concat lvalues
+// without overflowing the C stack. A heap worklist of LValue refs
+// expands Concat layers into their items (pushed in reverse so the
+// leftmost item is popped first, preserving MSB-side-first leaf order).
+fn flatten_lvalue_leaves<'a>(root: &'a LValue, out: &mut Vec<&'a LValue>) {
+    let mut work: Vec<&'a LValue> = vec![root];
+    while let Some(lvalue) = work.pop() {
+        match lvalue {
+            LValue::Name(_) | LValue::Select { .. } => out.push(lvalue),
+            LValue::Concat(items) => {
+                for item in items.iter().rev() {
+                    work.push(item);
+                }
             }
+            LValue::Truncated => unreachable!(
+                "LValue::Truncated is a display-only sentinel; never reaches flatten_lvalue_leaves"
+            ),
         }
-        LValue::Truncated => unreachable!(
-            "LValue::Truncated is a display-only sentinel; never reaches flatten_lvalue_leaves"
-        ),
     }
 }
 

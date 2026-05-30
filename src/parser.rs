@@ -425,6 +425,38 @@ fn steal_select_kind_children(kind: &mut SelectKind, out: &mut Vec<Expr>) {
     }
 }
 
+// Iterative Drop for LValue, mirroring `impl Drop for Expr` above. The
+// `LValue::Concat(Vec<LValue>)` shape is the deep one: `{{{...a}}} = 1`
+// nests a Concat per layer, and the auto-derived destructor would walk
+// the chain recursively. Flatten with a heap worklist and replace stolen
+// children with cheap `LValue::Name(String::new())` leaves so the auto-
+// drop after this method returns is shallow.
+//
+// `SelectKind` sub-expressions hang off `LValue::Select` via Box<Expr>
+// (Bit index / range bounds / indexed-base+width). The Drop on those
+// Boxes routes through `impl Drop for Expr` above, which is already
+// iterative — so we don't need to flatten SelectKind contents here.
+impl Drop for LValue {
+    fn drop(&mut self) {
+        let mut work: Vec<LValue> = Vec::new();
+        steal_lvalue_children(self, &mut work);
+        while let Some(mut victim) = work.pop() {
+            steal_lvalue_children(&mut victim, &mut work);
+            // victim's children are now leaves; auto-drop at end of this
+            // iteration is shallow.
+        }
+    }
+}
+
+fn steal_lvalue_children(lvalue: &mut LValue, out: &mut Vec<LValue>) {
+    match lvalue {
+        LValue::Name(_) | LValue::Select { .. } | LValue::Truncated => {}
+        LValue::Concat(items) => {
+            out.append(items);
+        }
+    }
+}
+
 // Top-level inputs. A REPL line / piped script segment between semicolons is
 // one `Stmt`. Expressions still drive the evaluator, but declarations and
 // blocking assignments mutate the session rather than producing a value.
@@ -1719,44 +1751,89 @@ fn top_level_task_name(expr: &Expr) -> Option<String> {
 // extract owned data while leaving each `Expr` in a leaf-shaped state
 // for its drop. The leading-Grouped peel is also iterative so an
 // `((((a))))` LHS doesn't recurse N levels.
-fn expression_to_lvalue(mut expr: Expr) -> Result<LValue, String> {
+//
+// The Concat arm is also iterative: `{{{...a}}} = 1` nests a
+// `Concatenation` per layer, and a recursive `.map(expression_to_lvalue)`
+// would overflow at ~50K depth on the default thread stack. Use a
+// `Visit`/`BuildConcat` CES driver so depth becomes heap-allocated work-
+// stack growth rather than C-stack frames.
+fn expression_to_lvalue(root: Expr) -> Result<LValue, String> {
     let placeholder = || Expr::Identifier(String::new());
+    let mut work: Vec<LValueTask> = vec![LValueTask::Visit(root)];
+    let mut vals: Vec<LValue> = Vec::new();
 
-    while let Expr::Grouped(inner) = &mut expr {
-        expr = std::mem::replace(inner.as_mut(), placeholder());
+    while let Some(task) = work.pop() {
+        match task {
+            LValueTask::Visit(mut expr) => {
+                while let Expr::Grouped(inner) = &mut expr {
+                    expr = std::mem::replace(inner.as_mut(), placeholder());
+                }
+                match &mut expr {
+                    Expr::Identifier(name) => {
+                        vals.push(LValue::Name(std::mem::take(name)));
+                    }
+                    // Chained selects (`a[i][m:l]`) pass straight through: on
+                    // the LHS the evaluator routes the array-element + inner-
+                    // select case through the same per-position distribution
+                    // path the vector-reg LHS uses (LRM 4.9). The structural
+                    // validation (only `Bit` outer on an array, inner
+                    // forbidden on a vector, inner part-select direction
+                    // matches the element's packed range) happens in
+                    // `lvalue_meta`, so the parser stays purely syntactic
+                    // here.
+                    Expr::Select { name, kind, inner } => {
+                        let name = std::mem::take(name);
+                        let kind_placeholder = SelectKind::Bit {
+                            index: Box::new(placeholder()),
+                        };
+                        let kind = std::mem::replace(kind, kind_placeholder);
+                        let inner = inner.take();
+                        vals.push(LValue::Select { name, kind, inner });
+                    }
+                    Expr::Concatenation { items } => {
+                        let items = std::mem::take(items);
+                        let count = items.len();
+                        work.push(LValueTask::BuildConcat(count));
+                        // Push in reverse so items[0] visits first, lands
+                        // first on `vals`, and BuildConcat drains them in
+                        // source order.
+                        for item in items.into_iter().rev() {
+                            work.push(LValueTask::Visit(item));
+                        }
+                    }
+                    Expr::Replication { .. } => {
+                        return Err(
+                            "invalid lvalue: replication is not a variable_lvalue".to_string(),
+                        );
+                    }
+                    _ => {
+                        return Err(
+                            "invalid lvalue: expected name, bit/part-select, or concatenation"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            LValueTask::BuildConcat(count) => {
+                let start = vals.len() - count;
+                let items: Vec<LValue> = vals.drain(start..).collect();
+                vals.push(LValue::Concat(items));
+            }
+        }
     }
 
-    match &mut expr {
-        Expr::Identifier(name) => Ok(LValue::Name(std::mem::take(name))),
-        // Chained selects (`a[i][m:l]`) pass straight through: on the LHS
-        // the evaluator routes the array-element + inner-select case through
-        // the same per-position distribution path the vector-reg LHS uses
-        // (LRM 4.9). The structural validation (only `Bit` outer on an
-        // array, inner forbidden on a vector, inner part-select direction
-        // matches the element's packed range) happens in `lvalue_meta`, so
-        // the parser stays purely syntactic here.
-        Expr::Select { name, kind, inner } => {
-            let name = std::mem::take(name);
-            let kind_placeholder = SelectKind::Bit {
-                index: Box::new(placeholder()),
-            };
-            let kind = std::mem::replace(kind, kind_placeholder);
-            let inner = inner.take();
-            Ok(LValue::Select { name, kind, inner })
-        }
-        Expr::Concatenation { items } => {
-            let items = std::mem::take(items);
-            let lvalues = items
-                .into_iter()
-                .map(expression_to_lvalue)
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(LValue::Concat(lvalues))
-        }
-        Expr::Replication { .. } => {
-            Err("invalid lvalue: replication is not a variable_lvalue".to_string())
-        }
-        _ => Err("invalid lvalue: expected name, bit/part-select, or concatenation".to_string()),
-    }
+    debug_assert_eq!(
+        vals.len(),
+        1,
+        "expression_to_lvalue produced {} values",
+        vals.len()
+    );
+    Ok(vals.pop().expect("driver invariant: one root produces one LValue"))
+}
+
+enum LValueTask {
+    Visit(Expr),
+    BuildConcat(usize),
 }
 
 // LRM §3.5.2: real constants follow IEEE 754 binary64. The lexer has
