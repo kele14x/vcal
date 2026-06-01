@@ -1847,7 +1847,18 @@ fn parse_based_decimal(
     ensure_decimal_digits(&digits)?;
 
     let magnitude = parse_biguint(&digits)?;
-    let width = width_hint.unwrap_or_else(|| usize::max(biguint_bit_len(&magnitude), 32));
+    // For unsized `'sd`, widen by one extra bit so auto-sizing never lands the
+    // value's MSB on the sign-bit position and silently flips the literal
+    // negative (e.g. `'sd9999999999999999999999999`). Sized forms respect the
+    // caller's width verbatim; unsized `'d` keeps its natural unsigned width.
+    let width = width_hint.unwrap_or_else(|| {
+        let natural = if signed {
+            signed_decimal_bit_len(&magnitude)
+        } else {
+            biguint_bit_len(&magnitude)
+        };
+        usize::max(natural, 32)
+    });
 
     Ok(LiteralSpec {
         width,

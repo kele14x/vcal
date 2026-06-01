@@ -115,6 +115,16 @@ fn keeps_unsized_literals_wider_than_32_bits_when_needed() {
     assert_eq!(evaluation.output, "34'sd4294967296");
 }
 
+// Unsized `'sd` whose magnitude exactly fills the auto-chosen width would
+// otherwise leave the MSB set and flip the literal negative. The parser
+// widens by one bit so the sign bit stays free.
+#[test]
+fn unsized_signed_decimal_does_not_flip_negative_on_msb() {
+    let evaluation = evaluate_input("'sd9999999999999999999999999")
+        .expect("wide unsized signed decimal should parse");
+    assert_eq!(evaluation.output, "85'sd9999999999999999999999999");
+}
+
 // LRM Table 5-22 footnote a: an unsized x/z-leading constant in an
 // expression wider than 32 bits extends by the MSB regardless of the
 // propagated context signedness. Sized x/z operands still follow §5.5.4
