@@ -2,23 +2,27 @@
 
 ## Prompt
 
-- Prompt format is `In[n]: ` / `Out[n]: ` (trailing space), where `n` is the index of the n-th user input, starting from 0.
-- `In[n]:` accepts a single line of Verilog. Multi-line input is a backlog item; see [scope.md](scope.md).
-- `Out[n]:` prints either:
-  - the result in canonical Verilog form `<width>'<base><digits>` — the expression preserves its source base when possible (see [expressions.md](expressions.md) → "Base rules"), or
-  - an empty value for non-value statements like declarations, `$finish`, and `$stop`.
+- Prompt format is `In [n]: ` / `Out[n]: ` (trailing space), where `n` is the index of the n-th user input, starting from 0.
+- `In [n]:` accepts a single line of Verilog. Multi-line input is a backlog item; see [scope.md](scope.md).
+- Each input gets exactly one output slot, followed by a blank line so consecutive turns are visually separated. Following the IPython convention, the REPL prints:
+  - `Out[n]: <value>` when the last statement is an expression and the input does not end with `;` — the value renders in canonical Verilog form `<width>'<base><digits>` (see [expressions.md](expressions.md) → "Base rules") — then a blank separator line before the next `In [n+1]:` prompt.
+  - a bare blank line (acting as both the output and the separator) for everything else: declarations, assignments, system tasks (`$finish`, `$stop`), or any expression whose input ends with `;`. Trailing `;` is the IPython-style suppression marker; see [non-standard.md](non-standard.md).
+  - an error message followed by a blank separator line, on evaluation failure. The `In [n]` counter still advances.
 
 ## Session
 
-Declarations and assignments persist across REPL turns:
+Declarations and assignments persist across REPL turns. Assignments don't echo a value (use a follow-up expression to read the variable back):
 
 ```plain
-In[0]: reg [7:0] a
-Out[0]:
-In[1]: a = 4'hF + 4'hF
-Out[1]: 8'b00011110
-In[2]: a + 4'b1
-Out[2]: 8'b00011111
+In [0]: reg [7:0] a
+In [1]: a = 4'hF + 4'hF
+In [2]: a
+Out[2]: 8'b00011110
+
+In [3]: a + 4'b1
+Out[3]: 8'b00011111
+
+In [4]:
 ```
 
 A `Session` owns the variable map (`RegValue`, not just bare `IntegerValue`) and is threaded through every evaluator entry. Reg metadata (width, signedness, base, declared msb/lsb) survives across turns; only redeclaration replaces it. See [variables.md](variables.md) for details.

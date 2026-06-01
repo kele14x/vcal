@@ -20,12 +20,15 @@ cargo test            # tests
 ## Example
 
 ```plain
-In[0]: reg [7:0] a
-Out[0]:
-In[1]: a = 4'hF + 4'hF
-Out[1]: 8'b00011110
-In[2]: a + 4'b1
-Out[2]: 8'b00011111
+In [0]: reg [7:0] a
+In [1]: a = 4'hF + 4'hF
+In [2]: a
+Out[2]: 8'b00011110
+
+In [3]: a + 4'b1
+Out[3]: 8'b00011111
+
+In [4]:
 ```
 
 ## Documentation

@@ -298,7 +298,7 @@ pub fn parse_input_with_depth(input: &str, max_depth: usize) -> Result<String, S
     if input.is_empty() {
         return Ok(String::new());
     }
-    let mut statements =
+    let (mut statements, _trailing_semicolon) =
         parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
     // Parse-only is a permissive "did it parse?" probe — undeclared
     // identifiers, unknown system calls, and out-of-range literal widths
@@ -324,24 +324,35 @@ fn evaluate_input_with_session(
         });
     }
 
-    let statements = parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
+    let (statements, trailing_semicolon) =
+        parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
 
-    let mut outputs = Vec::new();
+    // IPython-style suppression: only the last statement's output is
+    // visible, and only if it's an expression (not a decl/assign/task)
+    // AND the input did not end with a `;`. Everything else collapses
+    // to an empty string, which the REPL renders as a bare blank line.
+    let mut last_output = String::new();
+    let mut last_was_expr = false;
     for stmt in &statements {
         let (output, should_exit) = apply_stmt(session, stmt)?;
-        if !output.is_empty() {
-            outputs.push(output);
-        }
         if should_exit {
             return Ok(Evaluation {
-                output: outputs.join("\n"),
+                output: String::new(),
                 should_exit: true,
             });
         }
+        last_output = output;
+        last_was_expr = matches!(stmt, Stmt::Expr(_));
     }
 
+    let output = if trailing_semicolon || !last_was_expr {
+        String::new()
+    } else {
+        last_output
+    };
+
     Ok(Evaluation {
-        output: outputs.join("\n"),
+        output,
         should_exit: false,
     })
 }
@@ -752,7 +763,7 @@ pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Res
     let mut line = String::new();
 
     loop {
-        write!(writer, "In[{index}]: ")?;
+        write!(writer, "In [{index}]: ")?;
         writer.flush()?;
 
         line.clear();
@@ -762,14 +773,19 @@ pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Res
 
         match session.eval(&line) {
             Ok(result) => {
-                writeln!(writer, "Out[{index}]: {}", result.output)?;
+                if result.output.is_empty() {
+                    writeln!(writer)?;
+                } else {
+                    writeln!(writer, "Out[{index}]: {}", result.output)?;
+                    writeln!(writer)?;
+                }
                 if result.should_exit {
                     break;
                 }
             }
             Err(message) => {
-                writeln!(writer, "Out[{index}]: ")?;
                 writeln!(writer, "{message}")?;
+                writeln!(writer)?;
             }
         }
 
@@ -788,7 +804,7 @@ pub fn run_interactive() -> io::Result<()> {
     let mut index = 0usize;
 
     loop {
-        let line = match editor.readline(&format!("In[{index}]: ")) {
+        let line = match editor.readline(&format!("In [{index}]: ")) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
             Err(err) => return Err(io::Error::other(err)),
@@ -800,14 +816,19 @@ pub fn run_interactive() -> io::Result<()> {
 
         match session.eval(&line) {
             Ok(result) => {
-                println!("Out[{index}]: {}", result.output);
+                if result.output.is_empty() {
+                    println!();
+                } else {
+                    println!("Out[{index}]: {}", result.output);
+                    println!();
+                }
                 if result.should_exit {
                     break;
                 }
             }
             Err(message) => {
-                println!("Out[{index}]: ");
                 println!("{message}");
+                println!();
             }
         }
 
@@ -832,7 +853,7 @@ pub fn run_parse_repl<R: BufRead, W: Write>(
     let mut line = String::new();
 
     loop {
-        write!(writer, "In[{index}]: ")?;
+        write!(writer, "In [{index}]: ")?;
         writer.flush()?;
 
         line.clear();
@@ -841,10 +862,17 @@ pub fn run_parse_repl<R: BufRead, W: Write>(
         }
 
         match parse_input_with_depth(&line, max_depth) {
-            Ok(ast) => writeln!(writer, "Out[{index}]: {ast}")?,
+            Ok(ast) => {
+                if ast.is_empty() {
+                    writeln!(writer)?;
+                } else {
+                    writeln!(writer, "Out[{index}]: {ast}")?;
+                    writeln!(writer)?;
+                }
+            }
             Err(message) => {
-                writeln!(writer, "Out[{index}]: ")?;
                 writeln!(writer, "{message}")?;
+                writeln!(writer)?;
             }
         }
 
@@ -863,7 +891,7 @@ pub fn run_parse_interactive(max_depth: usize) -> io::Result<()> {
     let mut index = 0usize;
 
     loop {
-        let line = match editor.readline(&format!("In[{index}]: ")) {
+        let line = match editor.readline(&format!("In [{index}]: ")) {
             Ok(line) => line,
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
             Err(err) => return Err(io::Error::other(err)),
@@ -874,10 +902,17 @@ pub fn run_parse_interactive(max_depth: usize) -> io::Result<()> {
         }
 
         match parse_input_with_depth(&line, max_depth) {
-            Ok(ast) => println!("Out[{index}]: {ast}"),
+            Ok(ast) => {
+                if ast.is_empty() {
+                    println!();
+                } else {
+                    println!("Out[{index}]: {ast}");
+                    println!();
+                }
+            }
             Err(message) => {
-                println!("Out[{index}]: ");
                 println!("{message}");
+                println!();
             }
         }
 

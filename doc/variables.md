@@ -23,9 +23,9 @@ real    name [= init] { , name [= init] }
   of resetting a reg's metadata, so the new decl wipes the old width,
   signedness, base, and bit pattern. The freshly redeclared reg starts at
   all `x` like any other new reg.
-- A fresh reg is initialized to all `x`. The decl statement emits an empty
-  `Out[n]:` line — the same convention `$finish` / `$stop` use for
-  non-value statements.
+- A fresh reg is initialized to all `x`. The decl statement prints a
+  bare blank line — the same convention assignments, `$finish`, and
+  `$stop` use for non-value statements (see [repl.md](repl.md)).
 
 ## `integer`
 
@@ -78,8 +78,10 @@ bits while the reg's declared metadata is preserved. A real-typed RHS
 goes through an implicit real→integer conversion per LRM §3.5.3 (round
 to nearest, ties away from zero — the same rule `$itor`'s internal
 real→int step uses); NaN / ±∞ have no integer image and surface as the
-lvalue filled with x bits at its declared width. `Out[n]:` prints the
-reg's new canonical form in its own display base.
+lvalue filled with x bits at its declared width. The assignment itself
+prints a blank line per [repl.md](repl.md); reference the reg on the
+next line (or as a trailing expression on the same line) to display
+its new value.
 
 An identifier reference resolves to the reg's current bits and then
 participates in the surrounding expression like any other primary — its
@@ -135,31 +137,18 @@ A few semantic rules worth pinning down:
    distribution lets the leaf closer to the MSB end of the concat write
    last, so it wins. So `reg [3:0] a = 4'h0; {a[0], a[0]} = 2'b10`
    ends with `a` as `4'b0001` — the MSB-side `a[0]` receives the RHS
-   MSB (1).
-
-   A subtler case where the duplicate-bit rule interacts with the echo
-   rule: given `reg [3:0] a`, the line `{a, a[0]} = 8'b000_01xz_x`
-   prints `5'b01xzx` (the echo: 8-bit RHS truncated to the 5-bit total
-   LHS context per rule #4) but leaves `a` as `4'b01xz`. The two
-   differ in the LSB. Distribution walks leaves right-to-left, so the
-   rightmost `a[0]` leaf writes first (taking the RHS LSB `x` →
-   `a[0] = x`), then the leftmost `a` leaf writes its 4 bits over
-   `a[3:0]` — and *its* position 0 (the RHS bit `z`) overwrites the
-   earlier `x`. So `a[0]` ends as `z`, not the `x` you'd guess from
-   the echo's rightmost bit. The echo reflects "what the RHS becomes
-   in the LHS context"; the reg state reflects "what survived the
-   duplicate-write resolution".
+   MSB (1). The right-to-left walk also explains a subtler case: with
+   `reg [3:0] a` and `{a, a[0]} = 8'b000_01xz_x` (RHS truncated to the
+   5-bit LHS context as `5'b01xzx`), the rightmost `a[0]` leaf writes
+   first (taking the RHS LSB `x` → `a[0] = x`), then the leftmost `a`
+   leaf writes its 4 bits over `a[3:0]`. *Its* position 0 (the RHS
+   bit `z`) overwrites the earlier `x`, so `a` ends as `4'b01xz` —
+   not what a left-to-right walk would give.
 3. **All-or-nothing commit.** Structural validation (direction
    mismatch, undeclared leaf, scalar-with-select, x/z in a constant
    endpoint, zero indexed width) runs before the RHS is evaluated and
    before any reg is mutated. So `{a, b_undeclared} = ...` leaves `a`
    untouched.
-4. **Echo policy.** `Out[n]:` prints the RHS evaluated in the total-LHS
-   context. For bare-name LHS this is bit-identical to the pre-lvalue
-   behavior (reg's stored width / signedness / base); for a select LHS
-   it prints the slice at the select width and the reg's base; for a
-   concat LHS it prints the joined value at the sum-width with the
-   leftmost leaf's base.
 
 Per LRM 5.2.1, "A bit-select or part-select of a scalar … shall be
 illegal." A reg declared without a range is a scalar even when its

@@ -8,7 +8,12 @@ The LRM defines `statement ::= blocking_assignment ; | system_task_enable` insid
 
 ## Trailing semicolons
 
-The Verilog LRM requires a trailing semicolon for each statement. This is annoying for a calculator app. vcal accepts an optional trailing semicolon. Users may use a trailing semicolon to explicitly end the input phase and force the app to evaluate the input (works together with multi-line edit).
+The Verilog LRM requires a trailing semicolon for each statement. This is annoying for a calculator app, so vcal makes the trailing `;` optional and repurposes it as a REPL-only **output-suppression marker** following the IPython convention:
+
+- `1 + 1` → `Out[n]: 32'sd2`
+- `1 + 1;` → blank line (value computed but not displayed)
+
+This convention has no LRM counterpart — it exists only at the REPL prompt. Multi-statement input like `1; 2; 3` is `;`-separated by definition, and only the *last* statement's result is eligible to print, so the trailing-`;` rule applies uniformly to the input as a whole rather than per statement.
 
 ## Integer constants
 

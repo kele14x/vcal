@@ -921,8 +921,13 @@ pub(crate) fn parse_expression(input: &str) -> Result<Expr, String> {
     Ok(expression)
 }
 
-pub(crate) fn parse_statements(input: &str) -> Result<Vec<Stmt>, String> {
+// Returns the parsed statements and a flag indicating whether the input
+// ended with a `;` (after the final non-semicolon token). The REPL uses
+// the flag as an IPython-style output-suppression marker — see
+// `doc/non-standard.md`'s "Trailing semicolons" section.
+pub(crate) fn parse_statements(input: &str) -> Result<(Vec<Stmt>, bool), String> {
     let tokens = tokenize(input)?;
+    let trailing_semicolon = matches!(tokens.last(), Some(Token::Semicolon));
 
     let segments: Vec<&[Token]> = tokens
         .split(|t| matches!(t, Token::Semicolon))
@@ -930,7 +935,7 @@ pub(crate) fn parse_statements(input: &str) -> Result<Vec<Stmt>, String> {
         .collect();
 
     if segments.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), trailing_semicolon));
     }
 
     let mut stmts = Vec::with_capacity(segments.len());
@@ -946,7 +951,7 @@ pub(crate) fn parse_statements(input: &str) -> Result<Vec<Stmt>, String> {
         stmts.push(stmt);
     }
 
-    Ok(stmts)
+    Ok((stmts, trailing_semicolon))
 }
 
 impl<'a> Parser<'a> {
