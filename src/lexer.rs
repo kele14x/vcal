@@ -90,7 +90,34 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::Minus);
                 }
             }
-            '/' => tokens.push(Token::Slash),
+            '/' => match chars.peek() {
+                Some((_, '/')) => {
+                    // LRM 3.2: `//` runs to the next newline (or EOF).
+                    chars.next();
+                    for (_, c) in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                }
+                Some((_, '*')) => {
+                    // LRM 3.2: `/* ... */` block comment; non-nesting.
+                    chars.next();
+                    let mut closed = false;
+                    let mut prev_star = false;
+                    for (_, c) in chars.by_ref() {
+                        if prev_star && c == '/' {
+                            closed = true;
+                            break;
+                        }
+                        prev_star = c == '*';
+                    }
+                    if !closed {
+                        return Err("unterminated block comment".to_string());
+                    }
+                }
+                _ => tokens.push(Token::Slash),
+            },
             '%' => tokens.push(Token::Percent),
             '*' => {
                 if matches!(chars.peek(), Some((_, '*'))) {

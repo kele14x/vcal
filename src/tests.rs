@@ -653,6 +653,41 @@ fn whitespace_only_input_produces_empty_output() {
 }
 
 #[test]
+fn line_comment_is_skipped() {
+    let only = evaluate_input("// foo").expect("eval");
+    assert_eq!(only.output, "");
+
+    let trailing = evaluate_input("1 + 2 // tail").expect("eval");
+    assert_eq!(trailing.output, "32'sd3");
+}
+
+#[test]
+fn block_comment_is_skipped() {
+    let only = evaluate_input("/* foo */").expect("eval");
+    assert_eq!(only.output, "");
+
+    let inline = evaluate_input("1 + /* x */ 2").expect("eval");
+    assert_eq!(inline.output, "32'sd3");
+
+    let many = evaluate_input("/* a */ 1 /* b */ + /* c */ 2 // tail").expect("eval");
+    assert_eq!(many.output, "32'sd3");
+}
+
+#[test]
+fn line_comment_ends_at_newline() {
+    let tokens = tokenize("a // b\nc").expect("tokenize");
+    assert_eq!(tokens.len(), 2);
+    assert_eq!(tokens[0], Token::Identifier("a".to_string()));
+    assert_eq!(tokens[1], Token::Identifier("c".to_string()));
+}
+
+#[test]
+fn unterminated_block_comment_is_an_error() {
+    let err = evaluate_input("/* unterminated").expect_err("should error");
+    assert_eq!(err, "Syntax error: unterminated block comment");
+}
+
+#[test]
 fn binary_arithmetic_preserves_shared_operand_base() {
     let binary_add = evaluate_input("4'b0111 + 4'b1001").expect("binary add should evaluate");
     let hex_add = evaluate_input("8'h0a + 8'h05").expect("hex add should evaluate");
