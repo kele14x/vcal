@@ -15,16 +15,12 @@ fn main() -> ExitCode {
                 println!("                 Skips validation and evaluation. For");
                 println!("                 debugging parser-stage issues.");
                 println!();
-                println!(
-                    "  --max-depth=N  AST display depth cap for --parse-only mode.",
-                );
+                println!("  --max-depth=N  AST display depth cap for --parse-only mode.",);
                 println!(
                     "                 Sub-trees at depth N or deeper render as `Truncated`. Default {}.",
                     vcal::DEFAULT_DISPLAY_DEPTH
                 );
-                println!(
-                    "                 Higher caps preserve more of the AST but spend more"
-                );
+                println!("                 Higher caps preserve more of the AST but spend more");
                 println!("                 stack on the {{:#?}} formatter; very large values");
                 println!("                 (>10⁵) on a deep input may overflow.");
                 return ExitCode::SUCCESS;
@@ -34,7 +30,9 @@ fn main() -> ExitCode {
                 match value.parse::<usize>() {
                     Ok(n) => max_depth = Some(n),
                     Err(_) => {
-                        eprintln!("Error: --max-depth requires a non-negative integer (got `{value}`)");
+                        eprintln!(
+                            "Error: --max-depth requires a non-negative integer (got `{value}`)"
+                        );
                         return ExitCode::from(2);
                     }
                 }

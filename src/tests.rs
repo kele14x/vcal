@@ -3,10 +3,7 @@ use std::io::Cursor;
 use num_bigint::BigInt;
 
 use crate::lexer::{Token, tokenize};
-use crate::parser::{
-    BinaryOp, Expr, UnaryOp, parse_expression,
-    parse_integer,
-};
+use crate::parser::{BinaryOp, Expr, UnaryOp, parse_expression, parse_integer};
 use crate::{Session, evaluate_input, parse_input, parse_input_with_depth, run_repl};
 
 #[test]
@@ -48,8 +45,7 @@ fn formats_signed_decimal_and_non_decimal_outputs_differently() {
 fn accepts_spaces_inside_based_integer_literals_in_expressions() {
     let literal = evaluate_input("8 'd 6").expect("spaced based literal should parse");
     let unary = evaluate_input("- 8 'd 6").expect("spaced unary minus literal should parse");
-    let expr =
-        evaluate_input("8 'd 6 + 1").expect("spaced based literal expression should parse");
+    let expr = evaluate_input("8 'd 6 + 1").expect("spaced based literal expression should parse");
 
     assert_eq!(literal.output, "8'd6");
     assert_eq!(unary.output, "8'd250");
@@ -67,7 +63,10 @@ fn rejects_spaces_inside_base_token() {
 
     assert_eq!(missing_base, "Syntax error: missing base after apostrophe");
     assert_eq!(split_signed, "Syntax error: missing base after apostrophe");
-    assert_eq!(split_signed_base, "Syntax error: missing base after signed marker");
+    assert_eq!(
+        split_signed_base,
+        "Syntax error: missing base after signed marker"
+    );
 }
 
 #[test]
@@ -164,8 +163,7 @@ fn unsized_signed_literal_sign_extends_per_own_signedness_in_unsigned_context() 
     // a's "Otherwise" branch, the own (signed) signedness drives a sign-
     // extend even though the propagated context is unsigned. §5.5.4 would
     // instead zero-extend and yield 64'h00000000FFFFFFFF.
-    let evaluation =
-        evaluate_input("'shFFFFFFFF | 64'b0").expect("expression should evaluate");
+    let evaluation = evaluate_input("'shFFFFFFFF | 64'b0").expect("expression should evaluate");
     assert_eq!(evaluation.output, "64'hffffffffffffffff");
 }
 
@@ -203,8 +201,7 @@ fn sized_operands_still_follow_propagated_context_extension() {
 fn unsized_value_literals_unchanged_in_wider_context() {
     // Sanity: value (non-x/z) literals should produce the same bits
     // whether we eager-size at 32 + §5.5.4 extend, or footnote-a extend.
-    let unsigned_hex =
-        evaluate_input("'h7FFFFFFF | 64'b0").expect("expression should evaluate");
+    let unsigned_hex = evaluate_input("'h7FFFFFFF | 64'b0").expect("expression should evaluate");
     assert_eq!(unsigned_hex.output, "64'h000000007fffffff");
 
     let signed_decimal = evaluate_input("42 + 64'sb0").expect("expression should evaluate");
@@ -451,10 +448,8 @@ fn widens_signed_subexpressions_before_truncation() {
 #[test]
 fn evaluates_negative_base_power_cases_from_lrm_examples() {
     let odd = evaluate_input("(-4'sd1) ** 3").expect("odd negative-base power should evaluate");
-    let even =
-        evaluate_input("(-4'sd1) ** 2").expect("even negative-base power should evaluate");
-    let reciprocal =
-        evaluate_input("(-4'sd1) ** -3").expect("negative exponent should evaluate");
+    let even = evaluate_input("(-4'sd1) ** 2").expect("even negative-base power should evaluate");
+    let reciprocal = evaluate_input("(-4'sd1) ** -3").expect("negative exponent should evaluate");
 
     assert_eq!(odd.output, "-4'sd1");
     assert_eq!(even.output, "4'sd1");
@@ -548,8 +543,7 @@ fn system_task_in_expression_is_rejected() {
     ] {
         let error = evaluate_input(input).expect_err(input);
         assert!(
-            error.contains("is a system task")
-                && error.contains("cannot be called as a function"),
+            error.contains("is a system task") && error.contains("cannot be called as a function"),
             "{input}: got {error}"
         );
     }
@@ -706,9 +700,7 @@ fn decl_then_expr_prints_expr() {
 #[test]
 fn expr_then_decl_is_suppressed() {
     let mut session = Session::new();
-    let result = session
-        .eval("1 + 1; reg [7:0] a")
-        .expect("expr then decl");
+    let result = session.eval("1 + 1; reg [7:0] a").expect("expr then decl");
     assert_eq!(result.output, "");
 }
 
@@ -829,7 +821,13 @@ fn relational_binds_looser_than_additive() {
             op: BinaryOp::LessThan,
             lhs,
             ..
-        } => assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Add, .. })),
+        } => assert!(matches!(
+            lhs.as_ref(),
+            Expr::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        )),
         other => panic!("expected top-level <, got {other:?}"),
     }
 
@@ -1154,8 +1152,7 @@ fn case_equality_extends_unsigned_with_zero_not_x() {
 fn case_equality_signed_extends_msb_with_x_or_z() {
     // LRM 5.5.4: when BOTH operands are signed (context signed), an x or
     // z MSB does propagate into the upper bits.
-    let signed_x_fill =
-        evaluate_input("4'sbx000 === 8'sbxxxxx000").expect("signed x fills");
+    let signed_x_fill = evaluate_input("4'sbx000 === 8'sbxxxxx000").expect("signed x fills");
     let signed_zero_fill_wrong =
         evaluate_input("4'sbx000 === 8'sb0000x000").expect("signed zero would be wrong");
 
@@ -1182,7 +1179,13 @@ fn equality_is_left_associative() {
             op: BinaryOp::Equal,
             lhs,
             ..
-        } => assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Equal, .. })),
+        } => assert!(matches!(
+            lhs.as_ref(),
+            Expr::Binary {
+                op: BinaryOp::Equal,
+                ..
+            }
+        )),
         other => panic!("expected top-level ==, got {other:?}"),
     }
     assert_eq!(result.output, "1'b1");
@@ -1326,7 +1329,13 @@ fn logical_and_lower_precedence_than_equality() {
             op: BinaryOp::LogicalAnd,
             lhs,
             ..
-        } => assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Equal, .. })),
+        } => assert!(matches!(
+            lhs.as_ref(),
+            Expr::Binary {
+                op: BinaryOp::Equal,
+                ..
+            }
+        )),
         other => panic!("expected top-level &&, got {other:?}"),
     }
     let result = evaluate_input("4'd0 == 4'd0 && 4'd1").expect("eval");
@@ -1702,7 +1711,13 @@ fn bitwise_band_precedence_below_equality() {
             op: BinaryOp::BitwiseAnd,
             lhs,
             ..
-        } => assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Equal, .. })),
+        } => assert!(matches!(
+            lhs.as_ref(),
+            Expr::Binary {
+                op: BinaryOp::Equal,
+                ..
+            }
+        )),
         other => panic!("expected top-level &, got {other:?}"),
     }
     let result = evaluate_input("4'd1 == 4'd1 & 4'd1").expect("eval");
@@ -1818,7 +1833,10 @@ fn reduction_nand_nor_rejected_as_binary() {
     let nand = evaluate_input("4'd1 ~& 4'd1").expect_err("binary ~& rejected");
     let nor = evaluate_input("4'd0 ~| 4'd0").expect_err("binary ~| rejected");
 
-    assert_eq!(nand, "Syntax error: unexpected token after end of statement");
+    assert_eq!(
+        nand,
+        "Syntax error: unexpected token after end of statement"
+    );
     assert_eq!(nor, "Syntax error: unexpected token after end of statement");
 }
 
@@ -2246,10 +2264,7 @@ fn arithmetic_right_shift_fill_follows_propagated_signedness() {
     // Result base inherits from the leftmost operand (Binary), and the
     // shared 8-bit unsigned context makes the outer result unsigned.
     assert_eq!(mixed_unsigned.output, "8'b00000100");
-    assert_eq!(
-        all_signed.output,
-        "32'sb11111111111111111111111111111100"
-    );
+    assert_eq!(all_signed.output, "32'sb11111111111111111111111111111100");
 }
 
 #[test]
@@ -2300,14 +2315,19 @@ fn shift_precedence_below_additive_above_relational() {
             op: BinaryOp::LogicalShiftLeft,
             lhs,
             ..
-        } => assert!(matches!(lhs.as_ref(), Expr::Binary { op: BinaryOp::Add, .. })),
+        } => assert!(matches!(
+            lhs.as_ref(),
+            Expr::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        )),
         other => panic!("expected top-level <<, got {other:?}"),
     }
     let add_then_shift = evaluate_input("4'd1 + 4'd2 << 4'd1").expect("eval");
     assert_eq!(add_then_shift.output, "4'd6");
 
-    let shift_then_relational_expr =
-        parse_expression("4'd2 << 4'd1 < 4'd5").expect("parse");
+    let shift_then_relational_expr = parse_expression("4'd2 << 4'd1 < 4'd5").expect("parse");
     match &shift_then_relational_expr {
         Expr::Binary {
             op: BinaryOp::LessThan,
@@ -2581,10 +2601,7 @@ fn conditional_outer_unsigned_context_zero_fills_signed_branch() {
 
     assert_eq!(self_determined.output, "4'sb1000");
     assert_eq!(mixed.output, "8'b00001000");
-    assert_eq!(
-        all_signed.output,
-        "32'sb11111111111111111111111111111000"
-    );
+    assert_eq!(all_signed.output, "32'sb11111111111111111111111111111000");
 }
 
 #[test]
@@ -2754,7 +2771,10 @@ fn concatenation_rejects_bare_unsized_literal_operand() {
     // LRM 5.1.14: "Unsized constant numbers shall not be allowed in
     // concatenations."
     let err = evaluate_input("{1, 4'd2}").expect_err("indefinite");
-    assert_eq!(err, "Semantic error: concatenation operand has indefinite width");
+    assert_eq!(
+        err,
+        "Semantic error: concatenation operand has indefinite width"
+    );
 }
 
 #[test]
@@ -2762,7 +2782,10 @@ fn concatenation_rejects_arithmetic_with_unsized_operand() {
     // The indefinite-width flag propagates through context-determined
     // arithmetic: `4'd1 + 1` is indefinite because the `1` is unsized.
     let err = evaluate_input("{4'd1 + 1, 4'd2}").expect_err("indefinite");
-    assert_eq!(err, "Semantic error: concatenation operand has indefinite width");
+    assert_eq!(
+        err,
+        "Semantic error: concatenation operand has indefinite width"
+    );
 }
 
 #[test]
@@ -2788,7 +2811,10 @@ fn concatenation_rejects_shift_with_unsized_lhs() {
     // Shifts take their result width from the LHS only (LRM 5.1.12), so
     // an unsized LHS makes the whole expression indefinite.
     let err = evaluate_input("{1 << 1, 4'd2}").expect_err("indefinite");
-    assert_eq!(err, "Semantic error: concatenation operand has indefinite width");
+    assert_eq!(
+        err,
+        "Semantic error: concatenation operand has indefinite width"
+    );
 }
 
 #[test]
@@ -2796,7 +2822,10 @@ fn concatenation_rejects_conditional_with_unsized_branch() {
     // Conditional width is max(then, else) (LRM 5.1.13), so an unsized
     // branch makes the whole conditional indefinite.
     let err = evaluate_input("{1'b1 ? 1 : 4'd2, 4'd2}").expect_err("indefinite");
-    assert_eq!(err, "Semantic error: concatenation operand has indefinite width");
+    assert_eq!(
+        err,
+        "Semantic error: concatenation operand has indefinite width"
+    );
 }
 
 #[test]
@@ -2805,7 +2834,10 @@ fn concatenation_rejects_power_with_unsized_lhs() {
     // shape as shifts), so an unsized LHS makes the whole expression
     // indefinite even when the RHS is sized.
     let err = evaluate_input("{2 ** 4'd3, 4'd2}").expect_err("indefinite");
-    assert_eq!(err, "Semantic error: concatenation operand has indefinite width");
+    assert_eq!(
+        err,
+        "Semantic error: concatenation operand has indefinite width"
+    );
 }
 
 #[test]
@@ -2824,7 +2856,10 @@ fn top_level_replication_rejects_zero_count() {
     // concatenation with at least one positive-size operand; a top-level
     // `{0{...}}` (no enclosing concat) is rejected.
     let err = evaluate_input("{0{1'b1}}").expect_err("zero count");
-    assert_eq!(err, "Semantic error: replication count must be positive in this context");
+    assert_eq!(
+        err,
+        "Semantic error: replication count must be positive in this context"
+    );
 }
 
 #[test]
@@ -2867,12 +2902,10 @@ fn concatenation_of_only_zero_replication_is_rejected() {
     // `{ {0{1'b1}} }` — one operand, and it has zero size. No
     // positive-size sibling, so the surrounding concatenation has no
     // positive-size operand, which LRM 5.1.14 forbids.
-    let solo =
-        evaluate_input("{ {0{1'b1}} }").expect_err("solo zero rep in concat");
-    let pair = evaluate_input("{ {0{1'b1}}, {0{1'b1}} }")
-        .expect_err("two zero reps no positive sibling");
-    let nested =
-        evaluate_input("{2{ {0{1'b1}} }}").expect_err("outer rep over zero-only inner");
+    let solo = evaluate_input("{ {0{1'b1}} }").expect_err("solo zero rep in concat");
+    let pair =
+        evaluate_input("{ {0{1'b1}}, {0{1'b1}} }").expect_err("two zero reps no positive sibling");
+    let nested = evaluate_input("{2{ {0{1'b1}} }}").expect_err("outer rep over zero-only inner");
     assert_eq!(
         solo,
         "Semantic error: concatenation must have at least one operand with positive size"
@@ -2891,7 +2924,10 @@ fn concatenation_of_only_zero_replication_is_rejected() {
 fn replication_rejects_negative_count() {
     // `-1` is signed-negative — read as a math integer, sign() = Minus.
     let err = evaluate_input("{-1{1'b1}}").expect_err("negative count");
-    assert_eq!(err, "Semantic error: replication count must be non-negative");
+    assert_eq!(
+        err,
+        "Semantic error: replication count must be non-negative"
+    );
 }
 
 // The validator runs as a pre-pass on the whole expression tree, so a
@@ -2927,7 +2963,10 @@ fn replication_rejects_unknown_count() {
     // A count with any x or z bit is rejected — per LRM 5.1.14 the count
     // must be "a constant expression that is non-negative, non-x, non-z".
     let err = evaluate_input("{1'bx{1'b1}}").expect_err("unknown count");
-    assert_eq!(err, "Semantic error: replication count contains unknown bits");
+    assert_eq!(
+        err,
+        "Semantic error: replication count contains unknown bits"
+    );
 }
 
 #[test]
@@ -2974,8 +3013,7 @@ fn replication_widens_through_outer_arithmetic_context() {
 // signed -4; `$unsigned(-4'sd4)` flips the signed -4 to the unsigned 12.
 #[test]
 fn signed_unsigned_match_lrm_examples() {
-    let signed_from_binary =
-        evaluate_input("$signed(4'b1100)").expect("$signed should evaluate");
+    let signed_from_binary = evaluate_input("$signed(4'b1100)").expect("$signed should evaluate");
     let unsigned_from_negative_sized =
         evaluate_input("$unsigned(-4'sd4)").expect("$unsigned should evaluate");
     let unsigned_from_unsized_negative =
@@ -3060,8 +3098,14 @@ fn rejects_sign_cast_missing_parenthesis() {
     let missing_open = evaluate_input("$signed 1").expect_err("missing `(` should error");
     let missing_close = evaluate_input("$signed(1").expect_err("missing `)` should error");
 
-    assert_eq!(missing_open, "Syntax error: unexpected token after end of statement");
-    assert_eq!(missing_close, "Syntax error: expected `)` after $signed argument");
+    assert_eq!(
+        missing_open,
+        "Syntax error: unexpected token after end of statement"
+    );
+    assert_eq!(
+        missing_close,
+        "Syntax error: expected `)` after $signed argument"
+    );
 }
 
 // vcal-specific display-base casts: `$bin` / `$oct` / `$dec` / `$hex` change
@@ -3070,10 +3114,7 @@ fn rejects_sign_cast_missing_parenthesis() {
 #[test]
 fn base_casts_change_display_base_in_each_direction() {
     assert_eq!(evaluate_input("$bin(4'hf)").expect("bin").output, "4'b1111");
-    assert_eq!(
-        evaluate_input("$hex(4'b1010)").expect("hex").output,
-        "4'ha"
-    );
+    assert_eq!(evaluate_input("$hex(4'b1010)").expect("hex").output, "4'ha");
     assert_eq!(
         evaluate_input("$oct(8'b11110000)").expect("oct").output,
         "8'o360"
@@ -3136,10 +3177,7 @@ fn base_cast_locks_in_width_so_concatenation_accepts_unsized_arg() {
     // indefinite width. Wrapping it in `$bin` locks in the 32-bit width and
     // makes the concatenation legal.
     let concat = evaluate_input("{$bin(1), 4'b0}").expect("concat");
-    assert_eq!(
-        concat.output,
-        "36'b000000000000000000000000000000010000"
-    );
+    assert_eq!(concat.output, "36'b000000000000000000000000000000010000");
 }
 
 #[test]
@@ -3158,8 +3196,14 @@ fn rejects_base_cast_missing_parenthesis() {
     let missing_open = evaluate_input("$bin 1").expect_err("missing `(` should error");
     let missing_close = evaluate_input("$bin(1").expect_err("missing `)` should error");
 
-    assert_eq!(missing_open, "Syntax error: unexpected token after end of statement");
-    assert_eq!(missing_close, "Syntax error: expected `)` after $bin argument");
+    assert_eq!(
+        missing_open,
+        "Syntax error: unexpected token after end of statement"
+    );
+    assert_eq!(
+        missing_close,
+        "Syntax error: expected `)` after $bin argument"
+    );
 }
 
 // LRM §3.5.2 examples — accepted real-number forms.
@@ -3203,14 +3247,8 @@ fn rejects_invalid_real_forms() {
 fn evaluates_real_arithmetic() {
     assert_eq!(evaluate_input("1.0 + 2.0").expect("add").output, "3.0");
     assert_eq!(evaluate_input("1.0 + 2").expect("mixed add").output, "3.0");
-    assert_eq!(
-        evaluate_input("3.0 - 1.5").expect("subtract").output,
-        "1.5"
-    );
-    assert_eq!(
-        evaluate_input("2.0 * 3.0").expect("multiply").output,
-        "6.0"
-    );
+    assert_eq!(evaluate_input("3.0 - 1.5").expect("subtract").output, "1.5");
+    assert_eq!(evaluate_input("2.0 * 3.0").expect("multiply").output, "6.0");
     assert_eq!(
         evaluate_input("5.0 / 2.0").expect("real divide").output,
         "2.5"
@@ -3248,14 +3286,8 @@ fn evaluates_real_power() {
 // vcal inherits whatever f64::powf returns (NaN / ±∞ / 1.0).
 #[test]
 fn unspecified_real_power_corners_use_ieee_754() {
-    assert_eq!(
-        evaluate_input("0.0 ** 0.0").expect("0**0").output,
-        "1.0"
-    );
-    assert_eq!(
-        evaluate_input("0.0 ** -1.0").expect("0**neg").output,
-        "inf"
-    );
+    assert_eq!(evaluate_input("0.0 ** 0.0").expect("0**0").output, "1.0");
+    assert_eq!(evaluate_input("0.0 ** -1.0").expect("0**neg").output, "inf");
     assert_eq!(
         evaluate_input("(-2.0) ** 0.5")
             .expect("neg ** non-integral")
@@ -3284,10 +3316,7 @@ fn evaluates_real_relational_and_equality() {
         evaluate_input("1.0 != 2.0").expect("real !=").output,
         "1'b1"
     );
-    assert_eq!(
-        evaluate_input("1.0 == 1").expect("mixed ==").output,
-        "1'b1"
-    );
+    assert_eq!(evaluate_input("1.0 == 1").expect("mixed ==").output, "1'b1");
 }
 
 // LRM §5.1.9: !, &&, || on reals reduce via the 0=false / non-zero=true
@@ -3304,10 +3333,7 @@ fn evaluates_real_logical() {
         evaluate_input("0.0 || 1.0").expect("|| real").output,
         "1'b1"
     );
-    assert_eq!(
-        evaluate_input("1.0 && 0").expect("mixed &&").output,
-        "1'b0"
-    );
+    assert_eq!(evaluate_input("1.0 && 0").expect("mixed &&").output, "1'b0");
 }
 
 // LRM §5.1.13: ?: branches promote to real if either branch is real;
@@ -3323,7 +3349,9 @@ fn conditional_promotes_branches_to_real() {
         "2.0"
     );
     assert_eq!(
-        evaluate_input("1.0 ? 1 : 2").expect("real cond, int branches").output,
+        evaluate_input("1.0 ? 1 : 2")
+            .expect("real cond, int branches")
+            .output,
         "32'sd1"
     );
 }
@@ -3332,7 +3360,10 @@ fn conditional_promotes_branches_to_real() {
 #[test]
 fn rejects_modulus_on_real() {
     let err = evaluate_input("1.0 % 2.0").expect_err("modulus on real");
-    assert_eq!(err, "Semantic error: operator % not allowed on real operand");
+    assert_eq!(
+        err,
+        "Semantic error: operator % not allowed on real operand"
+    );
 }
 
 #[test]
@@ -3417,7 +3448,9 @@ fn rejects_sign_cast_on_real() {
 #[test]
 fn real_propagates_through_chained_arithmetic() {
     assert_eq!(
-        evaluate_input("1.0 + 2 * 3").expect("real propagates").output,
+        evaluate_input("1.0 + 2 * 3")
+            .expect("real propagates")
+            .output,
         "7.0"
     );
     assert_eq!(
@@ -3538,8 +3571,7 @@ fn rejects_real_replication_count() {
         "Semantic error: replication count cannot be real"
     );
     assert_eq!(
-        evaluate_input("{(1.5 + 0.5){1'b1}}")
-            .expect_err("real-typed expression as count"),
+        evaluate_input("{(1.5 + 0.5){1'b1}}").expect_err("real-typed expression as count"),
         "Semantic error: replication count cannot be real"
     );
 }
@@ -3666,11 +3698,15 @@ fn accepts_underscore_separators_inside_digit_run() {
 #[test]
 fn rtoi_truncates_toward_zero() {
     assert_eq!(
-        evaluate_input("$rtoi(123.45)").expect("$rtoi positive").output,
+        evaluate_input("$rtoi(123.45)")
+            .expect("$rtoi positive")
+            .output,
         "32'sd123"
     );
     assert_eq!(
-        evaluate_input("$rtoi(-22.7)").expect("$rtoi negative").output,
+        evaluate_input("$rtoi(-22.7)")
+            .expect("$rtoi negative")
+            .output,
         "-32'sd22"
     );
     // Truncation, not rounding: 0.9 → 0, -0.9 → 0.
@@ -3694,7 +3730,9 @@ fn rtoi_truncates_toward_zero() {
 #[test]
 fn rtoi_nan_and_infinity_yield_x() {
     assert_eq!(
-        evaluate_input("$rtoi(0.0 / 0.0)").expect("$rtoi NaN").output,
+        evaluate_input("$rtoi(0.0 / 0.0)")
+            .expect("$rtoi NaN")
+            .output,
         "32'sdx"
     );
     assert_eq!(
@@ -3745,7 +3783,10 @@ fn itor_converts_integer_to_real() {
         evaluate_input("$itor(-5)").expect("$itor negative").output,
         "-5.0"
     );
-    assert_eq!(evaluate_input("$itor(0)").expect("$itor zero").output, "0.0");
+    assert_eq!(
+        evaluate_input("$itor(0)").expect("$itor zero").output,
+        "0.0"
+    );
     // x/z bits become 0 per §3.5.3, so 4'b01x0 → 0100 → 4 → 4.0.
     assert_eq!(
         evaluate_input("$itor(4'b01x0)")
@@ -3792,24 +3833,18 @@ fn itor_rejects_real_argument() {
 fn itor_oversized_integer_saturates_to_infinity() {
     let huge_pos = format!("$itor(1{})", "0".repeat(309));
     assert_eq!(
-        evaluate_input(&huge_pos)
-            .expect("$itor 10**309")
-            .output,
+        evaluate_input(&huge_pos).expect("$itor 10**309").output,
         "inf"
     );
     let huge_neg = format!("$itor(-1{})", "0".repeat(309));
     assert_eq!(
-        evaluate_input(&huge_neg)
-            .expect("$itor -10**309")
-            .output,
+        evaluate_input(&huge_neg).expect("$itor -10**309").output,
         "-inf"
     );
     // 10**308 is still within f64 range — the boundary stays representable.
     let in_range = format!("$itor(1{})", "0".repeat(308));
     assert_eq!(
-        evaluate_input(&in_range)
-            .expect("$itor 10**308")
-            .output,
+        evaluate_input(&in_range).expect("$itor 10**308").output,
         "1.0e+308"
     );
 }
@@ -4033,7 +4068,9 @@ fn bitstoreal_accepts_64_bit_expressions() {
 #[test]
 fn bitstoreal_treats_xz_as_zero_bits() {
     assert_eq!(
-        evaluate_input("$bitstoreal(64'bx)").expect("all-x → +0.0").output,
+        evaluate_input("$bitstoreal(64'bx)")
+            .expect("all-x → +0.0")
+            .output,
         "0.0"
     );
 }
@@ -4147,7 +4184,9 @@ fn clog2_xz_bits_collapse_to_x_result() {
         "32'sdx"
     );
     assert_eq!(
-        evaluate_input("$clog2(1'bx)").expect("$clog2 pure x").output,
+        evaluate_input("$clog2(1'bx)")
+            .expect("$clog2 pure x")
+            .output,
         "32'sdx"
     );
 }
@@ -4188,42 +4227,18 @@ fn clog2_widens_in_outer_context() {
 // Rust's f64::* methods wrap libm so semantics match by construction.
 #[test]
 fn real_math_basic_results() {
-    assert_eq!(
-        evaluate_input("$sqrt(4.0)").expect("$sqrt").output,
-        "2.0"
-    );
-    assert_eq!(
-        evaluate_input("$ln(1.0)").expect("$ln(1)").output,
-        "0.0"
-    );
+    assert_eq!(evaluate_input("$sqrt(4.0)").expect("$sqrt").output, "2.0");
+    assert_eq!(evaluate_input("$ln(1.0)").expect("$ln(1)").output, "0.0");
     assert_eq!(
         evaluate_input("$log10(100.0)").expect("$log10").output,
         "2.0"
     );
-    assert_eq!(
-        evaluate_input("$exp(0.0)").expect("$exp(0)").output,
-        "1.0"
-    );
-    assert_eq!(
-        evaluate_input("$floor(2.7)").expect("$floor").output,
-        "2.0"
-    );
-    assert_eq!(
-        evaluate_input("$ceil(2.3)").expect("$ceil").output,
-        "3.0"
-    );
-    assert_eq!(
-        evaluate_input("$sin(0.0)").expect("$sin(0)").output,
-        "0.0"
-    );
-    assert_eq!(
-        evaluate_input("$cos(0.0)").expect("$cos(0)").output,
-        "1.0"
-    );
-    assert_eq!(
-        evaluate_input("$tan(0.0)").expect("$tan(0)").output,
-        "0.0"
-    );
+    assert_eq!(evaluate_input("$exp(0.0)").expect("$exp(0)").output, "1.0");
+    assert_eq!(evaluate_input("$floor(2.7)").expect("$floor").output, "2.0");
+    assert_eq!(evaluate_input("$ceil(2.3)").expect("$ceil").output, "3.0");
+    assert_eq!(evaluate_input("$sin(0.0)").expect("$sin(0)").output, "0.0");
+    assert_eq!(evaluate_input("$cos(0.0)").expect("$cos(0)").output, "1.0");
+    assert_eq!(evaluate_input("$tan(0.0)").expect("$tan(0)").output, "0.0");
     assert_eq!(
         evaluate_input("$asin(0.0)").expect("$asin(0)").output,
         "0.0"
@@ -4262,10 +4277,7 @@ fn real_math_basic_results() {
 // can write `$sqrt(4)` without an explicit `$itor` wrapper.
 #[test]
 fn real_math_accepts_integer_argument() {
-    assert_eq!(
-        evaluate_input("$sqrt(4)").expect("$sqrt int").output,
-        "2.0"
-    );
+    assert_eq!(evaluate_input("$sqrt(4)").expect("$sqrt int").output, "2.0");
     // 4'b01x0 → x/z→0 → 0100 → 4 → sqrt = 2.0
     assert_eq!(
         evaluate_input("$sqrt(4'b01x0)")
@@ -4273,10 +4285,7 @@ fn real_math_accepts_integer_argument() {
             .output,
         "2.0"
     );
-    assert_eq!(
-        evaluate_input("$exp(0)").expect("$exp int").output,
-        "1.0"
-    );
+    assert_eq!(evaluate_input("$exp(0)").expect("$exp int").output, "1.0");
 }
 
 // 2-arg math functions: $pow, $atan2, $hypot.
@@ -4323,14 +4332,8 @@ fn real_math_nan_and_infinity_propagate() {
         evaluate_input("$sqrt(-1.0)").expect("$sqrt neg").output,
         "NaN"
     );
-    assert_eq!(
-        evaluate_input("$ln(0.0)").expect("$ln(0)").output,
-        "-inf"
-    );
-    assert_eq!(
-        evaluate_input("$ln(-1.0)").expect("$ln neg").output,
-        "NaN"
-    );
+    assert_eq!(evaluate_input("$ln(0.0)").expect("$ln(0)").output, "-inf");
+    assert_eq!(evaluate_input("$ln(-1.0)").expect("$ln neg").output, "NaN");
     assert_eq!(
         evaluate_input("$acos(2.0)")
             .expect("$acos out of range")
@@ -4433,8 +4436,14 @@ fn reversed_and_forward_reg_ranges_behave_the_same_in_expressions() {
     session.eval("a = 4'b1010").expect("assign a");
     session.eval("b = 4'b1010").expect("assign b");
 
-    assert_eq!(session.eval("a + 1").expect("a + 1").output, "32'b00000000000000000000000000001011");
-    assert_eq!(session.eval("b + 1").expect("b + 1").output, "32'b00000000000000000000000000001011");
+    assert_eq!(
+        session.eval("a + 1").expect("a + 1").output,
+        "32'b00000000000000000000000000001011"
+    );
+    assert_eq!(
+        session.eval("b + 1").expect("b + 1").output,
+        "32'b00000000000000000000000000001011"
+    );
     assert_eq!(session.eval("a == b").expect("a == b").output, "1'b1");
     assert_eq!(session.eval("{a,b}").expect("concat").output, "8'b10101010");
 }
@@ -4467,8 +4476,14 @@ fn scalar_and_explicit_one_bit_reg_ranges_remain_distinct() {
         (&BigInt::from(0u8), &BigInt::from(0u8))
     );
 
-    assert_eq!(session.eval("a = 1'b1; a").expect("assign a").output, "1'b1");
-    assert_eq!(session.eval("b = 1'b1; b").expect("assign b").output, "1'b1");
+    assert_eq!(
+        session.eval("a = 1'b1; a").expect("assign a").output,
+        "1'b1"
+    );
+    assert_eq!(
+        session.eval("b = 1'b1; b").expect("assign b").output,
+        "1'b1"
+    );
     assert_eq!(session.eval("a == b").expect("a == b").output, "1'b1");
 }
 
@@ -4543,7 +4558,10 @@ fn reg_decl_produces_empty_out_line() {
 fn assignment_truncates_wider_rhs_to_reg_width() {
     let mut session = Session::new();
     session.eval("reg [3:0] a").expect("decl");
-    assert_eq!(session.eval("a = 8'hff; a").expect("assign").output, "4'b1111");
+    assert_eq!(
+        session.eval("a = 8'hff; a").expect("assign").output,
+        "4'b1111"
+    );
 }
 
 #[test]
@@ -4594,7 +4612,10 @@ fn assignment_of_real_value_implicitly_converts_per_lrm_3_5_3() {
         "8'b00000010"
     );
     assert_eq!(
-        session.eval("a = -2.5; a").expect("ties away from zero").output,
+        session
+            .eval("a = -2.5; a")
+            .expect("ties away from zero")
+            .output,
         "8'b11111101"
     );
     assert_eq!(
@@ -4657,7 +4678,9 @@ fn redeclaration_replaces_the_previous_binding() {
 #[test]
 fn reg_decl_accepts_negative_range_endpoint() {
     let mut session = Session::new();
-    session.eval("reg [-1:0] a").expect("negative endpoint should be accepted");
+    session
+        .eval("reg [-1:0] a")
+        .expect("negative endpoint should be accepted");
     assert_eq!(session.eval("a").expect("read").output, "2'bxx");
 }
 
@@ -4725,7 +4748,9 @@ fn reg_decl_init_sign_extends_into_signed_reg() {
     // `-1` is unsized signed 32-bit; flowing through a signed 4-bit reg
     // sign-extends down to all-ones — same path as `a = -1`.
     let mut session = Session::new();
-    session.eval("reg signed [3:0] s = -1").expect("decl with signed init");
+    session
+        .eval("reg signed [3:0] s = -1")
+        .expect("decl with signed init");
     assert_eq!(session.eval("s").expect("read").output, "4'sb1111");
 }
 
@@ -4737,7 +4762,9 @@ fn reg_decl_init_real_value_implicitly_converts_per_lrm_3_5_3() {
     session.eval("reg [7:0] a = 1.5").expect("real init rounds");
     assert_eq!(session.eval("a").expect("read").output, "8'b00000010");
     let mut session = Session::new();
-    session.eval("reg signed [7:0] a = -2.5").expect("ties away from zero");
+    session
+        .eval("reg signed [7:0] a = -2.5")
+        .expect("ties away from zero");
     assert_eq!(session.eval("a").expect("read").output, "8'sb11111101");
     let mut session = Session::new();
     session.eval("reg [7:0] a = 3.4").expect("rounds toward 3");
@@ -4800,7 +4827,9 @@ fn reg_decl_self_referencing_init_narrows_prior_binding() {
     // bit survives.
     let mut session = Session::new();
     session.eval("reg [1:0] a = 2'b11").expect("first decl");
-    session.eval("reg a = a").expect("redecl narrower with self-init");
+    session
+        .eval("reg a = a")
+        .expect("redecl narrower with self-init");
     assert_eq!(session.eval("a").expect("read").output, "1'b1");
 }
 
@@ -4809,8 +4838,7 @@ fn reg_decl_self_referencing_init_without_prior_binding_errors() {
     // No prior binding means the identifier in the init RHS is genuinely
     // undeclared at evaluation time — surface the same error path as a
     // normal expression.
-    let err = evaluate_input("reg a = a")
-        .expect_err("self-init without prior binding errors");
+    let err = evaluate_input("reg a = a").expect_err("self-init without prior binding errors");
     assert_eq!(err, "Semantic error: undeclared identifier: a");
 }
 
@@ -4818,7 +4846,9 @@ fn reg_decl_self_referencing_init_without_prior_binding_errors() {
 fn reg_decl_init_can_reference_previously_declared_reg() {
     let mut session = Session::new();
     session.eval("reg [3:0] a = 5").expect("first decl");
-    session.eval("reg [7:0] b = a + 1").expect("init from prior reg");
+    session
+        .eval("reg [7:0] b = a + 1")
+        .expect("init from prior reg");
     assert_eq!(session.eval("b").expect("read").output, "8'b00000110");
 }
 
@@ -4827,7 +4857,9 @@ fn reg_decl_init_preserves_declared_reg_range_metadata() {
     // The init applies after the RegValue is inserted, so the range
     // metadata stored at decl time is still present afterwards.
     let mut session = Session::new();
-    session.eval("reg [0:3] a = 4'b1010").expect("decl with init");
+    session
+        .eval("reg [0:3] a = 4'b1010")
+        .expect("decl with init");
     assert_eq!(
         session.lookup_reg_range("a").expect("range for a"),
         (&BigInt::from(0u8), &BigInt::from(3u8))
@@ -4840,8 +4872,7 @@ fn reg_decl_init_propagates_rhs_evaluation_error() {
     // A bare init expression has access to the surrounding session, so
     // referencing an undeclared identifier surfaces the usual error
     // rather than silently leaving the new reg at x.
-    let err = evaluate_input("reg [3:0] a = nope")
-        .expect_err("undeclared identifier in init");
+    let err = evaluate_input("reg [3:0] a = nope").expect_err("undeclared identifier in init");
     assert_eq!(err, "Semantic error: undeclared identifier: nope");
 }
 
@@ -4876,8 +4907,7 @@ fn reg_decl_failed_init_preserves_prior_binding_for_redeclared_name() {
 
 #[test]
 fn reg_decl_rejects_duplicate_names_even_with_init() {
-    let err = evaluate_input("reg [3:0] a = 1, a = 2")
-        .expect_err("duplicate names rejected");
+    let err = evaluate_input("reg [3:0] a = 1, a = 2").expect_err("duplicate names rejected");
     assert!(
         err.contains("duplicate name"),
         "error should mention duplicate name, got: {err}"
@@ -4914,11 +4944,15 @@ fn constant_part_select_on_forward_decl_returns_unsigned_slice() {
     // Part-select results are always unsigned per LRM 4.7, and the
     // declared reg base (Binary, set by the decl path) flows through.
     let mut session = Session::new();
-    session
-        .eval("reg [7:0] r = 8'hAB")
-        .expect("decl with init");
-    assert_eq!(session.eval("r[3:0]").expect("low nibble").output, "4'b1011");
-    assert_eq!(session.eval("r[7:4]").expect("high nibble").output, "4'b1010");
+    session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
+    assert_eq!(
+        session.eval("r[3:0]").expect("low nibble").output,
+        "4'b1011"
+    );
+    assert_eq!(
+        session.eval("r[7:4]").expect("high nibble").output,
+        "4'b1010"
+    );
 }
 
 #[test]
@@ -4942,9 +4976,7 @@ fn constant_part_select_on_reversed_decl_requires_msb_le_lsb() {
 #[test]
 fn constant_part_select_wrong_direction_on_forward_decl_errors() {
     let mut session = Session::new();
-    session
-        .eval("reg [7:0] r = 8'hAB")
-        .expect("decl with init");
+    session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     let err = session
         .eval("r[2:5]")
         .expect_err("reversed direction on forward decl errors");
@@ -4981,14 +5013,9 @@ fn out_of_range_bit_select_yields_x() {
     // LRM 4.2.1: bit-select with index outside the declared range
     // returns x.
     let mut session = Session::new();
-    session
-        .eval("reg [7:0] r = 8'hAB")
-        .expect("decl with init");
+    session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     assert_eq!(session.eval("r[8]").expect("above range").output, "1'bx");
-    assert_eq!(
-        session.eval("r[-1]").expect("below range").output,
-        "1'bx"
-    );
+    assert_eq!(session.eval("r[-1]").expect("below range").output, "1'bx");
 }
 
 #[test]
@@ -4998,30 +5025,37 @@ fn out_of_range_part_select_fills_only_the_out_of_range_bits_with_x() {
     // become x. 8'hAB = 8'b10101011, so bits 6 and 7 are `1` and `0`,
     // and bits 8 / 9 are out of range.
     let mut session = Session::new();
-    session
-        .eval("reg [7:0] r = 8'hAB")
-        .expect("decl with init");
+    session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     assert_eq!(
-        session.eval("r[9:6]").expect("constant partial overlap").output,
+        session
+            .eval("r[9:6]")
+            .expect("constant partial overlap")
+            .output,
         "4'bxx10"
     );
     assert_eq!(
-        session.eval("r[6 +: 4]").expect("indexed partial overlap").output,
+        session
+            .eval("r[6 +: 4]")
+            .expect("indexed partial overlap")
+            .output,
         "4'bxx10"
     );
     // The example from the bug report, exact wording: `reg [3:0] a =
     // 4'b0101; a[4:3]` → `2'bx0` (bit 4 oob → x; bit 3 in range → 0).
     let mut session = Session::new();
-    session.eval("reg [3:0] a = 4'b0101").expect("decl with init");
-    assert_eq!(session.eval("a[4:3]").expect("partial overlap").output, "2'bx0");
+    session
+        .eval("reg [3:0] a = 4'b0101")
+        .expect("decl with init");
+    assert_eq!(
+        session.eval("a[4:3]").expect("partial overlap").output,
+        "2'bx0"
+    );
 }
 
 #[test]
 fn xz_in_bit_select_index_yields_x() {
     let mut session = Session::new();
-    session
-        .eval("reg [7:0] r = 8'hAB")
-        .expect("decl with init");
+    session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     session
         .eval("reg [3:0] i = 4'bxx10")
         .expect("decl with x bits");
@@ -5032,9 +5066,7 @@ fn xz_in_bit_select_index_yields_x() {
 #[test]
 fn xz_in_indexed_part_select_base_yields_all_x() {
     let mut session = Session::new();
-    session
-        .eval("reg [7:0] r = 8'hAB")
-        .expect("decl with init");
+    session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     session
         .eval("reg [3:0] i = 4'bxx10")
         .expect("decl with x bits");
@@ -5047,9 +5079,7 @@ fn xz_in_indexed_part_select_base_yields_all_x() {
 #[test]
 fn xz_in_constant_part_select_endpoint_errors() {
     let mut session = Session::new();
-    session
-        .eval("reg [7:0] r = 8'hAB")
-        .expect("decl with init");
+    session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     let err = session
         .eval("r[4'bxxxx:0]")
         .expect_err("x in constant endpoint errors");
@@ -5062,9 +5092,7 @@ fn xz_in_constant_part_select_endpoint_errors() {
 #[test]
 fn xz_or_nonpositive_indexed_width_errors() {
     let mut session = Session::new();
-    session
-        .eval("reg [7:0] r = 8'hAB")
-        .expect("decl with init");
+    session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     let err_xz = session
         .eval("r[0 +: 4'bxxxx]")
         .expect_err("x in width errors");
@@ -5072,9 +5100,7 @@ fn xz_or_nonpositive_indexed_width_errors() {
         err_xz.contains("indexed part-select width contains unknown bits"),
         "error should mention unknown bits, got: {err_xz}"
     );
-    let err_zero = session
-        .eval("r[0 +: 0]")
-        .expect_err("zero width errors");
+    let err_zero = session.eval("r[0 +: 0]").expect_err("zero width errors");
     assert!(
         err_zero.contains("indexed part-select width must be positive"),
         "error should mention positive, got: {err_zero}"
@@ -5097,7 +5123,10 @@ fn select_from_signed_reg_is_unsigned() {
     session
         .eval("reg signed [7:0] s = -8'sd1")
         .expect("signed decl");
-    assert_eq!(session.eval("s[7:0]").expect("full select").output, "8'b11111111");
+    assert_eq!(
+        session.eval("s[7:0]").expect("full select").output,
+        "8'b11111111"
+    );
 }
 
 #[test]
@@ -5117,9 +5146,7 @@ fn select_result_widens_in_outer_context() {
     // The select itself is self-determined unsigned, but the outer
     // context (`+ 16'b0`) widens it to 16 bits with zero extension.
     let mut session = Session::new();
-    session
-        .eval("reg [7:0] r = 8'hAB")
-        .expect("decl with init");
+    session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     assert_eq!(
         session.eval("r[3:0] + 16'b0").expect("widened").output,
         "16'b0000000000001011"
@@ -5177,9 +5204,7 @@ fn indexed_part_select_requires_adjacent_colon() {
     // `+` and `:` breaks the token boundary and the bracket contents
     // no longer match any select form, so it fails at parse.
     let mut session = Session::new();
-    session
-        .eval("reg [7:0] r = 8'hAB")
-        .expect("decl with init");
+    session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     assert_eq!(
         session.eval("r[2 +: 4]").expect("adjacent ok").output,
         "4'b1010"
@@ -5215,7 +5240,10 @@ fn bit_select_lhs_writes_single_bit() {
     let mut session = Session::new();
     session.eval("reg [7:0] r = 8'h00").expect("decl");
     assert_eq!(
-        session.eval("r[2] = 1'b1; r[2]").expect("bit-select assign").output,
+        session
+            .eval("r[2] = 1'b1; r[2]")
+            .expect("bit-select assign")
+            .output,
         "1'b1"
     );
     assert_eq!(session.eval("r").expect("read r").output, "8'b00000100");
@@ -5350,7 +5378,10 @@ fn lhs_select_on_negative_endpoint_reg() {
     let mut session = Session::new();
     session.eval("reg [-1:2] r = 4'b0000").expect("decl");
     assert_eq!(
-        session.eval("r[-1] = 1'b1; r[-1]").expect("write MSB").output,
+        session
+            .eval("r[-1] = 1'b1; r[-1]")
+            .expect("write MSB")
+            .output,
         "1'b1"
     );
     assert_eq!(session.eval("r").expect("read r").output, "4'b1000");
@@ -5363,7 +5394,10 @@ fn lhs_bit_select_out_of_range_silently_drops() {
     let mut session = Session::new();
     session.eval("reg [3:0] r = 4'b1010").expect("decl");
     assert_eq!(
-        session.eval("r[7] = 1'b1; r[7]").expect("oob bit-select").output,
+        session
+            .eval("r[7] = 1'b1; r[7]")
+            .expect("oob bit-select")
+            .output,
         "1'bx"
     );
     assert_eq!(session.eval("r").expect("read r").output, "4'b1010");
@@ -5524,7 +5558,10 @@ fn lhs_indexed_part_select_real_base_runs_before_rhs_eval() {
     let err = session
         .eval("r[1.5 +: 2] = undeclared_rhs")
         .expect_err("real base rejected");
-    assert_eq!(err, "Semantic error: indexed part-select base cannot be real");
+    assert_eq!(
+        err,
+        "Semantic error: indexed part-select base cannot be real"
+    );
     assert_eq!(session.eval("r").expect("read r").output, "4'b0000");
 }
 
@@ -5549,7 +5586,10 @@ fn lhs_real_rhs_into_concat_converts() {
     session.eval("reg [1:0] a = 2'b00").expect("decl a");
     session.eval("reg [3:0] b = 4'b0000").expect("decl b");
     assert_eq!(
-        session.eval("{a, b} = 6.7; {a, b}").expect("real RHS").output,
+        session
+            .eval("{a, b} = 6.7; {a, b}")
+            .expect("real RHS")
+            .output,
         "6'b000111"
     );
     assert_eq!(session.eval("a").expect("read a").output, "2'b00");
@@ -5564,7 +5604,10 @@ fn lhs_nan_rhs_fills_all_with_x() {
     session.eval("reg [3:0] a = 4'b0000").expect("decl a");
     session.eval("reg [3:0] b = 4'b0000").expect("decl b");
     assert_eq!(
-        session.eval("{a, b} = 0.0/0.0; {a, b}").expect("NaN RHS").output,
+        session
+            .eval("{a, b} = 0.0/0.0; {a, b}")
+            .expect("NaN RHS")
+            .output,
         "8'bxxxxxxxx"
     );
     assert_eq!(session.eval("a").expect("read a").output, "4'bxxxx");
@@ -5597,7 +5640,10 @@ fn lhs_rhs_zero_extends_to_concat_width() {
     session.eval("reg [3:0] a = 4'b1111").expect("decl a");
     session.eval("reg [3:0] b = 4'b1111").expect("decl b");
     assert_eq!(
-        session.eval("{a, b} = 4'h5; {a, b}").expect("zero-extend").output,
+        session
+            .eval("{a, b} = 4'h5; {a, b}")
+            .expect("zero-extend")
+            .output,
         "8'b00000101"
     );
     assert_eq!(session.eval("a").expect("read a").output, "4'b0000");
@@ -5653,7 +5699,10 @@ fn bare_concat_no_assign_still_parses_as_expression() {
     // The speculative lvalue branch must not poison the standalone-
     // concat-as-expression path: with no `=` following, the parsed
     // concat falls through to a normal expression statement.
-    assert_eq!(evaluate_input("{1'b1, 1'b0}").expect("concat expr").output, "2'b10");
+    assert_eq!(
+        evaluate_input("{1'b1, 1'b0}").expect("concat expr").output,
+        "2'b10"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -5666,7 +5715,10 @@ fn array_decl_records_dimension_and_element_count() {
     let mut session = Session::new();
     session.eval("reg [3:0] a [0:15]").expect("decl");
     let (msb, lsb, count) = session.lookup_reg_array("a").expect("array a");
-    assert_eq!((msb, lsb, count), (BigInt::from(0u8), BigInt::from(15u8), 16));
+    assert_eq!(
+        (msb, lsb, count),
+        (BigInt::from(0u8), BigInt::from(15u8), 16)
+    );
 }
 
 #[test]
@@ -5676,7 +5728,10 @@ fn array_decl_with_reversed_dimension_is_accepted() {
     let mut session = Session::new();
     session.eval("reg [3:0] a [15:0]").expect("decl");
     let (msb, lsb, count) = session.lookup_reg_array("a").expect("array a");
-    assert_eq!((msb, lsb, count), (BigInt::from(15u8), BigInt::from(0u8), 16));
+    assert_eq!(
+        (msb, lsb, count),
+        (BigInt::from(15u8), BigInt::from(0u8), 16)
+    );
 }
 
 #[test]
@@ -5842,7 +5897,10 @@ fn array_element_read_with_negative_index_against_negative_dim() {
     let mut session = Session::new();
     session.eval("reg [3:0] a [-2:1]").expect("decl");
     // -2 is in range; element width comes from the packed range.
-    assert_eq!(session.eval("a[-2]").expect("neg in range").output, "4'bxxxx");
+    assert_eq!(
+        session.eval("a[-2]").expect("neg in range").output,
+        "4'bxxxx"
+    );
     // -3 is out of range; same all-x result, but exercises the OOB
     // branch on the lower bound.
     assert_eq!(session.eval("a[-3]").expect("neg oob").output, "4'bxxxx");
@@ -5882,9 +5940,7 @@ fn array_element_read_rejects_real_index() {
     // no defined integer image at the array-element level.
     let mut session = Session::new();
     session.eval("reg [3:0] a [0:15]").expect("decl");
-    let err = session
-        .eval("a[1.0]")
-        .expect_err("real index should fail");
+    let err = session.eval("a[1.0]").expect_err("real index should fail");
     assert!(err.contains("array element index") && err.contains("real"));
 }
 
@@ -5942,7 +5998,10 @@ fn array_element_index_is_evaluated_in_self_determined_context() {
     // element's 4-bit value (x).
     let mut session = Session::new();
     session.eval("reg [3:0] a [0:15]").expect("decl");
-    assert_eq!(session.eval("a[2 + 3]").expect("arith idx").output, "4'bxxxx");
+    assert_eq!(
+        session.eval("a[2 + 3]").expect("arith idx").output,
+        "4'bxxxx"
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -6002,7 +6061,10 @@ fn array_chained_inner_select_with_oob_outer_index_yields_xs() {
         session.eval("a[100][3:1]").expect("oob outer").output,
         "3'bxxx"
     );
-    assert_eq!(session.eval("a[100][0]").expect("oob outer bit").output, "1'bx");
+    assert_eq!(
+        session.eval("a[100][0]").expect("oob outer bit").output,
+        "1'bx"
+    );
 }
 
 #[test]
@@ -6016,10 +6078,7 @@ fn array_chained_inner_select_with_xz_outer_index_yields_xs() {
         session.eval("a[1'bx][3:0]").expect("x outer").output,
         "4'bxxxx"
     );
-    assert_eq!(
-        session.eval("a[1'bz][0]").expect("z outer").output,
-        "1'bx"
-    );
+    assert_eq!(session.eval("a[1'bz][0]").expect("z outer").output, "1'bx");
 }
 
 #[test]
@@ -6142,7 +6201,10 @@ fn array_chained_select_in_concatenation_contributes_inner_width() {
     let mut session = Session::new();
     session.eval("reg [7:0] a [0:3]").expect("decl");
     assert_eq!(
-        session.eval("{a[0][3:0], a[1][1:0]}").expect("concat").output,
+        session
+            .eval("{a[0][3:0], a[1][1:0]}")
+            .expect("concat")
+            .output,
         "6'bxxxxxx"
     );
 }
@@ -6200,7 +6262,10 @@ fn array_element_write_with_wider_rhs_truncates_to_element_width() {
     let mut session = Session::new();
     session.eval("reg [3:0] a [0:3]").expect("decl");
     assert_eq!(
-        session.eval("a[1] = 8'b10101111; a[1]").expect("trunc").output,
+        session
+            .eval("a[1] = 8'b10101111; a[1]")
+            .expect("trunc")
+            .output,
         "4'b1111"
     );
     assert_eq!(session.eval("a[1]").expect("readback").output, "4'b1111");
@@ -6242,7 +6307,10 @@ fn array_element_write_with_oob_index_does_not_modify_any_element() {
     let mut session = Session::new();
     session.eval("reg [3:0] a [0:7]").expect("decl");
     assert_eq!(
-        session.eval("a[100] = 4'b0001; 4'b0001").expect("oob write").output,
+        session
+            .eval("a[100] = 4'b0001; 4'b0001")
+            .expect("oob write")
+            .output,
         "4'b0001"
     );
     // No element should have been touched.
@@ -6257,11 +6325,17 @@ fn array_element_write_with_xz_index_does_not_modify_any_element() {
     let mut session = Session::new();
     session.eval("reg [3:0] a [0:7]").expect("decl");
     assert_eq!(
-        session.eval("a[1'bx] = 4'b0001; 4'b0001").expect("x idx").output,
+        session
+            .eval("a[1'bx] = 4'b0001; 4'b0001")
+            .expect("x idx")
+            .output,
         "4'b0001"
     );
     assert_eq!(
-        session.eval("a[1'bz] = 4'b0010; 4'b0010").expect("z idx").output,
+        session
+            .eval("a[1'bz] = 4'b0010; 4'b0010")
+            .expect("z idx")
+            .output,
         "4'b0010"
     );
     assert_eq!(session.eval("a[0]").expect("e0").output, "4'bxxxx");
@@ -6313,7 +6387,10 @@ fn array_element_write_on_scalar_array_element_writes_one_bit() {
     let mut session = Session::new();
     session.eval("reg a [0:7]").expect("decl");
     assert_eq!(
-        session.eval("a[3] = 1'b1; a[3]").expect("scalar write").output,
+        session
+            .eval("a[3] = 1'b1; a[3]")
+            .expect("scalar write")
+            .output,
         "1'b1"
     );
     assert_eq!(session.eval("a[3]").expect("readback").output, "1'b1");
@@ -6329,7 +6406,10 @@ fn array_element_write_supports_self_reference() {
     session.eval("reg [3:0] a [0:3]").expect("decl");
     session.eval("a[0] = 4'b0011").expect("init");
     assert_eq!(
-        session.eval("a[0] = a[0] + 4'd1; a[0]").expect("self").output,
+        session
+            .eval("a[0] = a[0] + 4'd1; a[0]")
+            .expect("self")
+            .output,
         "4'b0100"
     );
     assert_eq!(session.eval("a[0]").expect("readback").output, "4'b0100");
@@ -6347,7 +6427,10 @@ fn array_element_write_supports_cross_element_read() {
         "4'b1100"
     );
     assert_eq!(session.eval("a[2]").expect("readback").output, "4'b1100");
-    assert_eq!(session.eval("a[1]").expect("source unchanged").output, "4'b1100");
+    assert_eq!(
+        session.eval("a[1]").expect("source unchanged").output,
+        "4'b1100"
+    );
 }
 
 #[test]
@@ -6422,7 +6505,10 @@ fn array_element_write_against_negative_endpoint_unpacked_dim() {
     let mut session = Session::new();
     session.eval("reg [3:0] a [-2:1]").expect("decl");
     assert_eq!(
-        session.eval("a[-2] = 4'b1001; a[-2]").expect("neg write").output,
+        session
+            .eval("a[-2] = 4'b1001; a[-2]")
+            .expect("neg write")
+            .output,
         "4'b1001"
     );
     assert_eq!(session.eval("a[-2]").expect("readback").output, "4'b1001");
@@ -6456,7 +6542,10 @@ fn array_element_write_with_arithmetic_index_expression() {
     let mut session = Session::new();
     session.eval("reg [3:0] a [0:7]").expect("decl");
     assert_eq!(
-        session.eval("a[2 + 3] = 4'b1111; a[5]").expect("arith idx").output,
+        session
+            .eval("a[2 + 3] = 4'b1111; a[5]")
+            .expect("arith idx")
+            .output,
         "4'b1111"
     );
     assert_eq!(session.eval("a[5]").expect("readback").output, "4'b1111");
@@ -6481,7 +6570,10 @@ fn array_element_bit_select_lhs_writes_only_the_named_bit() {
     // Echo prints in 1-bit unsigned binary context (the inner select's
     // self-determined shape).
     assert_eq!(
-        session.eval("a[1][0] = 1'b1; a[1][0]").expect("write bit").output,
+        session
+            .eval("a[1][0] = 1'b1; a[1][0]")
+            .expect("write bit")
+            .output,
         "1'b1"
     );
     assert_eq!(session.eval("a[1]").expect("readback").output, "4'b1011");
@@ -6505,7 +6597,10 @@ fn array_element_part_select_lhs_writes_only_the_named_slice() {
         "4'b1011"
     );
     // Bits [5:2] become 1011, others stay 0.
-    assert_eq!(session.eval("a[2]").expect("readback").output, "8'b00101100");
+    assert_eq!(
+        session.eval("a[2]").expect("readback").output,
+        "8'b00101100"
+    );
 }
 
 #[test]
@@ -6522,7 +6617,10 @@ fn array_element_indexed_part_select_lhs_writes_the_slice() {
             .output,
         "3'b111"
     );
-    assert_eq!(session.eval("a[0]").expect("readback").output, "8'b00011100");
+    assert_eq!(
+        session.eval("a[0]").expect("readback").output,
+        "8'b00011100"
+    );
 }
 
 #[test]
@@ -6641,9 +6739,7 @@ fn scalar_array_element_rejects_inner_select_on_lhs() {
     // diagnostic.
     let mut session = Session::new();
     session.eval("reg a [0:3]").expect("decl");
-    let err = session
-        .eval("a[0][0] = 1'b1")
-        .expect_err("scalar element");
+    let err = session.eval("a[0][0] = 1'b1").expect_err("scalar element");
     assert!(err.contains("scalar array element `a`"));
 }
 
@@ -6653,9 +6749,7 @@ fn array_element_chained_select_rejects_part_outer_select() {
     // is rejected with the array-element diagnostic.
     let mut session = Session::new();
     session.eval("reg [3:0] a [0:7]").expect("decl");
-    let err = session
-        .eval("a[3:0][1:0] = 2'b11")
-        .expect_err("part outer");
+    let err = session.eval("a[3:0][1:0] = 2'b11").expect_err("part outer");
     assert!(err.contains("part-select on array `a`"));
 }
 
@@ -6724,7 +6818,10 @@ fn array_element_lhs_concat_xz_index_drops_element_but_cursor_advances() {
     // b receives the low nibble correctly despite the dropped leaf.
     assert_eq!(session.eval("b").expect("b").output, "4'b0000");
     // a[0] is untouched (the x-index doesn't accidentally hit it).
-    assert_eq!(session.eval("a[0]").expect("a[0] preserved").output, "4'b1010");
+    assert_eq!(
+        session.eval("a[0]").expect("a[0] preserved").output,
+        "4'b1010"
+    );
     // All other array elements remain at their default x.
     assert_eq!(session.eval("a[1]").expect("a[1]").output, "4'bxxxx");
     assert_eq!(session.eval("a[2]").expect("a[2]").output, "4'bxxxx");
@@ -6792,9 +6889,7 @@ fn array_element_write_rhs_error_wins_over_outer_index_xz() {
     // precedence — matching the Phase 4 precedence rule.
     let mut session = Session::new();
     session.eval("reg [3:0] a [0:3]").expect("decl");
-    let err = session
-        .eval("a[1'bx] = nope")
-        .expect_err("rhs error wins");
+    let err = session.eval("a[1'bx] = nope").expect_err("rhs error wins");
     assert!(err.contains("undeclared identifier: nope"));
 }
 
@@ -6806,9 +6901,7 @@ fn array_element_lhs_concat_rejects_array_bare_name_leaf() {
     let mut session = Session::new();
     session.eval("reg [3:0] a [0:3]").expect("decl");
     session.eval("reg [3:0] b").expect("decl b");
-    let err = session
-        .eval("{a, b} = 20'b0")
-        .expect_err("bare array leaf");
+    let err = session.eval("{a, b} = 20'b0").expect_err("bare array leaf");
     assert!(err.contains("array `a` cannot be used as a value"));
 }
 
@@ -6845,10 +6938,14 @@ fn integer_decl_with_negative_init_sign_extends_to_32_bits() {
 #[test]
 fn integer_decl_with_real_init_rounds_per_lrm_3_5_3() {
     let mut session = Session::new();
-    session.eval("integer i = 1.5").expect("ties away from zero");
+    session
+        .eval("integer i = 1.5")
+        .expect("ties away from zero");
     assert_eq!(session.eval("i").expect("read").output, "32'sd2");
     let mut session = Session::new();
-    session.eval("integer i = -2.5").expect("negative ties away from zero");
+    session
+        .eval("integer i = -2.5")
+        .expect("negative ties away from zero");
     assert_eq!(session.eval("i").expect("read").output, "-32'sd3");
 }
 
@@ -7165,14 +7262,19 @@ fn real_array_element_read_in_real_arithmetic() {
     session.eval("real r [0:3]").expect("decl");
     session.eval("r[0] = 1.5").expect("write");
     assert_eq!(session.eval("r[0] + 0.5").expect("arith").output, "2.0");
-    assert_eq!(session.eval("$sqrt(r[0] + 2.5)").expect("sqrt").output, "2.0");
+    assert_eq!(
+        session.eval("$sqrt(r[0] + 2.5)").expect("sqrt").output,
+        "2.0"
+    );
 }
 
 #[test]
 fn real_array_rejects_part_select_on_lhs() {
     let mut session = Session::new();
     session.eval("real r [0:3]").expect("decl");
-    let err = session.eval("r[1:0] = 1.0").expect_err("part-select banned");
+    let err = session
+        .eval("r[1:0] = 1.0")
+        .expect_err("part-select banned");
     assert!(err.contains("part-select on array `r`"));
 }
 
@@ -7190,9 +7292,7 @@ fn real_array_rejects_chained_inner_select_on_lhs() {
 fn real_array_rejects_real_index_on_lhs() {
     let mut session = Session::new();
     session.eval("real r [0:3]").expect("decl");
-    let err = session
-        .eval("r[1.0] = 1.0")
-        .expect_err("real index banned");
+    let err = session.eval("r[1.0] = 1.0").expect_err("real index banned");
     assert!(err.contains("array element index cannot be real"));
 }
 
@@ -7291,7 +7391,9 @@ fn integer_decl_self_reference_reads_prior_binding() {
     // binding, not the new (still-uninitialized) slot.
     let mut session = Session::new();
     session.eval("integer i = 7").expect("first decl");
-    session.eval("integer i = i + 1").expect("redecl reads prior");
+    session
+        .eval("integer i = i + 1")
+        .expect("redecl reads prior");
     assert_eq!(session.eval("i").expect("read").output, "32'sd8");
 }
 
@@ -7534,7 +7636,9 @@ fn annotate_of_deep_binary_does_not_overflow() {
         e = Expr::Binary {
             op: BinaryOp::Add,
             lhs: Box::new(e),
-            rhs: Box::new(Expr::Literal(parse_integer("1").expect("literal should parse"))),
+            rhs: Box::new(Expr::Literal(
+                parse_integer("1").expect("literal should parse"),
+            )),
         };
     }
     let session = Session::new();
@@ -7584,7 +7688,9 @@ fn semantic_check_of_deep_binary_does_not_overflow() {
         e = Expr::Binary {
             op: BinaryOp::Add,
             lhs: Box::new(e),
-            rhs: Box::new(Expr::Literal(parse_integer("1").expect("literal should parse"))),
+            rhs: Box::new(Expr::Literal(
+                parse_integer("1").expect("literal should parse"),
+            )),
         };
     }
     let session = Session::new();
@@ -7599,8 +7705,12 @@ fn semantic_check_of_deep_conditional_does_not_overflow() {
     let mut e = Expr::Literal(parse_integer("0").expect("literal should parse"));
     for _ in 0..100_000 {
         e = Expr::Conditional {
-            cond: Box::new(Expr::Literal(parse_integer("1").expect("literal should parse"))),
-            then_expr: Box::new(Expr::Literal(parse_integer("1").expect("literal should parse"))),
+            cond: Box::new(Expr::Literal(
+                parse_integer("1").expect("literal should parse"),
+            )),
+            then_expr: Box::new(Expr::Literal(
+                parse_integer("1").expect("literal should parse"),
+            )),
             else_expr: Box::new(e),
         };
     }
@@ -7664,7 +7774,11 @@ fn deep_unary_minus_chain_evaluates() {
     let n = DEEP_CHAIN_DEPTH;
     let input: String = "-".repeat(n) + "1";
     let evaluation = evaluate_input(&input).expect("deep unary minus chain evaluates");
-    let expected = if n.is_multiple_of(2) { "32'sd1" } else { "-32'sd1" };
+    let expected = if n.is_multiple_of(2) {
+        "32'sd1"
+    } else {
+        "-32'sd1"
+    };
     assert_eq!(evaluation.output, expected);
 }
 
@@ -7867,7 +7981,10 @@ fn evaluate_of_deep_concatenation_two_items_per_layer_does_not_overflow() {
     let value = crate::eval::evaluate_expr(&e, &session).expect("deep two-item concat evaluates");
     let total_bits = n + 1;
     let expected_digits = "1".repeat(total_bits);
-    assert_eq!(value.canonical(), format!("{total_bits}'b{expected_digits}"));
+    assert_eq!(
+        value.canonical(),
+        format!("{total_bits}'b{expected_digits}")
+    );
 }
 
 #[test]
@@ -7996,11 +8113,14 @@ fn evaluate_of_pow_with_deep_integer_arg_does_not_overflow() {
     }
     let e = Expr::SystemCall {
         name: "$pow".to_string(),
-        args: vec![Expr::Literal(parse_integer("2").expect("base literal")), chain],
+        args: vec![
+            Expr::Literal(parse_integer("2").expect("base literal")),
+            chain,
+        ],
     };
     let session = Session::new();
-    let value = crate::eval::evaluate_expr(&e, &session)
-        .expect("$pow(2, deep integer chain) evaluates");
+    let value =
+        crate::eval::evaluate_expr(&e, &session).expect("$pow(2, deep integer chain) evaluates");
     assert!(matches!(value, crate::value::Value::Real(_)));
 }
 
@@ -8302,8 +8422,7 @@ fn at_cap_literal_width_accepted() {
     // Boundary: exactly 2**24 bits is accepted. Sanity-check the cap
     // is inclusive on the accept side — otherwise the off-by-one would
     // surface as a silent regression on the largest legal value.
-    let evaluation =
-        evaluate_input("16777216'd1").expect("at-cap literal width is accepted");
+    let evaluation = evaluate_input("16777216'd1").expect("at-cap literal width is accepted");
     assert!(
         evaluation.output.starts_with("16777216'd"),
         "expected 16777216-wide output, got: {}",
@@ -8329,7 +8448,10 @@ fn parse_input_returns_ast_without_evaluating() {
     // contract.
     let rendered = parse_input("1 + 2").expect("should parse");
     assert!(rendered.contains("Add"), "expected Add op in: {rendered}");
-    assert!(rendered.contains("Binary"), "expected Binary node in: {rendered}");
+    assert!(
+        rendered.contains("Binary"),
+        "expected Binary node in: {rendered}"
+    );
 
     // Empty input is the same no-op contract as evaluate_input.
     assert_eq!(parse_input("").unwrap(), "");
@@ -8404,8 +8526,8 @@ fn parse_input_truncates_deep_concat_lvalue() {
     let n = 200;
     let lhs = "{".repeat(n) + "a" + &"}".repeat(n);
     let input = format!("{lhs} = 1");
-    let rendered = parse_input_with_depth(&input, 10)
-        .expect("deep concat lvalue should parse and render");
+    let rendered =
+        parse_input_with_depth(&input, 10).expect("deep concat lvalue should parse and render");
     assert!(
         rendered.contains("Truncated"),
         "expected LValue::Truncated marker when concat lvalue exceeds depth cap"

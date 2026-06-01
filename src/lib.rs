@@ -93,18 +93,14 @@ impl RegValue {
             RegStorage::Array { .. } | RegStorage::RealArray { .. } => {
                 Err(format!("array `{name}` cannot be used as a value"))
             }
-            RegStorage::Real(_) => Err(format!(
-                "real `{name}` cannot be used as an integer value"
-            )),
+            RegStorage::Real(_) => Err(format!("real `{name}` cannot be used as an integer value")),
         }
     }
 
     pub(crate) fn vector_mut(&mut self) -> Option<&mut IntegerValue> {
         match &mut self.storage {
             RegStorage::Vector(value) => Some(value),
-            RegStorage::Array { .. }
-            | RegStorage::Real(_)
-            | RegStorage::RealArray { .. } => None,
+            RegStorage::Array { .. } | RegStorage::Real(_) | RegStorage::RealArray { .. } => None,
         }
     }
 
@@ -115,9 +111,7 @@ impl RegValue {
     pub(crate) fn array(&self) -> Option<(&RegRange, &[IntegerValue])> {
         match &self.storage {
             RegStorage::Array { dim, elements } => Some((dim, elements.as_slice())),
-            RegStorage::Vector(_)
-            | RegStorage::Real(_)
-            | RegStorage::RealArray { .. } => None,
+            RegStorage::Vector(_) | RegStorage::Real(_) | RegStorage::RealArray { .. } => None,
         }
     }
 
@@ -128,9 +122,7 @@ impl RegValue {
     pub(crate) fn array_mut(&mut self) -> Option<(&RegRange, &mut [IntegerValue])> {
         match &mut self.storage {
             RegStorage::Array { dim, elements } => Some((dim, elements.as_mut_slice())),
-            RegStorage::Vector(_)
-            | RegStorage::Real(_)
-            | RegStorage::RealArray { .. } => None,
+            RegStorage::Vector(_) | RegStorage::Real(_) | RegStorage::RealArray { .. } => None,
         }
     }
 
@@ -140,9 +132,7 @@ impl RegValue {
     pub(crate) fn real_array(&self) -> Option<(&RegRange, &[f64])> {
         match &self.storage {
             RegStorage::RealArray { dim, elements } => Some((dim, elements.as_slice())),
-            RegStorage::Vector(_)
-            | RegStorage::Array { .. }
-            | RegStorage::Real(_) => None,
+            RegStorage::Vector(_) | RegStorage::Array { .. } | RegStorage::Real(_) => None,
         }
     }
 
@@ -152,9 +142,7 @@ impl RegValue {
     pub(crate) fn real_array_mut(&mut self) -> Option<(&RegRange, &mut [f64])> {
         match &mut self.storage {
             RegStorage::RealArray { dim, elements } => Some((dim, elements.as_mut_slice())),
-            RegStorage::Vector(_)
-            | RegStorage::Array { .. }
-            | RegStorage::Real(_) => None,
+            RegStorage::Vector(_) | RegStorage::Array { .. } | RegStorage::Real(_) => None,
         }
     }
 
@@ -165,9 +153,7 @@ impl RegValue {
     pub(crate) fn real(&self) -> Option<f64> {
         match &self.storage {
             RegStorage::Real(value) => Some(*value),
-            RegStorage::Vector(_)
-            | RegStorage::Array { .. }
-            | RegStorage::RealArray { .. } => None,
+            RegStorage::Vector(_) | RegStorage::Array { .. } | RegStorage::RealArray { .. } => None,
         }
     }
 
@@ -177,9 +163,7 @@ impl RegValue {
     pub(crate) fn real_mut(&mut self) -> Option<&mut f64> {
         match &mut self.storage {
             RegStorage::Real(value) => Some(value),
-            RegStorage::Vector(_)
-            | RegStorage::Array { .. }
-            | RegStorage::RealArray { .. } => None,
+            RegStorage::Vector(_) | RegStorage::Array { .. } | RegStorage::RealArray { .. } => None,
         }
     }
 }
@@ -218,34 +202,24 @@ impl Session {
     // shape behind a single read accessor so tests don't have to import
     // `RegStorage`.
     #[cfg(test)]
-    pub(crate) fn lookup_reg_array(
-        &self,
-        name: &str,
-    ) -> Option<(BigInt, BigInt, usize)> {
+    pub(crate) fn lookup_reg_array(&self, name: &str) -> Option<(BigInt, BigInt, usize)> {
         self.lookup(name).and_then(|reg| match &reg.storage {
             RegStorage::Array { dim, elements } => {
                 Some((dim.msb.clone(), dim.lsb.clone(), elements.len()))
             }
-            RegStorage::Vector(_)
-            | RegStorage::Real(_)
-            | RegStorage::RealArray { .. } => None,
+            RegStorage::Vector(_) | RegStorage::Real(_) | RegStorage::RealArray { .. } => None,
         })
     }
 
     // Test helper: returns (msb, lsb, element_count) for a real array,
     // mirroring `lookup_reg_array` for the f64-element form.
     #[cfg(test)]
-    pub(crate) fn lookup_reg_real_array(
-        &self,
-        name: &str,
-    ) -> Option<(BigInt, BigInt, usize)> {
+    pub(crate) fn lookup_reg_real_array(&self, name: &str) -> Option<(BigInt, BigInt, usize)> {
         self.lookup(name).and_then(|reg| match &reg.storage {
             RegStorage::RealArray { dim, elements } => {
                 Some((dim.msb.clone(), dim.lsb.clone(), elements.len()))
             }
-            RegStorage::Vector(_)
-            | RegStorage::Array { .. }
-            | RegStorage::Real(_) => None,
+            RegStorage::Vector(_) | RegStorage::Array { .. } | RegStorage::Real(_) => None,
         })
     }
 
@@ -312,10 +286,7 @@ pub fn parse_input_with_depth(input: &str, max_depth: usize) -> Result<String, S
     Ok(format!("{statements:#?}"))
 }
 
-fn evaluate_input_with_session(
-    session: &mut Session,
-    input: &str,
-) -> Result<Evaluation, String> {
+fn evaluate_input_with_session(session: &mut Session, input: &str) -> Result<Evaluation, String> {
     let input = input.trim();
     if input.is_empty() {
         return Ok(Evaluation {
@@ -372,7 +343,10 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), Stri
     match stmt {
         Stmt::Expr(expr) => {
             if let Expr::SystemCall { name, .. } = eval::unwrap_grouped(expr)
-                && matches!(eval::classify_system_call(name), Ok(eval::SystemCallKind::Task))
+                && matches!(
+                    eval::classify_system_call(name),
+                    Ok(eval::SystemCallKind::Task)
+                )
             {
                 return Ok((String::new(), true));
             }
@@ -547,10 +521,7 @@ fn apply_decl(
 // back in so the per-init loop doesn't have to clone on every
 // iteration. Mirrors the inlined pattern the previous reg-only path
 // used; lifting it out keeps the per-kind storage branches readable.
-fn with_staged_session<T, F>(
-    staged: &mut HashMap<String, RegValue>,
-    f: F,
-) -> Result<T, String>
+fn with_staged_session<T, F>(staged: &mut HashMap<String, RegValue>, f: F) -> Result<T, String>
 where
     F: FnOnce(&Session) -> Result<T, String>,
 {
@@ -739,11 +710,7 @@ impl RegRange {
     }
 }
 
-fn evaluate_range_endpoint(
-    expr: &Expr,
-    session: &Session,
-    role: &str,
-) -> Result<BigInt, String> {
+fn evaluate_range_endpoint(expr: &Expr, session: &Session, role: &str) -> Result<BigInt, String> {
     if eval::expression_is_real(expr, session) {
         return Err(format!("Semantic error: reg range {role} cannot be real"));
     }
@@ -752,7 +719,9 @@ fn evaluate_range_endpoint(
     // is also a static-semantic rule, so it carries the same prefix.
     let value = eval::evaluate_constant_expr(expr, session)?;
     if value.has_unknown_bits() {
-        return Err(format!("Semantic error: reg range {role} contains unknown bits"));
+        return Err(format!(
+            "Semantic error: reg range {role} contains unknown bits"
+        ));
     }
     Ok(value.as_bigint(value.signed))
 }

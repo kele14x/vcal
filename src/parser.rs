@@ -27,7 +27,9 @@ pub(crate) enum LiteralPayload {
     // Numeric magnitude only — used by parse_unsized_decimal and the
     // non-x/non-z arm of parse_based_decimal. Size O(digits). Materializes
     // via biguint_to_bits_with_width.
-    Numeric { magnitude: BigUint },
+    Numeric {
+        magnitude: BigUint,
+    },
     // Explicit bit pattern from radix digits (binary/octal/hex), plus a fill
     // bit for sign/zero/x/z extension to `width`. Covers parse_based_radix
     // and the all-x / all-z short-circuits in parse_based_decimal (empty
@@ -194,24 +196,15 @@ pub(crate) enum SelectKind {
     Bit { index: Box<Expr> },
     // `r[m:l]`. Both endpoints are constant expressions (LRM 5.2.1).
     // Direction must match the declared reg direction.
-    PartConst {
-        msb: Box<Expr>,
-        lsb: Box<Expr>,
-    },
+    PartConst { msb: Box<Expr>, lsb: Box<Expr> },
     // `r[base +: width]`. `base` is a self-determined integer expression;
     // `width` is a positive constant (LRM 5.2.2). Result spans the source
     // range `[base, base + width - 1]`.
-    PartIndexedUp {
-        base: Box<Expr>,
-        width: Box<Expr>,
-    },
+    PartIndexedUp { base: Box<Expr>, width: Box<Expr> },
     // `r[base -: width]`. `base` is a self-determined integer expression;
     // `width` is a positive constant (LRM 5.2.2). Result spans the source
     // range `[base - width + 1, base]`.
-    PartIndexedDown {
-        base: Box<Expr>,
-        width: Box<Expr>,
-    },
+    PartIndexedDown { base: Box<Expr>, width: Box<Expr> },
 }
 
 // Truncate an `Expr` so that any sub-tree at depth `>= max_depth` is
@@ -239,10 +232,7 @@ fn truncate_expr_inner(expr: &mut Expr, depth: usize, max_depth: usize) {
         return;
     }
     match expr {
-        Expr::Literal(_)
-        | Expr::RealLiteral(_)
-        | Expr::Identifier(_)
-        | Expr::Truncated => {}
+        Expr::Literal(_) | Expr::RealLiteral(_) | Expr::Identifier(_) | Expr::Truncated => {}
         Expr::Grouped(inner) => truncate_expr_inner(inner.as_mut(), depth + 1, max_depth),
         Expr::Unary { expr: inner, .. } => {
             truncate_expr_inner(inner.as_mut(), depth + 1, max_depth)
@@ -292,8 +282,7 @@ fn truncate_select_kind_inner(kind: &mut SelectKind, depth: usize, max_depth: us
             truncate_expr_inner(msb.as_mut(), depth, max_depth);
             truncate_expr_inner(lsb.as_mut(), depth, max_depth);
         }
-        SelectKind::PartIndexedUp { base, width }
-        | SelectKind::PartIndexedDown { base, width } => {
+        SelectKind::PartIndexedUp { base, width } | SelectKind::PartIndexedDown { base, width } => {
             truncate_expr_inner(base.as_mut(), depth, max_depth);
             truncate_expr_inner(width.as_mut(), depth, max_depth);
         }
@@ -401,10 +390,7 @@ impl Drop for Expr {
 fn steal_expr_children(expr: &mut Expr, out: &mut Vec<Expr>) {
     let placeholder = || Expr::Identifier(String::new());
     match expr {
-        Expr::Literal(_)
-        | Expr::RealLiteral(_)
-        | Expr::Identifier(_)
-        | Expr::Truncated => {}
+        Expr::Literal(_) | Expr::RealLiteral(_) | Expr::Identifier(_) | Expr::Truncated => {}
         Expr::Grouped(inner) => {
             out.push(std::mem::replace(inner.as_mut(), placeholder()));
         }
@@ -456,8 +442,7 @@ fn steal_select_kind_children(kind: &mut SelectKind, out: &mut Vec<Expr>) {
             out.push(std::mem::replace(msb.as_mut(), placeholder()));
             out.push(std::mem::replace(lsb.as_mut(), placeholder()));
         }
-        SelectKind::PartIndexedUp { base, width }
-        | SelectKind::PartIndexedDown { base, width } => {
+        SelectKind::PartIndexedUp { base, width } | SelectKind::PartIndexedDown { base, width } => {
             out.push(std::mem::replace(base.as_mut(), placeholder()));
             out.push(std::mem::replace(width.as_mut(), placeholder()));
         }
@@ -899,7 +884,10 @@ enum Pending {
 // across the open delimiter.
 fn apply_prefix_unary_ops(mut expr: Expr, ops: Vec<UnaryOp>) -> Expr {
     for op in ops.into_iter().rev() {
-        expr = Expr::Unary { op, expr: Box::new(expr) };
+        expr = Expr::Unary {
+            op,
+            expr: Box::new(expr),
+        };
     }
     expr
 }
@@ -911,7 +899,10 @@ pub(crate) fn parse_expression(input: &str) -> Result<Expr, String> {
         return Err("empty expression".to_string());
     }
 
-    let mut parser = Parser { tokens: &tokens, index: 0 };
+    let mut parser = Parser {
+        tokens: &tokens,
+        index: 0,
+    };
     let expression = parser.parse_expression()?;
 
     if parser.peek().is_some() {
@@ -1036,7 +1027,10 @@ impl<'a> Parser<'a> {
                     // sign cast, base cast, task, or unknown.
                     if !matches!(self.peek(), Some(Token::LParen)) {
                         value = Some(apply_prefix_unary_ops(
-                            Expr::SystemCall { name, args: Vec::new() },
+                            Expr::SystemCall {
+                                name,
+                                args: Vec::new(),
+                            },
                             prefix_ops,
                         ));
                         continue;
@@ -1045,7 +1039,10 @@ impl<'a> Parser<'a> {
                     if matches!(self.peek(), Some(Token::RParen)) {
                         self.index += 1;
                         value = Some(apply_prefix_unary_ops(
-                            Expr::SystemCall { name, args: Vec::new() },
+                            Expr::SystemCall {
+                                name,
+                                args: Vec::new(),
+                            },
                             prefix_ops,
                         ));
                         continue;
@@ -1115,17 +1112,27 @@ impl<'a> Parser<'a> {
                     }
                     let inner = value.take().expect("value is Some when reducing");
                     let frame = stack.pop().expect("just inspected via last()");
-                    let Pending::Group { unary_wrap, saved_min_bp } = frame else {
+                    let Pending::Group {
+                        unary_wrap,
+                        saved_min_bp,
+                    } = frame
+                    else {
                         unreachable!("matched Group above");
                     };
-                    let wrapped = apply_prefix_unary_ops(Expr::Grouped(Box::new(inner)), unary_wrap);
+                    let wrapped =
+                        apply_prefix_unary_ops(Expr::Grouped(Box::new(inner)), unary_wrap);
                     value = Some(wrapped);
                     min_bp = saved_min_bp;
                 }
                 Some(Pending::BinaryAwaitRhs { .. }) => {
                     let rhs = value.take().expect("value is Some when reducing");
                     let frame = stack.pop().expect("just inspected via last()");
-                    let Pending::BinaryAwaitRhs { lhs, op, saved_min_bp } = frame else {
+                    let Pending::BinaryAwaitRhs {
+                        lhs,
+                        op,
+                        saved_min_bp,
+                    } = frame
+                    else {
                         unreachable!("matched BinaryAwaitRhs above");
                     };
                     value = Some(Expr::Binary {
@@ -1156,7 +1163,12 @@ impl<'a> Parser<'a> {
                 Some(Pending::ConditionalElse { .. }) => {
                     let else_expr = value.take().expect("value is Some when reducing");
                     let frame = stack.pop().expect("just inspected via last()");
-                    let Pending::ConditionalElse { cond, then, saved_min_bp } = frame else {
+                    let Pending::ConditionalElse {
+                        cond,
+                        then,
+                        saved_min_bp,
+                    } = frame
+                    else {
                         unreachable!("matched ConditionalElse above");
                     };
                     value = Some(Expr::Conditional {
@@ -1183,7 +1195,12 @@ impl<'a> Parser<'a> {
                         self.index += 1;
                         let v = value.take().expect("value is Some when reducing");
                         let frame = stack.pop().expect("just inspected via last()");
-                        let Pending::Brace { mut items, unary_wrap, saved_min_bp } = frame else {
+                        let Pending::Brace {
+                            mut items,
+                            unary_wrap,
+                            saved_min_bp,
+                        } = frame
+                        else {
                             unreachable!("matched Brace above");
                         };
                         items.push(v);
@@ -1200,7 +1217,12 @@ impl<'a> Parser<'a> {
                         self.index += 1; // consume `{`
                         let count = value.take().expect("value is Some when reducing");
                         let frame = stack.pop().expect("just inspected via last()");
-                        let Pending::Brace { unary_wrap, saved_min_bp, .. } = frame else {
+                        let Pending::Brace {
+                            unary_wrap,
+                            saved_min_bp,
+                            ..
+                        } = frame
+                        else {
                             unreachable!("matched Brace above");
                         };
                         stack.push(Pending::Replication {
@@ -1402,10 +1424,12 @@ impl<'a> Parser<'a> {
         loop {
             let name = match self.next() {
                 Some(Token::Identifier(n)) => n.clone(),
-                _ => return Err(format!(
-                    "expected identifier in {} declaration",
-                    kind.keyword()
-                )),
+                _ => {
+                    return Err(format!(
+                        "expected identifier in {} declaration",
+                        kind.keyword()
+                    ));
+                }
             };
             if matches!(name.as_str(), "reg" | "integer" | "real" | "signed") {
                 return Err(format!(
@@ -1550,7 +1574,7 @@ impl<'a> Parser<'a> {
             let inner_kind = self.parse_select_kind()?;
             if matches!(self.peek(), Some(Token::LBracket)) {
                 return Err(
-                    "chained selects beyond one inner bracket are not supported".to_string(),
+                    "chained selects beyond one inner bracket are not supported".to_string()
                 );
             }
             Some(Box::new(inner_kind))
@@ -1693,7 +1717,7 @@ fn expression_to_lvalue(root: Expr) -> Result<LValue, String> {
                     }
                     Expr::Replication { .. } => {
                         return Err(
-                            "invalid lvalue: replication is not a variable_lvalue".to_string(),
+                            "invalid lvalue: replication is not a variable_lvalue".to_string()
                         );
                     }
                     _ => {
@@ -1718,7 +1742,9 @@ fn expression_to_lvalue(root: Expr) -> Result<LValue, String> {
         "expression_to_lvalue produced {} values",
         vals.len()
     );
-    Ok(vals.pop().expect("driver invariant: one root produces one LValue"))
+    Ok(vals
+        .pop()
+        .expect("driver invariant: one root produces one LValue"))
 }
 
 enum LValueTask {
