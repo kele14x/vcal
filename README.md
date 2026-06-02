@@ -11,6 +11,10 @@ VCAL is a **V**erilog **cal**culator: an interactive REPL for evaluating Verilog
 
 ## Install & run
 
+Download a pre-built binary for your platform from the [GitHub releases page](https://github.com/kele14x/vcal/releases), extract the archive, and run `vcal` to start the interactive REPL.
+
+To build from source instead:
+
 ```sh
 cargo run             # interactive REPL
 cargo build           # build the binary
@@ -33,14 +37,7 @@ In [4]:
 
 ## Documentation
 
-- [doc/repl.md](doc/repl.md) — prompt, session, exit behavior, lexical clarifications
-- [doc/expressions.md](doc/expressions.md) — width, signedness, leaf extension, base propagation
-- [doc/operators.md](doc/operators.md) — per-operator semantics
-- [doc/variables.md](doc/variables.md) — `reg`, blocking assignment, bit-select / part-select
-- [doc/non-standard.md](doc/non-standard.md) — vcal-specific divergences from LRM
-- [doc/lrm-coverage.md](doc/lrm-coverage.md) — LRM chapter coverage and grammar matrix
-- [doc/scope.md](doc/scope.md) — current status and backlog
-- [doc/architecture.md](doc/architecture.md) — source layout and REPL entry points
+vcal aims to follow IEEE 1364-2005. See [doc/non-standard.md](doc/non-standard.md) for the vcal-specific divergences from the LRM.
 
 ## License
 

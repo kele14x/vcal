@@ -11,7 +11,14 @@
 
 - [README.md](README.md) — stable user-facing entry point. Do not edit without user input.
 - [doc/scope.md](doc/scope.md) — mutable working state (current status, active scope, backlog). **Update this first** when scope changes or a task completes; collapse completed work to one-line summaries. Git history is the granular record.
-- [doc/*.md](doc/) — stable implementation / spec docs (one topic per file: `repl`, `expressions`, `operators`, `variables`, `non-standard`, `lrm-coverage`, `architecture`).
+- Stable implementation / spec docs under [doc/](doc/) — one topic per file:
+  - [doc/repl.md](doc/repl.md) — prompt, session, exit behavior, lexical clarifications
+  - [doc/expressions.md](doc/expressions.md) — width, signedness, leaf extension, base propagation
+  - [doc/operators.md](doc/operators.md) — per-operator semantics
+  - [doc/variables.md](doc/variables.md) — `reg`, blocking assignment, bit-select / part-select
+  - [doc/non-standard.md](doc/non-standard.md) — vcal-specific divergences from LRM
+  - [doc/lrm-coverage.md](doc/lrm-coverage.md) — LRM chapter coverage and grammar matrix
+  - [doc/architecture.md](doc/architecture.md) — source layout and REPL entry points
 
 Quick test for where a fact belongs: if it will still hold after the next feature ships, put it in one of the stable docs; otherwise it belongs in `doc/scope.md`.
 
