@@ -4,6 +4,7 @@ use std::io::{self, BufRead, Write};
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
 
+mod color;
 mod eval;
 mod lexer;
 mod parser;
@@ -765,10 +766,16 @@ pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Res
 }
 
 pub fn run_interactive() -> io::Result<()> {
-    use rustyline::DefaultEditor;
+    use rustyline::Editor;
     use rustyline::error::ReadlineError;
+    use rustyline::history::DefaultHistory;
 
-    let mut editor = DefaultEditor::new().map_err(io::Error::other)?;
+    let use_color = color::should_color();
+    let mut editor: Editor<color::PromptHelper, DefaultHistory> =
+        Editor::new().map_err(io::Error::other)?;
+    editor.set_helper(Some(color::PromptHelper {
+        enabled: use_color,
+    }));
     let mut session = Session::new();
     let mut index = 0usize;
 
@@ -788,7 +795,9 @@ pub fn run_interactive() -> io::Result<()> {
                 if result.output.is_empty() {
                     println!();
                 } else {
-                    println!("Out[{index}]: {}", result.output);
+                    let prefix = format!("Out[{index}]: ");
+                    let prefix = if use_color { color::red(&prefix) } else { prefix };
+                    println!("{prefix}{}", result.output);
                     println!();
                 }
                 if result.should_exit {
@@ -853,10 +862,16 @@ pub fn run_parse_repl<R: BufRead, W: Write>(
 
 // Parse-only TTY REPL — rustyline-backed counterpart to run_parse_repl.
 pub fn run_parse_interactive(max_depth: usize) -> io::Result<()> {
-    use rustyline::DefaultEditor;
+    use rustyline::Editor;
     use rustyline::error::ReadlineError;
+    use rustyline::history::DefaultHistory;
 
-    let mut editor = DefaultEditor::new().map_err(io::Error::other)?;
+    let use_color = color::should_color();
+    let mut editor: Editor<color::PromptHelper, DefaultHistory> =
+        Editor::new().map_err(io::Error::other)?;
+    editor.set_helper(Some(color::PromptHelper {
+        enabled: use_color,
+    }));
     let mut index = 0usize;
 
     loop {
@@ -875,7 +890,9 @@ pub fn run_parse_interactive(max_depth: usize) -> io::Result<()> {
                 if ast.is_empty() {
                     println!();
                 } else {
-                    println!("Out[{index}]: {ast}");
+                    let prefix = format!("Out[{index}]: ");
+                    let prefix = if use_color { color::red(&prefix) } else { prefix };
+                    println!("{prefix}{ast}");
                     println!();
                 }
             }
