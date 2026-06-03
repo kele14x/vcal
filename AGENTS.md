@@ -7,6 +7,14 @@
 - `cargo build` — build the binary
 - `scripts/stress_recursion.sh` — feed deeply-nested expressions to the release binary and confirm no walker overflows the main-thread stack. Run after touching parser / annotate / validate / evaluate paths.
 
+## Pre-commit checks
+
+Run all three checks the CI gate (`.github/workflows/ci.yml`, job `fmt + clippy + test`) runs, before every commit — the gate rejects on any failure:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --all-targets`
+
 ## Documentation boundary
 
 - [README.md](README.md) — stable user-facing entry point. Do not edit without user input.
