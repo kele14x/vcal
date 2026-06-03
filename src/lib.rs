@@ -773,9 +773,7 @@ pub fn run_interactive() -> io::Result<()> {
     let use_color = color::should_color();
     let mut editor: Editor<color::PromptHelper, DefaultHistory> =
         Editor::new().map_err(io::Error::other)?;
-    editor.set_helper(Some(color::PromptHelper {
-        enabled: use_color,
-    }));
+    editor.set_helper(Some(color::PromptHelper { enabled: use_color }));
     let mut session = Session::new();
     let mut index = 0usize;
 
@@ -796,7 +794,11 @@ pub fn run_interactive() -> io::Result<()> {
                     println!();
                 } else {
                     let prefix = format!("Out[{index}]: ");
-                    let prefix = if use_color { color::red(&prefix) } else { prefix };
+                    let prefix = if use_color {
+                        color::red(&prefix)
+                    } else {
+                        prefix
+                    };
                     println!("{prefix}{}", result.output);
                     println!();
                 }
@@ -869,9 +871,7 @@ pub fn run_parse_interactive(max_depth: usize) -> io::Result<()> {
     let use_color = color::should_color();
     let mut editor: Editor<color::PromptHelper, DefaultHistory> =
         Editor::new().map_err(io::Error::other)?;
-    editor.set_helper(Some(color::PromptHelper {
-        enabled: use_color,
-    }));
+    editor.set_helper(Some(color::PromptHelper { enabled: use_color }));
     let mut index = 0usize;
 
     loop {
@@ -891,7 +891,11 @@ pub fn run_parse_interactive(max_depth: usize) -> io::Result<()> {
                     println!();
                 } else {
                     let prefix = format!("Out[{index}]: ");
-                    let prefix = if use_color { color::red(&prefix) } else { prefix };
+                    let prefix = if use_color {
+                        color::red(&prefix)
+                    } else {
+                        prefix
+                    };
                     println!("{prefix}{ast}");
                     println!();
                 }
