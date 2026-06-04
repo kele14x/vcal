@@ -6,6 +6,7 @@ use num_traits::{Signed, ToPrimitive};
 
 mod color;
 mod eval;
+mod highlight;
 mod lexer;
 mod parser;
 mod value;
