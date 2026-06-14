@@ -12,7 +12,7 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 - Real arithmetic and mixed integer/real promotion (LRM 5.1.5 / 5.1.7 / Tables 5-2, 5-3)
 - Two-pass context (width, signedness) propagation; leftmost-base propagation
 - `reg` / `integer` / `real` declarations and blocking assignment with the full LRM A.8.5 `variable_lvalue` — bare name, bit/part/indexed-part selects, and arbitrarily nested concatenations on the LHS (see [variables.md](variables.md))
-- 1-D unpacked arrays on `reg` / `integer` / `real` (LRM 4.9 / A.2.2.1)
+- 1-D unpacked arrays on `reg` / `integer` / `real` (LRM 4.9 / A.2.2.1); vector-array total storage is capped at the same 16,777,216-bit limit as scalar vectors
 - Static-semantic validation as a top-level pre-pass over every expression entry — errors prefixed `Syntax error:` (lex/parse) or `Semantic error:` (validator)
 - System tasks: `$finish`, `$stop` (LRM 17.4)
 - System functions:

@@ -446,6 +446,7 @@ fn apply_decl(
                     evaluate_reg_range(dim_msb_expr, dim_lsb_expr, view)
                 })?;
                 let count = dim_range.width()?;
+                ensure_array_total_bits(element_width, count)?;
                 let element_template = IntegerValue {
                     width: element_width,
                     signed: element_signed,
@@ -516,6 +517,16 @@ fn apply_decl(
     }
     session.variables = staged;
     Ok((String::new(), false))
+}
+
+fn ensure_array_total_bits(element_width: usize, count: usize) -> Result<(), String> {
+    let total = element_width.checked_mul(count).ok_or_else(|| {
+        format!(
+            "Semantic error: array total width exceeds limit {}",
+            value::MAX_BIT_WIDTH
+        )
+    })?;
+    value::ensure_bit_width(total, "array total").map_err(|e| format!("Semantic error: {e}"))
 }
 
 // Wraps an evaluator call that needs a `&Session` view over the staged

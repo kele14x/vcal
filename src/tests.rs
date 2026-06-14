@@ -8344,6 +8344,25 @@ fn huge_array_dim_rejected() {
 }
 
 #[test]
+fn vector_array_total_width_at_cap_accepted() {
+    // 4096-bit elements * 4096 elements = 16,777,216 total bits.
+    let mut session = Session::new();
+    session
+        .eval("reg [4095:0] a [0:4095];")
+        .expect("array total exactly at cap is accepted");
+}
+
+#[test]
+fn vector_array_total_width_over_cap_rejected() {
+    // 4097-bit elements * 4096 elements = 16,781,312 total bits.
+    let err = evaluate_input("reg [4096:0] a [0:4095];").unwrap_err();
+    assert_eq!(
+        err,
+        "Semantic error: array total width 16781312 exceeds limit 16777216"
+    );
+}
+
+#[test]
 fn huge_replication_count_rejected() {
     // `{count{1'b0}}` with count one over the cap. Cap is on the
     // *result* width (inner_bits.len() * count), so a 1-bit element
