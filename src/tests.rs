@@ -89,6 +89,91 @@ fn accepts_underscores_in_size_and_digits() {
 }
 
 #[test]
+fn tokenizes_string_literals_as_single_tokens() {
+    assert_eq!(
+        tokenize("\"// not a comment\"").expect("string token"),
+        vec![Token::StringLiteral(b"// not a comment".to_vec())]
+    );
+    assert_eq!(
+        tokenize("\"/* not a comment */\"").expect("string token"),
+        vec![Token::StringLiteral(b"/* not a comment */".to_vec())]
+    );
+}
+
+#[test]
+fn evaluates_string_literals_as_packed_byte_vectors() {
+    assert_eq!(evaluate_input("\"A\"").expect("string").output, "8'h41");
+    assert_eq!(
+        evaluate_input("\"AB\"").expect("two-byte string").output,
+        "16'h4142"
+    );
+    assert_eq!(
+        evaluate_input("\"A\" == 8'h41")
+            .expect("compare string")
+            .output,
+        "1'b1"
+    );
+}
+
+#[test]
+fn decodes_string_literal_escapes() {
+    assert_eq!(
+        evaluate_input("\"\\\"\\\\\"")
+            .expect("quote and slash escapes")
+            .output,
+        "16'h225c"
+    );
+    assert_eq!(
+        evaluate_input("\"\\n\\t\"")
+            .expect("control escapes")
+            .output,
+        "16'h0a09"
+    );
+    assert_eq!(
+        evaluate_input("\"\\101\"").expect("octal escape").output,
+        "8'h41"
+    );
+}
+
+#[test]
+fn string_assignments_follow_existing_width_context() {
+    let mut session = Session::new();
+    session.eval("reg [15:0] word = \"AB\"").expect("decl");
+    assert_eq!(
+        session.eval("word == 16'h4142").expect("read").output,
+        "1'b1"
+    );
+
+    session
+        .eval("reg [7:0] byte = \"AB\"")
+        .expect("narrow decl");
+    assert_eq!(session.eval("byte == 8'h42").expect("read").output, "1'b1");
+
+    session.eval("reg [23:0] wide = \"A\"").expect("wide decl");
+    assert_eq!(session.eval("wide == 24'h41").expect("read").output, "1'b1");
+}
+
+#[test]
+fn rejects_malformed_string_literals() {
+    assert_eq!(
+        evaluate_input("\"unterminated").expect_err("unterminated string"),
+        "Syntax error: unterminated string literal"
+    );
+    assert_eq!(
+        evaluate_input("\"a\nb\"").expect_err("raw newline"),
+        "Syntax error: newline in string literal"
+    );
+    assert_eq!(
+        evaluate_input("\"\\r\"").expect_err("unsupported escape"),
+        "Syntax error: unsupported string escape: \\r"
+    );
+    assert_eq!(
+        evaluate_input("\"\\400\"").expect_err("octal out of range"),
+        "Syntax error: octal escape out of byte range: 400"
+    );
+}
+
+#[test]
 fn evaluates_based_literal_with_unknown_digits() {
     let evaluation = evaluate_input("4'b10x?").expect("binary literal should parse");
     assert_eq!(evaluation.output, "4'b10xz");

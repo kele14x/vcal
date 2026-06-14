@@ -5,6 +5,7 @@ use num_traits::{FromPrimitive, One, Signed, ToPrimitive, Zero};
 
 use crate::parser::{
     BinaryOp, Expr, LValue, MathFunctionKind, RealConversionKind, SelectKind, UnaryOp,
+    string_literal_spec,
 };
 use crate::value;
 use crate::value::{
@@ -279,6 +280,18 @@ pub(crate) fn annotate<'a>(root: &'a Expr, session: &Session) -> Result<Annotate
                     }),
                     kind: AnnotatedKind::Leaf,
                 }),
+                Expr::StringLiteral(bytes) => {
+                    let spec = string_literal_spec(bytes);
+                    vals.push(Annotated {
+                        expr,
+                        meta: Some(ExprMeta {
+                            width: spec.width,
+                            signed: spec.signed,
+                            base: spec.base,
+                        }),
+                        kind: AnnotatedKind::Leaf,
+                    });
+                }
                 Expr::RealLiteral(_) => vals.push(Annotated {
                     expr,
                     meta: None,
@@ -891,7 +904,7 @@ pub(crate) fn expression_is_real(expr: &Expr, session: &Session) -> bool {
     let mut work: Vec<&Expr> = vec![expr];
     while let Some(node) = work.pop() {
         match node {
-            Expr::Literal(_) => {}
+            Expr::Literal(_) | Expr::StringLiteral(_) => {}
             Expr::RealLiteral(_) => return true,
             Expr::Grouped(inner) => work.push(inner),
             Expr::Unary { op, expr } => match op {
@@ -1375,6 +1388,9 @@ fn visit_expr_structure<'a>(
         // `9999999999999'd1` would parse cleanly (the spec carries width as
         // a number, not bits) and only blow up at `materialize()` time.
         Expr::Literal(spec) => value::ensure_bit_width(spec.width, "literal")?,
+        Expr::StringLiteral(bytes) => {
+            value::ensure_bit_width(bytes.len().saturating_mul(8), "string literal")?
+        }
         Expr::RealLiteral(_) => {}
         Expr::Grouped(inner) => work.push(ExprValidateTask::Visit(inner)),
         Expr::Unary { op, expr } => {
@@ -1635,6 +1651,9 @@ fn visit_annotated<'b, 'a: 'b>(
             // (e.g. evaluate_subexpr_as_integer's pre-validated callers
             // that still hit literal leaves through this driver).
             Expr::Literal(spec) => value::ensure_bit_width(spec.width, "literal")?,
+            Expr::StringLiteral(bytes) => {
+                value::ensure_bit_width(bytes.len().saturating_mul(8), "string literal")?
+            }
             Expr::RealLiteral(_) => {}
             Expr::Identifier(name) => {
                 let reg = session
@@ -1954,6 +1973,13 @@ fn evaluate_leaf_expr_in_context(
             // bounded. Resize-to-context follows whether the literal sits in
             // a propagated width/signedness or stands alone (None).
             let value = spec.materialize();
+            Ok(match context {
+                Some(context) => value.resized_to_context(context.width, context.signed),
+                None => value,
+            })
+        }
+        Expr::StringLiteral(bytes) => {
+            let value = string_literal_spec(bytes).materialize();
             Ok(match context {
                 Some(context) => value.resized_to_context(context.width, context.signed),
                 None => value,
@@ -2534,7 +2560,7 @@ fn visit_real_eval<'b, 'a: 'b>(
                 };
                 real_vals.push(evaluate_real_array_element_select(name, index, session)?);
             }
-            Expr::Literal(_) => {
+            Expr::Literal(_) | Expr::StringLiteral(_) => {
                 unreachable!("integer literal Leaf isn't real-typed; would be coerced earlier");
             }
             _ => unreachable!(
@@ -3928,6 +3954,14 @@ fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
                     signed: value.signed,
                     base: value.base,
                 }),
+                Expr::StringLiteral(bytes) => {
+                    let spec = string_literal_spec(bytes);
+                    vals.push(ExprMeta {
+                        width: spec.width,
+                        signed: spec.signed,
+                        base: spec.base,
+                    });
+                }
                 // Real has no width/sign/base; reaching this branch means
                 // an integer-pipeline operator looked at a real-typed
                 // sub-expression for context, which the dispatch should
@@ -4386,6 +4420,7 @@ fn is_indefinite_width(expr: &Expr) -> bool {
                     return true;
                 }
             }
+            Expr::StringLiteral(_) => {}
             // Real values are always rejected from concatenation by
             // `evaluate_concatenation_expr` with a clearer message; mark
             // them as indefinite-width here so any reachable check still
@@ -4732,6 +4767,10 @@ fn visit_bigint_eval<'a>(
             // materialize is bounded. Numeric payload trivially yields the
             // bigint; Bits with all 0/1 has to expand to read the value.
             let value = spec.materialize();
+            vals.push(value.as_bigint(value.signed));
+        }
+        Expr::StringLiteral(bytes) => {
+            let value = string_literal_spec(bytes).materialize();
             vals.push(value.as_bigint(value.signed));
         }
         // Reaching this helper with a real-typed expression means the

@@ -61,6 +61,15 @@ The general rules for how vcal evaluates expressions. Per-operator details live 
 - This digit-padding rule is not sign extension.
 - An unsized constant remains unsized after parsing; its default >=32-bit form is only an intermediate. When it becomes an operand of an expression wider than 32 bits, leaf extension still follows footnote a rather than §5.5.4. Sized literals continue to follow §5.5.4.
 
+## String literals
+
+- A double-quoted string literal is a packed unsigned byte vector. Each decoded character contributes 8 bits.
+- The first source character occupies the most significant byte. For example, `"A"` is `8'h41`, and `"AB"` is `16'h4142`.
+- String literals are self-determined and have definite width, so they are legal in the same integer-expression positions as sized integer literals, including assignments, comparisons, concatenations, and casts.
+- Assignment to a narrower vector truncates from the MSB side, preserving the rightmost bytes. Assignment to a wider vector zero-extends on the left under the existing context rules.
+- Supported escapes are `\n`, `\t`, `\\`, `\"`, and 1-3 digit octal byte escapes.
+- vcal does not implement SystemVerilog's dynamic `string` type; there is no `string` declaration keyword.
+
 ## Signedness rules
 
 - Mainly derived from LRM §5.5.

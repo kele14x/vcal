@@ -33,6 +33,10 @@ pub(crate) fn magenta(s: &str) -> String {
     format!("\x1b[35m{s}\x1b[0m")
 }
 
+pub(crate) fn cyan(s: &str) -> String {
+    format!("\x1b[36m{s}\x1b[0m")
+}
+
 pub(crate) fn dim(s: &str) -> String {
     format!("\x1b[2m{s}\x1b[0m")
 }
@@ -92,6 +96,7 @@ impl Highlighter for PromptHelper {
             match span.class {
                 TokenClass::Number => out.push_str(&yellow(s)),
                 TokenClass::SystemIdent => out.push_str(&magenta(s)),
+                TokenClass::String => out.push_str(&cyan(s)),
                 TokenClass::Comment => out.push_str(&dim(s)),
                 TokenClass::Error => out.push_str(&red(s)),
                 TokenClass::Identifier | TokenClass::Operator | TokenClass::Punct => {

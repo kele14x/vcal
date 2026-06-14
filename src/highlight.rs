@@ -13,6 +13,7 @@ pub(crate) enum TokenClass {
     Number,
     Identifier,
     SystemIdent,
+    String,
     Operator,
     Punct,
     Comment,
@@ -91,6 +92,10 @@ pub(crate) fn highlight_spans(input: &str) -> Vec<Span> {
                 let (end, class) = read_bare_based_literal(&mut chars);
                 out.push(Span { start, end, class });
             }
+            '"' => {
+                let (end, class) = read_string_literal(&mut chars, input.len());
+                out.push(Span { start, end, class });
+            }
             '$' => {
                 let (end, class) = read_system_identifier(&mut chars);
                 out.push(Span { start, end, class });
@@ -123,6 +128,25 @@ pub(crate) fn highlight_spans(input: &str) -> Vec<Span> {
     }
 
     out
+}
+
+fn read_string_literal(chars: &mut Peekable<CharIndices<'_>>, eof: usize) -> (usize, TokenClass) {
+    let _ = chars.next().expect("quote available");
+    let mut escaped = false;
+    for (pos, c) in chars.by_ref() {
+        let end = pos + c.len_utf8();
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '"' => return (end, TokenClass::String),
+            '\r' | '\n' => return (pos, TokenClass::Error),
+            _ => {}
+        }
+    }
+    (eof, TokenClass::Error)
 }
 
 fn consume_line_comment(chars: &mut Peekable<CharIndices<'_>>, eof: usize) -> usize {
@@ -380,6 +404,22 @@ mod tests {
         assert_eq!(
             classes("$finish"),
             vec![("$finish", TokenClass::SystemIdent)]
+        );
+    }
+
+    #[test]
+    fn strings_are_single_spans() {
+        assert_eq!(
+            classes("\"// not a comment\" + 1"),
+            vec![
+                ("\"// not a comment\"", TokenClass::String),
+                ("+", TokenClass::Operator),
+                ("1", TokenClass::Number),
+            ]
+        );
+        assert_eq!(
+            classes("\"unterminated"),
+            vec![("\"unterminated", TokenClass::Error)]
         );
     }
 

@@ -97,6 +97,10 @@ impl LiteralSpec {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Expr {
     Literal(LiteralSpec),
+    // LRM 3.6: string literals are packed arrays of 8-bit ASCII codes. Keep
+    // the AST leaf distinct from integer literals, then materialize through
+    // the same IntegerValue path during evaluation.
+    StringLiteral(Vec<u8>),
     // LRM §3.5.2: a real constant is stored as a 64-bit IEEE 754 double.
     // Width / signedness / base / x-z don't apply (Table 5-9 lists real as
     // "Signed, floating point"), so we keep the f64 directly rather than
@@ -232,7 +236,11 @@ fn truncate_expr_inner(expr: &mut Expr, depth: usize, max_depth: usize) {
         return;
     }
     match expr {
-        Expr::Literal(_) | Expr::RealLiteral(_) | Expr::Identifier(_) | Expr::Truncated => {}
+        Expr::Literal(_)
+        | Expr::StringLiteral(_)
+        | Expr::RealLiteral(_)
+        | Expr::Identifier(_)
+        | Expr::Truncated => {}
         Expr::Grouped(inner) => truncate_expr_inner(inner.as_mut(), depth + 1, max_depth),
         Expr::Unary { expr: inner, .. } => {
             truncate_expr_inner(inner.as_mut(), depth + 1, max_depth)
@@ -390,7 +398,11 @@ impl Drop for Expr {
 fn steal_expr_children(expr: &mut Expr, out: &mut Vec<Expr>) {
     let placeholder = || Expr::Identifier(String::new());
     match expr {
-        Expr::Literal(_) | Expr::RealLiteral(_) | Expr::Identifier(_) | Expr::Truncated => {}
+        Expr::Literal(_)
+        | Expr::StringLiteral(_)
+        | Expr::RealLiteral(_)
+        | Expr::Identifier(_)
+        | Expr::Truncated => {}
         Expr::Grouped(inner) => {
             out.push(std::mem::replace(inner.as_mut(), placeholder()));
         }
@@ -1520,6 +1532,7 @@ impl<'a> Parser<'a> {
         let token = self.next();
         match token {
             Some(Token::IntegerLiteral(text)) => parse_integer(text).map(Expr::Literal),
+            Some(Token::StringLiteral(bytes)) => Ok(Expr::StringLiteral(bytes.clone())),
             Some(Token::RealLiteral(text)) => parse_real(text).map(Expr::RealLiteral),
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
@@ -1767,6 +1780,25 @@ pub(crate) fn parse_integer(input: &str) -> Result<LiteralSpec, String> {
     match input.find('\'') {
         Some(apostrophe_index) => parse_based_integer(input, apostrophe_index),
         None => parse_unsized_decimal(input),
+    }
+}
+
+pub(crate) fn string_literal_spec(bytes: &[u8]) -> LiteralSpec {
+    let mut low_bits = Vec::with_capacity(bytes.len() * 8);
+    // Source order maps left-to-right onto MSB-to-LSB. Since IntegerValue
+    // stores bits LSB-first, push bytes from the right end of the string.
+    for byte in bytes.iter().rev() {
+        push_integer_bits(*byte, 8, &mut low_bits);
+    }
+    LiteralSpec {
+        width: bytes.len() * 8,
+        signed: false,
+        base: Base::Hex,
+        unsized_literal: false,
+        payload: LiteralPayload::Bits {
+            low_bits,
+            fill: LogicBit::Zero,
+        },
     }
 }
 

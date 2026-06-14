@@ -9,6 +9,10 @@ pub(crate) enum Token {
     // time. The string here is the raw lexeme (still containing `_` and the
     // original `e`/`E` casing); f64 conversion happens in the parser.
     RealLiteral(String),
+    // LRM 3.6 / A.8.8: string literal enclosed in double quotes. The lexer
+    // decodes escape sequences to bytes so every downstream stage can treat
+    // the string as a packed 8-bit vector.
+    StringLiteral(Vec<u8>),
     // `$identifier` — system task or function name. Per LRM A.9.3 the name
     // matches `$[a-zA-Z0-9_$]+`; the `$` shall not be followed by white space
     // (LRM 19.5 / README "Identifier white spaces").
@@ -251,6 +255,9 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     &mut chars,
                 )?));
             }
+            '"' => {
+                tokens.push(Token::StringLiteral(read_string_literal(&mut chars)?));
+            }
             '$' => {
                 tokens.push(Token::SystemIdentifier(read_system_identifier(&mut chars)?));
             }
@@ -270,6 +277,59 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     }
 
     Ok(tokens)
+}
+
+fn read_string_literal<I>(chars: &mut std::iter::Peekable<I>) -> Result<Vec<u8>, String>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let mut bytes = Vec::new();
+    while let Some((_, ch)) = chars.next() {
+        match ch {
+            '"' => return Ok(bytes),
+            '\r' | '\n' => return Err("newline in string literal".to_string()),
+            '\\' => bytes.push(read_string_escape(chars)?),
+            _ if ch.is_ascii() => bytes.push(ch as u8),
+            _ => {
+                return Err(format!("non-ASCII character in string literal: {ch}"));
+            }
+        }
+    }
+    Err("unterminated string literal".to_string())
+}
+
+fn read_string_escape<I>(chars: &mut std::iter::Peekable<I>) -> Result<u8, String>
+where
+    I: Iterator<Item = (usize, char)>,
+{
+    let (_, ch) = chars
+        .next()
+        .ok_or_else(|| "unterminated string escape".to_string())?;
+    match ch {
+        'n' => Ok(b'\n'),
+        't' => Ok(b'\t'),
+        '\\' => Ok(b'\\'),
+        '"' => Ok(b'"'),
+        '0'..='7' => {
+            let mut value = ch as u32 - '0' as u32;
+            for _ in 0..2 {
+                match chars.peek().copied() {
+                    Some((_, next)) if ('0'..='7').contains(&next) => {
+                        chars.next();
+                        value = value * 8 + (next as u32 - '0' as u32);
+                    }
+                    _ => break,
+                }
+            }
+            if value > u8::MAX as u32 {
+                Err(format!("octal escape out of byte range: {value:o}"))
+            } else {
+                Ok(value as u8)
+            }
+        }
+        '\r' | '\n' => Err("newline in string literal".to_string()),
+        _ => Err(format!("unsupported string escape: \\{ch}")),
+    }
 }
 
 // Decides between Token::IntegerLiteral, Token::RealLiteral, and the based

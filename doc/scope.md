@@ -8,6 +8,7 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 
 - REPL shell with `rustyline` history
 - Integer and real literals, all LRM forms (LRM 3.5.2)
+- String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8); display tasks are not included
 - All operators between integers (see [operators.md](operators.md))
 - Real arithmetic and mixed integer/real promotion (LRM 5.1.5 / 5.1.7 / Tables 5-2, 5-3)
 - Two-pass context (width, signedness) propagation; leftmost-base propagation
@@ -26,7 +27,6 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 Planned but not yet implemented:
 
 - **Multi-line edit.** The REPL accepts only single-line input today; the right TUI affordance for multi-line editing is still being explored.
-- **String literals (LRM 3.6 / A.8.8).** No `"..."` token in the lexer and no `String` AST variant. The use case is tied to the display task family (`$display` etc., LRM 17.1) — both will likely land together.
 
 ## Known issues
 

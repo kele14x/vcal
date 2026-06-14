@@ -47,6 +47,10 @@ vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same f
 - §17.8 doesn't carve out an x/z rule for `$bitstoreal`. vcal applies §3.5.3's "x/z → 0" rule to its 64-bit operand for consistency with the sibling integer-to-real conversions, so `$bitstoreal(64'bx)` decodes as `+0.0`.
 - §17.11 doesn't address x/z bits in `$clog2`. vcal returns 32 bits of `x` whenever the operand contains any x or z bit, mirroring the `$rtoi` NaN/±∞ rule (surface "no defined image" rather than silently mapping to zero). Per LRM the operand is "treated as an unsigned value" of its natural width, so `$clog2(64'hFFFF_FFFF_FFFF_FFFF)` is `32'sd64` and `$clog2(-1)` (32-bit signed) is `32'sd32`. Real arguments are rejected up front (`Semantic error: $clog2 argument cannot be real`) because LRM 17.11.1 lists the argument as "an integer or an arbitrary sized vector value" — real is not in that list, and accepting it would force vcal to pick one of the divergent vendor rounding rules called out under `$itor` above.
 
+## String literals
+
+vcal implements Verilog string constants as packed 8-bit vectors, but it does not yet implement the display task family (`$display`, `$write`, `$strobe`, `$monitor`). A bare string expression therefore renders as its packed numeric value, using hex as the display base, rather than being printed as text.
+
 ## Conditional operator
 
 vcal deliberately diverges from LRM Table 5-21 on the ambiguous-cond merge. The strict table reduces *every* combination other than `(0,0)` and `(1,1)` to `x` — including `(x,x)` and `(z,z)`. iverilog (and most other simulators) instead use the value-preserving rule above, on the principle that if both branches put the same `x` (or `z`) at the same position regardless of cond, the result is necessarily that bit and reducing it to `x` would discard information. So `1'bx ? 4'b01xz : 4'b01xz` is `4'b01xz` here (and in iverilog), not the `4'b01xx` the LRM table prescribes. vcal follows iverilog as the practical reference.
