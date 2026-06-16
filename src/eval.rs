@@ -9,8 +9,8 @@ use crate::parser::{
 };
 use crate::value;
 use crate::value::{
-    Base, IntegerValue, LogicBit, Value, bits_to_biguint, bitwise_and_bits, bitwise_not_bit,
-    bitwise_or_bits, bitwise_xnor_bits, bitwise_xor_bits,
+    Base, DisplayStyle, IntegerValue, LogicBit, Value, bits_to_biguint, bitwise_and_bits,
+    bitwise_not_bit, bitwise_or_bits, bitwise_xnor_bits, bitwise_xor_bits,
 };
 use crate::{RegRange, RegValue, Session};
 
@@ -1979,7 +1979,9 @@ fn evaluate_leaf_expr_in_context(
             })
         }
         Expr::StringLiteral(bytes) => {
-            let value = string_literal_spec(bytes).materialize();
+            let value = string_literal_spec(bytes)
+                .materialize()
+                .with_display_style(DisplayStyle::String);
             Ok(match context {
                 Some(context) => value.resized_to_context(context.width, context.signed),
                 None => value,
@@ -3603,7 +3605,9 @@ fn combine_eval<'b, 'a: 'b>(
                     "concatenation must have at least one operand with positive size".to_string(),
                 );
             }
-            let result = IntegerValue::computed(bits.len(), false, leftmost_base, bits);
+            let display_style = concatenated_display_style(&items);
+            let result = IntegerValue::computed(bits.len(), false, leftmost_base, bits)
+                .with_display_style(display_style);
             vals.push(extend_to_outer_context(result, ctx));
         }
         EvalCombiner::ReplicationCountReceived {
@@ -3670,7 +3674,9 @@ fn combine_eval<'b, 'a: 'b>(
             for _ in 0..count {
                 bits.extend(inner_bits.iter().copied());
             }
-            let result = IntegerValue::computed(bits.len(), false, leftmost_base, bits);
+            let display_style = concatenated_display_style(&items);
+            let result = IntegerValue::computed(bits.len(), false, leftmost_base, bits)
+                .with_display_style(display_style);
             vals.push(extend_to_outer_context(result, ctx));
         }
         // ----- Bridge variants (real_vals → int_vals or read int_vals to
@@ -4381,6 +4387,24 @@ fn shift_bits_right(bits: &[LogicBit], shift: usize, fill: LogicBit) -> Vec<Logi
 
 fn comparison_result_value(bit: LogicBit) -> IntegerValue {
     IntegerValue::computed(1, false, Base::Binary, vec![bit])
+}
+
+fn concatenated_display_style(items: &[IntegerValue]) -> DisplayStyle {
+    let mut saw_string_bytes = false;
+    for item in items {
+        if item.width == 0 {
+            continue;
+        }
+        if item.display_style != DisplayStyle::String || item.width % 8 != 0 {
+            return DisplayStyle::Base;
+        }
+        saw_string_bytes = true;
+    }
+    if saw_string_bytes {
+        DisplayStyle::String
+    } else {
+        DisplayStyle::Base
+    }
 }
 
 // LRM 5.1.9: an operand reduces to its logical value before the
@@ -5583,6 +5607,7 @@ pub(crate) fn evaluate_lvalue_assignment(
         width: meta.width,
         signed: meta.signed,
         base: meta.base,
+        display_style: DisplayStyle::Base,
         bits: sized.bits.clone(),
         unsized_literal: false,
     };

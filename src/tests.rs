@@ -102,16 +102,26 @@ fn tokenizes_string_literals_as_single_tokens() {
 
 #[test]
 fn evaluates_string_literals_as_packed_byte_vectors() {
-    assert_eq!(evaluate_input("\"A\"").expect("string").output, "8'h41");
-    assert_eq!(
-        evaluate_input("\"AB\"").expect("two-byte string").output,
-        "16'h4142"
-    );
     assert_eq!(
         evaluate_input("\"A\" == 8'h41")
             .expect("compare string")
             .output,
         "1'b1"
+    );
+    assert_eq!(
+        evaluate_input("\"AB\" == 16'h4142")
+            .expect("compare string")
+            .output,
+        "1'b1"
+    );
+}
+
+#[test]
+fn displays_string_literals_as_escaped_text() {
+    assert_eq!(evaluate_input("\"A\"").expect("string").output, "\"A\"");
+    assert_eq!(
+        evaluate_input("\"AB\"").expect("two-byte string").output,
+        "\"AB\""
     );
 }
 
@@ -121,17 +131,57 @@ fn decodes_string_literal_escapes() {
         evaluate_input("\"\\\"\\\\\"")
             .expect("quote and slash escapes")
             .output,
-        "16'h225c"
+        "\"\\\"\\\\\""
     );
     assert_eq!(
         evaluate_input("\"\\n\\t\"")
             .expect("control escapes")
             .output,
-        "16'h0a09"
+        "\"\\n\\t\""
     );
     assert_eq!(
         evaluate_input("\"\\101\"").expect("octal escape").output,
-        "8'h41"
+        "\"A\""
+    );
+}
+
+#[test]
+fn string_display_survives_string_only_concat_and_replication() {
+    assert_eq!(
+        evaluate_input("{\"A\", \"B\"}")
+            .expect("string concat")
+            .output,
+        "\"AB\""
+    );
+    assert_eq!(
+        evaluate_input("{\"A\", \"\", \"B\"}")
+            .expect("string concat with empty")
+            .output,
+        "\"AB\""
+    );
+    assert_eq!(
+        evaluate_input("{2{\"A\"}}")
+            .expect("string replication")
+            .output,
+        "\"AA\""
+    );
+}
+
+#[test]
+fn string_display_drops_for_numeric_contexts() {
+    assert_eq!(
+        evaluate_input("$hex(\"AB\")").expect("hex cast").output,
+        "16'h4142"
+    );
+    assert_eq!(
+        evaluate_input("$dec(\"AB\")").expect("decimal cast").output,
+        "16'd16706"
+    );
+    assert_eq!(
+        evaluate_input("{\"A\", 8'h42}")
+            .expect("mixed concat")
+            .output,
+        "16'h4142"
     );
 }
 
@@ -151,6 +201,11 @@ fn string_assignments_follow_existing_width_context() {
 
     session.eval("reg [23:0] wide = \"A\"").expect("wide decl");
     assert_eq!(session.eval("wide == 24'h41").expect("read").output, "1'b1");
+
+    assert_eq!(
+        session.eval("word").expect("reg read").output,
+        "16'b0100000101000010"
+    );
 }
 
 #[test]

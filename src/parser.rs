@@ -3,7 +3,7 @@ use std::borrow::Cow;
 
 use crate::lexer::{Token, tokenize};
 use crate::value::{
-    Base, IntegerValue, LogicBit, biguint_bit_len, biguint_to_bits_with_width,
+    Base, DisplayStyle, IntegerValue, LogicBit, biguint_bit_len, biguint_to_bits_with_width,
     signed_decimal_bit_len,
 };
 
@@ -72,6 +72,7 @@ impl LiteralSpec {
                 width: self.width,
                 signed: self.signed,
                 base: self.base,
+                display_style: DisplayStyle::Base,
                 bits: biguint_to_bits_with_width(magnitude, self.width),
                 unsized_literal: self.unsized_literal,
             },
@@ -86,6 +87,7 @@ impl LiteralSpec {
                     width: self.width,
                     signed: self.signed,
                     base: self.base,
+                    display_style: DisplayStyle::Base,
                     bits,
                     unsized_literal: self.unsized_literal,
                 }

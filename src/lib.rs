@@ -14,6 +14,7 @@ mod value;
 #[cfg(test)]
 mod tests;
 
+use value::DisplayStyle;
 pub use value::{Base, IntegerValue, LogicBit, Value};
 
 use parser::{DeclKind, DeclName, Expr, LValue, SelectKind, Stmt};
@@ -451,6 +452,7 @@ fn apply_decl(
                     width: element_width,
                     signed: element_signed,
                     base: element_base,
+                    display_style: DisplayStyle::Base,
                     bits: vec![LogicBit::X; element_width],
                     unsized_literal: false,
                 };
@@ -490,6 +492,7 @@ fn apply_decl(
                     width: element_width,
                     signed: element_signed,
                     base: element_base,
+                    display_style: DisplayStyle::Base,
                     bits,
                     unsized_literal: false,
                 })

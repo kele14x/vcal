@@ -49,7 +49,7 @@ vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same f
 
 ## String literals
 
-vcal implements Verilog string constants as packed 8-bit vectors, but it does not yet implement the display task family (`$display`, `$write`, `$strobe`, `$monitor`). A bare string expression therefore renders as its packed numeric value, using hex as the display base, rather than being printed as text.
+vcal implements Verilog string constants as packed 8-bit vectors, but it does not yet implement the display task family (`$display`, `$write`, `$strobe`, `$monitor`). As a REPL convenience, bare string literals render as escaped quoted text even though their value is still the packed vector. String-only concatenation and replication preserve that display style (`{"A", "B"}` -> `"AB"`); mixed numeric concatenation and display-base casts render numerically (`{"A", 8'h42}` -> `16'h4142`, `$dec("AB")` -> `16'd16706`).
 
 ## Conditional operator
 

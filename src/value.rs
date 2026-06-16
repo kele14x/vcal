@@ -143,11 +143,18 @@ impl Base {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DisplayStyle {
+    Base,
+    String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IntegerValue {
     pub(crate) width: usize,
     pub(crate) signed: bool,
     pub(crate) base: Base,
+    pub(crate) display_style: DisplayStyle,
     pub(crate) bits: Vec<LogicBit>,
     // True for literals parsed without an explicit size (LRM 3.5.1 default
     // width). Drives Table 5-22 footnote a's MSB-fill extension when the
@@ -158,6 +165,12 @@ pub struct IntegerValue {
 
 impl IntegerValue {
     pub fn canonical(&self) -> String {
+        if self.display_style == DisplayStyle::String
+            && let Some(text) = self.render_string_literal()
+        {
+            return text;
+        }
+
         if self.base == Base::Decimal
             && self.signed
             && let Some((negative, digits)) = self.render_signed_decimal_digits()
@@ -292,6 +305,7 @@ impl IntegerValue {
             width,
             signed: context_signed,
             base: self.base,
+            display_style: DisplayStyle::Base,
             bits,
             unsized_literal: false,
         }
@@ -319,6 +333,7 @@ impl IntegerValue {
             width,
             signed: self.signed,
             base: self.base,
+            display_style: DisplayStyle::Base,
             bits,
             unsized_literal: false,
         }
@@ -348,6 +363,7 @@ impl IntegerValue {
             width,
             signed,
             base,
+            display_style: DisplayStyle::Base,
             bits,
             unsized_literal: false,
         }
@@ -358,6 +374,7 @@ impl IntegerValue {
             width,
             signed,
             base,
+            display_style: DisplayStyle::Base,
             bits: bigint_to_bits_with_width(&value, width),
             unsized_literal: false,
         }
@@ -368,9 +385,54 @@ impl IntegerValue {
             width,
             signed,
             base,
+            display_style: DisplayStyle::Base,
             bits: vec![LogicBit::X; width],
             unsized_literal: false,
         }
+    }
+
+    pub(crate) fn with_display_style(mut self, display_style: DisplayStyle) -> Self {
+        self.display_style = display_style;
+        self
+    }
+
+    fn render_string_literal(&self) -> Option<String> {
+        if self.width != self.bits.len() || !self.width.is_multiple_of(8) {
+            return None;
+        }
+
+        let byte_count = self.width / 8;
+        let mut output = String::with_capacity(byte_count + 2);
+        output.push('"');
+        for byte_index in (0..byte_count).rev() {
+            let byte = byte_from_bits(&self.bits[byte_index * 8..byte_index * 8 + 8])?;
+            push_escaped_byte(byte, &mut output);
+        }
+        output.push('"');
+        Some(output)
+    }
+}
+
+fn byte_from_bits(bits: &[LogicBit]) -> Option<u8> {
+    let mut byte = 0u8;
+    for (index, bit) in bits.iter().enumerate() {
+        match bit {
+            LogicBit::Zero => {}
+            LogicBit::One => byte |= 1 << index,
+            LogicBit::X | LogicBit::Z => return None,
+        }
+    }
+    Some(byte)
+}
+
+fn push_escaped_byte(byte: u8, output: &mut String) {
+    match byte {
+        b'\n' => output.push_str("\\n"),
+        b'\t' => output.push_str("\\t"),
+        b'\\' => output.push_str("\\\\"),
+        b'"' => output.push_str("\\\""),
+        0x20..=0x7e => output.push(byte as char),
+        _ => output.push_str(&format!("\\{byte:03o}")),
     }
 }
 
