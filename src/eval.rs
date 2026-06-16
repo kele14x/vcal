@@ -835,8 +835,8 @@ pub(crate) fn evaluate_assignment_rhs(
     if annotated.is_real() {
         let real_val = evaluate_annotated_as_real(&annotated, session)?;
         return Ok(match real_to_integer_bigint(real_val) {
-            Some(bigint) => IntegerValue::from_bigint(bigint, width, signed, base),
-            None => IntegerValue::all_x(width, signed, base),
+            Some(bigint) => IntegerValue::from_bigint(bigint, width, signed, base).with_weak_base(),
+            None => IntegerValue::all_x(width, signed, base).with_weak_base(),
         });
     }
     let context = ExprMeta {
@@ -5598,21 +5598,36 @@ pub(crate) fn evaluate_lvalue_assignment(
     // unsized literal's natural width wins). Distributing those over the
     // LHS requires exactly `meta.width` bits: truncate the LSB-end if
     // the RHS came back wider, extend with context-fill if narrower.
-    // Re-stamp `(width, signed, base)` from the lvalue context for the
-    // same reason — the leftmost-base inference would otherwise let the
-    // RHS's display base leak into the echo (so `a = 4'hF + 4'hF` would
-    // render in hex).
+    // Re-stamp width/sign from the lvalue context. Base normally comes
+    // from the lvalue too; the exception is a bare-name reg whose display
+    // base is still weak, where a successful integer RHS resolves it.
     let sized = rhs_value.resized_to_context(meta.width, meta.signed);
+    let mut staged = session.variables.clone();
+    distribute_bits_to_leaves(&leaves, &sized.bits, &mut staged, session)?;
+    let mut display_base = meta.base;
+    let mut display_base_locked = true;
+    if let LValue::Name(name) = lvalue {
+        let value = staged
+            .get_mut(name)
+            .expect("lvalue_meta already resolved bare-name lvalue")
+            .vector_mut()
+            .expect("lvalue_meta already rejected non-vector bare-name lvalue");
+        if !value.base_locked && rhs_value.base_locked {
+            value.base = rhs_value.base;
+            value.base_locked = true;
+        }
+        display_base = value.base;
+        display_base_locked = value.base_locked;
+    }
     let displayed = IntegerValue {
         width: meta.width,
         signed: meta.signed,
-        base: meta.base,
+        base: display_base,
+        base_locked: display_base_locked,
         display_style: DisplayStyle::Base,
         bits: sized.bits.clone(),
         unsized_literal: false,
     };
-    let mut staged = session.variables.clone();
-    distribute_bits_to_leaves(&leaves, &sized.bits, &mut staged, session)?;
     Ok((staged, displayed))
 }
 
@@ -5763,10 +5778,10 @@ fn leaf_lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, Stri
                     return Err("array element index cannot be real".to_string());
                 }
                 // The chosen element's shape is the one every element
-                // shares — array decl bakes Base::Binary into the
-                // element template, so `(width, signed, base)` is read
-                // off `elements[0]` (always present: RegRange::width
-                // enforces count >= 1 at decl time).
+                // shares. Reg arrays keep the fresh-reg binary fallback
+                // in the element template, so `(width, signed, base)` is
+                // read off `elements[0]` (always present:
+                // RegRange::width enforces count >= 1 at decl time).
                 let (_, elements) = reg.array().expect("is_array() => array() returns Some");
                 debug_assert!(!elements.is_empty());
                 let template = &elements[0];

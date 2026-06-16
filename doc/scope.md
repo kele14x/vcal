@@ -11,7 +11,7 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 - String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; display tasks are not included
 - All operators between integers (see [operators.md](operators.md))
 - Real arithmetic and mixed integer/real promotion (LRM 5.1.5 / 5.1.7 / Tables 5-2, 5-3)
-- Two-pass context (width, signedness) propagation; leftmost-base propagation
+- Two-pass context (width, signedness) propagation; leftmost-base propagation; `reg` display base starts as a weak binary fallback and resolves from the first whole-reg integer init/assignment
 - `reg` / `integer` / `real` declarations and blocking assignment with the full LRM A.8.5 `variable_lvalue` — bare name, bit/part/indexed-part selects, and arbitrarily nested concatenations on the LHS (see [variables.md](variables.md))
 - 1-D unpacked arrays on `reg` / `integer` / `real` (LRM 4.9 / A.2.2.1); vector-array total storage is capped at the same 16,777,216-bit limit as scalar vectors
 - Static-semantic validation as a top-level pre-pass over every expression entry — errors prefixed `Syntax error:` (lex/parse) or `Semantic error:` (validator)

@@ -388,33 +388,34 @@ fn apply_decl(
     // bakes a constant `[31:0]` range so bit-selects against the
     // integer reg work identically to a `reg signed [31:0]` decl — the
     // value is conceptually 32 bits. `real` has no bit range.
-    let (resolved_range, element_width, element_signed, element_base) = match kind {
-        DeclKind::Reg => {
-            let resolved = match range {
-                Some((msb_expr, lsb_expr)) => {
-                    Some(evaluate_reg_range(msb_expr, lsb_expr, session)?)
-                }
-                None => None,
-            };
-            let width = match &resolved {
-                Some(range) => range.width()?,
-                None => 1,
-            };
-            (resolved, width, signed, Base::Binary)
-        }
-        DeclKind::Integer => {
-            // LRM 4.8: `integer` is signed 32-bit. Decimal display base
-            // matches `integer i; i = 0;` round-tripping through the
-            // canonical printer as `32'sd0` — same as `$signed(0)` or
-            // `reg signed [31:0] i` would render once stored in decimal.
-            let range = RegRange {
-                msb: BigInt::from(31),
-                lsb: BigInt::from(0),
-            };
-            (Some(range), 32usize, true, Base::Decimal)
-        }
-        DeclKind::Real => (None, 0usize, false, Base::Binary),
-    };
+    let (resolved_range, element_width, element_signed, element_base, element_base_locked) =
+        match kind {
+            DeclKind::Reg => {
+                let resolved = match range {
+                    Some((msb_expr, lsb_expr)) => {
+                        Some(evaluate_reg_range(msb_expr, lsb_expr, session)?)
+                    }
+                    None => None,
+                };
+                let width = match &resolved {
+                    Some(range) => range.width()?,
+                    None => 1,
+                };
+                (resolved, width, signed, Base::Binary, false)
+            }
+            DeclKind::Integer => {
+                // LRM 4.8: `integer` is signed 32-bit. Decimal display base
+                // matches `integer i; i = 0;` round-tripping through the
+                // canonical printer as `32'sd0` — same as `$signed(0)` or
+                // `reg signed [31:0] i` would render once stored in decimal.
+                let range = RegRange {
+                    msb: BigInt::from(31),
+                    lsb: BigInt::from(0),
+                };
+                (Some(range), 32usize, true, Base::Decimal, true)
+            }
+            DeclKind::Real => (None, 0usize, false, Base::Binary, true),
+        };
 
     // Staging area mirrors the prior reg-only path: every init runs
     // against a `Session` view of `staged` so a self-reference reads
@@ -452,6 +453,7 @@ fn apply_decl(
                     width: element_width,
                     signed: element_signed,
                     base: element_base,
+                    base_locked: element_base_locked,
                     display_style: DisplayStyle::Base,
                     bits: vec![LogicBit::X; element_width],
                     unsized_literal: false,
@@ -481,21 +483,15 @@ fn apply_decl(
             // Scalar / vector (non-array) reg or integer: integer-pipeline
             // init evaluation with the per-kind context.
             (DeclKind::Reg | DeclKind::Integer, None) => {
-                let bits = eval_init_bits(
+                let value = eval_init_value(
                     init.as_ref(),
                     element_width,
                     element_signed,
                     element_base,
+                    element_base_locked,
                     &mut staged,
                 )?;
-                RegStorage::Vector(IntegerValue {
-                    width: element_width,
-                    signed: element_signed,
-                    base: element_base,
-                    display_style: DisplayStyle::Base,
-                    bits,
-                    unsized_literal: false,
-                })
+                RegStorage::Vector(value)
             }
             // Scalar real: LRM 4.8 zero-init, optional real-pipeline
             // init (`evaluate_real_value` handles the §5.1.7 / §3.5.3
@@ -555,21 +551,46 @@ where
 // runs through `evaluate_assignment_rhs` so the same width / sign /
 // base context and real→integer §3.5.3 conversion semantics apply that
 // `name = expr` would use after the decl.
-fn eval_init_bits(
+fn eval_init_value(
     init: Option<&Expr>,
     width: usize,
     signed: bool,
     base: Base,
+    base_locked: bool,
     staged: &mut HashMap<String, RegValue>,
-) -> Result<Vec<LogicBit>, String> {
+) -> Result<IntegerValue, String> {
     match init {
         Some(init_expr) => {
             let result = with_staged_session(staged, |view| {
                 eval::evaluate_assignment_rhs(init_expr, width, signed, base, view)
             })?;
-            Ok(result.bits)
+            let sized = result.resized_to_context(width, signed);
+            let (stored_base, stored_base_locked) = if base_locked {
+                (base, true)
+            } else if result.base_locked {
+                (result.base, true)
+            } else {
+                (base, false)
+            };
+            Ok(IntegerValue {
+                width,
+                signed,
+                base: stored_base,
+                base_locked: stored_base_locked,
+                display_style: DisplayStyle::Base,
+                bits: sized.bits,
+                unsized_literal: false,
+            })
         }
-        None => Ok(vec![LogicBit::X; width]),
+        None => Ok(IntegerValue {
+            width,
+            signed,
+            base,
+            base_locked,
+            display_style: DisplayStyle::Base,
+            bits: vec![LogicBit::X; width],
+            unsized_literal: false,
+        }),
     }
 }
 

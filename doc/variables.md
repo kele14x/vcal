@@ -9,9 +9,13 @@ integer name [= init] { , name [= init] }
 real    name [= init] { , name [= init] }
 ```
 
-- The display base for a reg is binary, so a reg renders as
-  `<width>'b<digits>` (signed: `<width>'sb<digits>`). `reg [7:0] a` reads
-  back as `8'bxxxxxxxx` before any assignment.
+- A reg declaration has no strong display base. vcal uses binary as a
+  fallback for an unassigned reg, so `reg [7:0] a` reads back as
+  `8'bxxxxxxxx`, but the first whole-reg integer init or blocking
+  assignment resolves the display base from the RHS expression:
+  `reg [7:0] a = 8'h00; a` reads back as `8'h00`. Signedness still comes
+  only from the declaration, so `reg signed [7:0] a = 8'hff` reads back
+  as `8'shff`.
 - An unsized decl is 1 bit (`reg a` → `1'bx`).
 - Range halves are constant integer expressions evaluated in the current
   session at decl time; they must be non-negative and free of x/z bits.
@@ -21,8 +25,8 @@ real    name [= init] { , name [= init] }
 - Redeclaring an existing identifier in the same session replaces the
   prior binding — the REPL is single-scope and a redecl is the user's way
   of resetting a reg's metadata, so the new decl wipes the old width,
-  signedness, base, and bit pattern. The freshly redeclared reg starts at
-  all `x` like any other new reg.
+  signedness, display base, and bit pattern. The freshly redeclared reg
+  starts at all `x` like any other new reg.
 - A fresh reg is initialized to all `x`. The decl statement prints a
   bare blank line — the same convention assignments, `$finish`, and
   `$stop` use for non-value statements (see [repl.md](repl.md)).
@@ -72,22 +76,27 @@ A `real` decl is an IEEE 754 binary64 slot (LRM 4.8 / 3.5.2):
 
 Blocking assignment `name = expression` is a top-level statement, not an
 expression (LRM A.6.2), so it does not nest inside larger expressions.
-The LHS reg's width, signedness, and base flow into the RHS via the
-standard §5.6 context rules, then the resulting bits replace the reg's
-bits while the reg's declared metadata is preserved. A real-typed RHS
-goes through an implicit real→integer conversion per LRM §3.5.3 (round
-to nearest, ties away from zero — the same rule `$itor`'s internal
-real→int step uses); NaN / ±∞ have no integer image and surface as the
-lvalue filled with x bits at its declared width. The assignment itself
-prints a blank line per [repl.md](repl.md); reference the reg on the
-next line (or as a trailing expression on the same line) to display
-its new value.
+The LHS reg's width, signedness, and current display base flow into the
+RHS via the standard §5.6 context rules, then the resulting bits replace
+the reg's bits. If the LHS is a whole `reg` whose display base is still
+weak, an integer RHS resolves it; later whole-reg assignments preserve
+the resolved base. Real-typed RHS expressions do not resolve a weak
+display base. Bit-select, part-select, array-element, and concat-lvalue
+writes update bits without resolving the whole reg's display base.
+
+A real-typed RHS goes through an implicit real→integer conversion per
+LRM §3.5.3 (round to nearest, ties away from zero — the same rule
+`$itor`'s internal real→int step uses); NaN / ±∞ have no integer image
+and surface as the lvalue filled with x bits at its declared width. The
+assignment itself prints a blank line per [repl.md](repl.md); reference
+the reg on the next line (or as a trailing expression on the same line)
+to display its new value.
 
 An identifier reference resolves to the reg's current bits and then
 participates in the surrounding expression like any other primary — its
-`(width, signed, base)` propagates per §5.5 (so e.g. an 8-bit binary reg
-on the left of `+` makes the result render in binary). Referencing an
-undeclared name is an error.
+`(width, signed, base)` propagates per §5.5 (so e.g. an 8-bit reg whose
+base resolved to hex makes a leftmost `+` result render in hex).
+Referencing an undeclared name is an error.
 
 ## Bit-select and part-select
 
@@ -282,8 +291,8 @@ Element-select reads (RHS):
 Element-select writes (LHS):
 
 - `a[i] = expr` writes the whole element in element-shape context
-  (width / signed / base from the packed range, base hardcoded to
-  binary at decl time).
+  (width / signed from the packed range; reg-array elements currently use
+  the same binary fallback display base as a fresh scalar `reg`).
 - `a[i][n] = expr`, `a[i][m:l] = expr`, and the indexed forms write
   only the named positions of the chosen element; other positions are
   preserved. The RHS evaluates in the *inner select's* shape (width

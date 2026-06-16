@@ -154,6 +154,10 @@ pub struct IntegerValue {
     pub(crate) width: usize,
     pub(crate) signed: bool,
     pub(crate) base: Base,
+    // `reg` declarations use a binary fallback before the user gives the
+    // object a value with a real display base. Literals, computed values,
+    // integers, and explicitly resolved regs keep this fixed.
+    pub(crate) base_locked: bool,
     pub(crate) display_style: DisplayStyle,
     pub(crate) bits: Vec<LogicBit>,
     // True for literals parsed without an explicit size (LRM 3.5.1 default
@@ -305,6 +309,7 @@ impl IntegerValue {
             width,
             signed: context_signed,
             base: self.base,
+            base_locked: self.base_locked,
             display_style: DisplayStyle::Base,
             bits,
             unsized_literal: false,
@@ -333,6 +338,7 @@ impl IntegerValue {
             width,
             signed: self.signed,
             base: self.base,
+            base_locked: self.base_locked,
             display_style: DisplayStyle::Base,
             bits,
             unsized_literal: false,
@@ -363,6 +369,7 @@ impl IntegerValue {
             width,
             signed,
             base,
+            base_locked: true,
             display_style: DisplayStyle::Base,
             bits,
             unsized_literal: false,
@@ -374,6 +381,7 @@ impl IntegerValue {
             width,
             signed,
             base,
+            base_locked: true,
             display_style: DisplayStyle::Base,
             bits: bigint_to_bits_with_width(&value, width),
             unsized_literal: false,
@@ -385,10 +393,16 @@ impl IntegerValue {
             width,
             signed,
             base,
+            base_locked: true,
             display_style: DisplayStyle::Base,
             bits: vec![LogicBit::X; width],
             unsized_literal: false,
         }
+    }
+
+    pub(crate) fn with_weak_base(mut self) -> Self {
+        self.base_locked = false;
+        self
     }
 
     pub(crate) fn with_display_style(mut self, display_style: DisplayStyle) -> Self {

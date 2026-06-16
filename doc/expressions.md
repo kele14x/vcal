@@ -90,11 +90,13 @@ The integer implementation holds at least four fields for the features specified
 And one additional field for proper display in console:
 
 - Base
+- Whether the base is fixed or still a weak `reg` fallback
 - Display style (`base` or `string`)
 
 The base of an arithmetic result is inferred from its operands so the output keeps the form the user typed when possible. The LRM does not specify this — it is a vcal display convention.
 
 - A literal carries the base it was declared with. Unsized decimal literals (e.g. `42`) are decimal.
+- A fresh `reg` has a weak binary fallback base until a whole-reg integer init or assignment resolves it. After that, identifier references carry the resolved base like any other value.
 - A unary operator (`+`, `-`) preserves the operand's base. So `-4'b1` is `4'b1111`.
 - A binary operator (`+`, `-`, `*`, `/`, `%`, `**`) takes the **leftmost** operand's base. So `4'b0111 + 4'b1001` is `4'b0000`, `8'h0a + 8'b1` is `8'h0b`, and `8'b00001010 + 8'h05` is `8'b00001111`.
   - The leftmost-wins rule mirrors the left-to-right evaluation order of the supported operators. There is no automatic base "promotion" between bases.

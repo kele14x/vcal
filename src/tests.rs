@@ -202,10 +202,7 @@ fn string_assignments_follow_existing_width_context() {
     session.eval("reg [23:0] wide = \"A\"").expect("wide decl");
     assert_eq!(session.eval("wide == 24'h41").expect("read").output, "1'b1");
 
-    assert_eq!(
-        session.eval("word").expect("reg read").output,
-        "16'b0100000101000010"
-    );
+    assert_eq!(session.eval("word").expect("reg read").output, "16'h4142");
 }
 
 #[test]
@@ -4514,9 +4511,9 @@ fn math_function_parser_errors() {
 // `reg` declarations and blocking assignment — the smallest end-to-end
 // variable type. These tests cover decl forms (with / without range, signed,
 // reversed range, multi-name), default x-initialization, width/sign behavior
-// of blocking assignment, the binary display base for regs, error surfaces
-// for undeclared / redeclared identifiers and real RHS, and Session state
-// persistence across multiple `eval` calls.
+// of blocking assignment, weak display-base resolution for regs, error
+// surfaces for undeclared / redeclared identifiers and real RHS, and Session
+// state persistence across multiple `eval` calls.
 
 #[test]
 fn reg_decl_without_range_is_one_bit_unsigned() {
@@ -4698,21 +4695,16 @@ fn reg_decl_produces_empty_out_line() {
 fn assignment_truncates_wider_rhs_to_reg_width() {
     let mut session = Session::new();
     session.eval("reg [3:0] a").expect("decl");
-    assert_eq!(
-        session.eval("a = 8'hff; a").expect("assign").output,
-        "4'b1111"
-    );
+    assert_eq!(session.eval("a = 8'hff; a").expect("assign").output, "4'hf");
 }
 
 #[test]
 fn assignment_sign_extends_narrower_rhs_into_signed_reg() {
     let mut session = Session::new();
     session.eval("reg signed [7:0] a").expect("decl");
-    // Binary base is the reg's default display, so the sign-extended bits
-    // print in their per-position form rather than as signed decimal.
     assert_eq!(
         session.eval("a = 4'shf; a").expect("assign").output,
-        "8'sb11111111"
+        "8'shff"
     );
 }
 
@@ -4727,17 +4719,71 @@ fn assignment_preserves_x_and_z_bits() {
 }
 
 #[test]
+fn reg_assignment_resolves_weak_display_base_once() {
+    let mut session = Session::new();
+    session.eval("reg [7:0] a").expect("decl");
+    assert_eq!(
+        session.eval("a").expect("unresolved read").output,
+        "8'bxxxxxxxx"
+    );
+    assert_eq!(
+        session.eval("a = 8'h00; a").expect("first assign").output,
+        "8'h00"
+    );
+    assert_eq!(
+        session.eval("a = 8'b1; a").expect("later assign").output,
+        "8'h01"
+    );
+}
+
+#[test]
+fn reg_init_resolves_display_base_but_not_signedness() {
+    let mut session = Session::new();
+    session
+        .eval("reg signed [7:0] a = 8'hff")
+        .expect("signed hex init");
+    assert_eq!(session.eval("a").expect("read").output, "8'shff");
+}
+
+#[test]
+fn real_assignment_does_not_resolve_weak_reg_display_base() {
+    let mut session = Session::new();
+    session.eval("reg [7:0] a").expect("decl");
+    assert_eq!(
+        session.eval("a = 1.5; a").expect("real assign").output,
+        "8'b00000010"
+    );
+    assert_eq!(
+        session.eval("a = 8'h03; a").expect("integer assign").output,
+        "8'h03"
+    );
+}
+
+#[test]
+fn select_assignment_does_not_resolve_whole_reg_display_base() {
+    let mut session = Session::new();
+    session.eval("reg [7:0] a").expect("decl");
+    assert_eq!(
+        session
+            .eval("a[3:0] = 4'hf; a")
+            .expect("select assign")
+            .output,
+        "8'bxxxx1111"
+    );
+    assert_eq!(
+        session.eval("a = 8'h00; a").expect("whole assign").output,
+        "8'h00"
+    );
+}
+
+#[test]
 fn reg_value_participates_in_later_expression_with_its_own_base() {
-    // After storing 4'h0a into an 8-bit binary-base reg, `a + 4'b1` is
-    // evaluated with `a`'s metadata propagated (binary base wins from the
-    // leftmost operand, width = 8).
+    // After storing 4'h0a into an 8-bit reg, the weak declaration base
+    // resolves to hex. Later expressions propagate that stored base.
     let mut session = Session::new();
     session.eval("reg [7:0] a").expect("decl");
     session.eval("a = 4'h0a").expect("assign");
-    assert_eq!(
-        session.eval("a + 4'b1").expect("expr").output,
-        "8'b00001011"
-    );
+    assert_eq!(session.eval("a + 4'b1").expect("expr").output, "8'h0b");
 }
 
 #[test]
@@ -4802,12 +4848,12 @@ fn assigning_to_undeclared_identifier_is_an_error() {
 #[test]
 fn redeclaration_replaces_the_previous_binding() {
     // The REPL is single-scope and a redecl is the user's way of resetting
-    // a reg's metadata. The new decl wipes width / signed / base / value;
-    // the new reg starts at all-x just like a fresh one.
+    // a reg's metadata. The new decl wipes width / signed / display base /
+    // value; the new reg starts at all-x just like a fresh one.
     let mut session = Session::new();
     session.eval("reg [7:0] a").expect("first decl");
     session.eval("a = 8'h2a").expect("populate");
-    assert_eq!(session.eval("a").expect("read").output, "8'b00101010");
+    assert_eq!(session.eval("a").expect("read").output, "8'h2a");
     session.eval("reg [3:0] a").expect("redecl narrower");
     assert_eq!(
         session.eval("a").expect("read after redecl").output,
@@ -4858,16 +4904,16 @@ fn session_state_persists_across_eval_calls() {
     session.eval("reg [7:0] a").expect("decl");
     assert_eq!(
         session.eval("a = 4'hF + 4'hF; a").expect("assign").output,
-        "8'b00011110"
+        "8'h1e"
     );
-    assert_eq!(session.eval("a").expect("read").output, "8'b00011110");
+    assert_eq!(session.eval("a").expect("read").output, "8'h1e");
 }
 
 #[test]
 fn reg_decl_init_value_populates_bits() {
     let mut session = Session::new();
     session.eval("reg [7:0] a = 8'h2a").expect("decl with init");
-    assert_eq!(session.eval("a").expect("read").output, "8'b00101010");
+    assert_eq!(session.eval("a").expect("read").output, "8'h2a");
 }
 
 #[test]
@@ -4877,10 +4923,10 @@ fn reg_decl_init_truncates_wider_literal_to_reg_width() {
     // low 4 bits.
     let mut session = Session::new();
     session.eval("reg [3:0] a = 8'hff").expect("decl with init");
-    assert_eq!(session.eval("a").expect("read").output, "4'b1111");
+    assert_eq!(session.eval("a").expect("read").output, "4'hf");
     let mut session = Session::new();
     session.eval("reg [3:0] a = 8'h1f").expect("decl with init");
-    assert_eq!(session.eval("a").expect("read").output, "4'b1111");
+    assert_eq!(session.eval("a").expect("read").output, "4'hf");
 }
 
 #[test]
@@ -4891,7 +4937,7 @@ fn reg_decl_init_sign_extends_into_signed_reg() {
     session
         .eval("reg signed [3:0] s = -1")
         .expect("decl with signed init");
-    assert_eq!(session.eval("s").expect("read").output, "4'sb1111");
+    assert_eq!(session.eval("s").expect("read").output, "-4'sd1");
 }
 
 #[test]
@@ -4928,7 +4974,7 @@ fn reg_decl_partial_init_list_leaves_uninitialized_names_x() {
     let mut session = Session::new();
     session.eval("reg a, b = 5, c").expect("partial init list");
     assert_eq!(session.eval("a").expect("read a").output, "1'bx");
-    assert_eq!(session.eval("b").expect("read b").output, "1'b1");
+    assert_eq!(session.eval("b").expect("read b").output, "1'd1");
     assert_eq!(session.eval("c").expect("read c").output, "1'bx");
 }
 
@@ -4941,8 +4987,8 @@ fn reg_decl_init_sees_earlier_name_in_same_decl() {
     session
         .eval("reg [3:0] a = 1, b = a + 1")
         .expect("sequential init");
-    assert_eq!(session.eval("a").expect("read a").output, "4'b0001");
-    assert_eq!(session.eval("b").expect("read b").output, "4'b0010");
+    assert_eq!(session.eval("a").expect("read a").output, "4'd1");
+    assert_eq!(session.eval("b").expect("read b").output, "4'd2");
 }
 
 #[test]
@@ -4956,7 +5002,7 @@ fn reg_decl_self_referencing_init_reads_prior_binding() {
     session
         .eval("reg [3:0] a = a")
         .expect("redecl with self-init");
-    assert_eq!(session.eval("a").expect("read").output, "4'b0111");
+    assert_eq!(session.eval("a").expect("read").output, "4'd7");
 }
 
 #[test]
@@ -4989,7 +5035,7 @@ fn reg_decl_init_can_reference_previously_declared_reg() {
     session
         .eval("reg [7:0] b = a + 1")
         .expect("init from prior reg");
-    assert_eq!(session.eval("b").expect("read").output, "8'b00000110");
+    assert_eq!(session.eval("b").expect("read").output, "8'd6");
 }
 
 #[test]
@@ -5041,7 +5087,7 @@ fn reg_decl_failed_init_preserves_prior_binding_for_redeclared_name() {
         .eval("reg [3:0] a = 1, b = nope")
         .expect_err("undeclared identifier in init");
     assert_eq!(err, "Semantic error: undeclared identifier: nope");
-    assert_eq!(session.eval("a").expect("read a").output, "4'b0111");
+    assert_eq!(session.eval("a").expect("read a").output, "4'd7");
     assert!(session.lookup("b").is_none(), "b should not be bound");
 }
 
@@ -5082,17 +5128,11 @@ fn bit_select_maps_source_index_to_internal_on_reversed_decl() {
 #[test]
 fn constant_part_select_on_forward_decl_returns_unsigned_slice() {
     // Part-select results are always unsigned per LRM 4.7, and the
-    // declared reg base (Binary, set by the decl path) flows through.
+    // learned reg base flows through.
     let mut session = Session::new();
     session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
-    assert_eq!(
-        session.eval("r[3:0]").expect("low nibble").output,
-        "4'b1011"
-    );
-    assert_eq!(
-        session.eval("r[7:4]").expect("high nibble").output,
-        "4'b1010"
-    );
+    assert_eq!(session.eval("r[3:0]").expect("low nibble").output, "4'hb");
+    assert_eq!(session.eval("r[7:4]").expect("high nibble").output, "4'ha");
 }
 
 #[test]
@@ -5154,8 +5194,8 @@ fn out_of_range_bit_select_yields_x() {
     // returns x.
     let mut session = Session::new();
     session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
-    assert_eq!(session.eval("r[8]").expect("above range").output, "1'bx");
-    assert_eq!(session.eval("r[-1]").expect("below range").output, "1'bx");
+    assert_eq!(session.eval("r[8]").expect("above range").output, "1'hx");
+    assert_eq!(session.eval("r[-1]").expect("below range").output, "1'hx");
 }
 
 #[test]
@@ -5171,14 +5211,14 @@ fn out_of_range_part_select_fills_only_the_out_of_range_bits_with_x() {
             .eval("r[9:6]")
             .expect("constant partial overlap")
             .output,
-        "4'bxx10"
+        "4'hx"
     );
     assert_eq!(
         session
             .eval("r[6 +: 4]")
             .expect("indexed partial overlap")
             .output,
-        "4'bxx10"
+        "4'hx"
     );
     // The example from the bug report, exact wording: `reg [3:0] a =
     // 4'b0101; a[4:3]` → `2'bx0` (bit 4 oob → x; bit 3 in range → 0).
@@ -5200,7 +5240,7 @@ fn xz_in_bit_select_index_yields_x() {
         .eval("reg [3:0] i = 4'bxx10")
         .expect("decl with x bits");
     // i has x bits anywhere → bit-select index unknown → result 1'bx.
-    assert_eq!(session.eval("r[i]").expect("x in index").output, "1'bx");
+    assert_eq!(session.eval("r[i]").expect("x in index").output, "1'hx");
 }
 
 #[test]
@@ -5210,10 +5250,7 @@ fn xz_in_indexed_part_select_base_yields_all_x() {
     session
         .eval("reg [3:0] i = 4'bxx10")
         .expect("decl with x bits");
-    assert_eq!(
-        session.eval("r[i +: 4]").expect("x in base").output,
-        "4'bxxxx"
-    );
+    assert_eq!(session.eval("r[i +: 4]").expect("x in base").output, "4'hx");
 }
 
 #[test]
@@ -5258,14 +5295,14 @@ fn xz_or_nonpositive_indexed_width_errors() {
 fn select_from_signed_reg_is_unsigned() {
     // LRM 4.7: a part-select is always unsigned, even on a signed reg.
     // -8'sd1 stores all-ones; the 8-bit select reads back all-ones as
-    // an unsigned 8-bit value (rendered in the reg's binary base).
+    // an unsigned 8-bit value in the reg's learned decimal base.
     let mut session = Session::new();
     session
         .eval("reg signed [7:0] s = -8'sd1")
         .expect("signed decl");
     assert_eq!(
         session.eval("s[7:0]").expect("full select").output,
-        "8'b11111111"
+        "8'd255"
     );
 }
 
@@ -5289,7 +5326,7 @@ fn select_result_widens_in_outer_context() {
     session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     assert_eq!(
         session.eval("r[3:0] + 16'b0").expect("widened").output,
-        "16'b0000000000001011"
+        "16'h000b"
     );
 }
 
@@ -5347,7 +5384,7 @@ fn indexed_part_select_requires_adjacent_colon() {
     session.eval("reg [7:0] r = 8'hAB").expect("decl with init");
     assert_eq!(
         session.eval("r[2 +: 4]").expect("adjacent ok").output,
-        "4'b1010"
+        "4'ha"
     );
     let err = session
         .eval("r[2 + : 4]")
@@ -5370,9 +5407,9 @@ fn bare_name_lhs_unchanged() {
     session.eval("reg [7:0] a").expect("decl");
     assert_eq!(
         session.eval("a = 8'hAB; a").expect("bare assign").output,
-        "8'b10101011"
+        "8'hab"
     );
-    assert_eq!(session.eval("a").expect("read").output, "8'b10101011");
+    assert_eq!(session.eval("a").expect("read").output, "8'hab");
 }
 
 #[test]
@@ -5384,9 +5421,9 @@ fn bit_select_lhs_writes_single_bit() {
             .eval("r[2] = 1'b1; r[2]")
             .expect("bit-select assign")
             .output,
-        "1'b1"
+        "1'h1"
     );
-    assert_eq!(session.eval("r").expect("read r").output, "8'b00000100");
+    assert_eq!(session.eval("r").expect("read r").output, "8'h04");
 }
 
 #[test]
@@ -5398,9 +5435,9 @@ fn part_const_lhs_writes_slice() {
             .eval("r[5:2] = 4'hF; r[5:2]")
             .expect("part-const assign")
             .output,
-        "4'b1111"
+        "4'hf"
     );
-    assert_eq!(session.eval("r").expect("read r").output, "8'b00111100");
+    assert_eq!(session.eval("r").expect("read r").output, "8'h3c");
 }
 
 #[test]
@@ -5414,9 +5451,9 @@ fn part_indexed_up_lhs_writes_slice() {
             .eval("r[2 +: 4] = 4'b1010; r[2 +: 4]")
             .expect("indexed-up assign")
             .output,
-        "4'b1010"
+        "4'ha"
     );
-    assert_eq!(session.eval("r").expect("read r").output, "8'b00101000");
+    assert_eq!(session.eval("r").expect("read r").output, "8'h28");
 }
 
 #[test]
@@ -5430,9 +5467,9 @@ fn part_indexed_down_lhs_writes_slice() {
             .eval("r[5 -: 4] = 4'b1010; r[5 -: 4]")
             .expect("indexed-down assign")
             .output,
-        "4'b1010"
+        "4'ha"
     );
-    assert_eq!(session.eval("r").expect("read r").output, "8'b00101000");
+    assert_eq!(session.eval("r").expect("read r").output, "8'h28");
 }
 
 #[test]
@@ -5447,10 +5484,10 @@ fn concat_lhs_distributes_bits() {
             .eval("{a, b} = 8'hAB; {a, b}")
             .expect("concat assign")
             .output,
-        "8'b10101011"
+        "8'hab"
     );
-    assert_eq!(session.eval("a").expect("read a").output, "4'b1010");
-    assert_eq!(session.eval("b").expect("read b").output, "4'b1011");
+    assert_eq!(session.eval("a").expect("read a").output, "4'ha");
+    assert_eq!(session.eval("b").expect("read b").output, "4'hb");
 }
 
 #[test]
@@ -5485,12 +5522,12 @@ fn concat_lhs_with_selects() {
             .eval("{a[3:0], b[7:4]} = 8'hAB; {a[3:0], b[7:4]}")
             .expect("concat-of-selects assign")
             .output,
-        "8'b10101011"
+        "8'hab"
     );
     // a[3:0] receives the MSB-side nibble 0xA.
-    assert_eq!(session.eval("a").expect("read a").output, "8'b00001010");
+    assert_eq!(session.eval("a").expect("read a").output, "8'h0a");
     // b[7:4] receives the LSB-side nibble 0xB.
-    assert_eq!(session.eval("b").expect("read b").output, "8'b10110000");
+    assert_eq!(session.eval("b").expect("read b").output, "8'hb0");
 }
 
 #[test]
@@ -5506,9 +5543,9 @@ fn lhs_part_const_endpoints_runtime_eval() {
             .eval("r[hi:2] = 4'hF; r[hi:2]")
             .expect("runtime endpoint")
             .output,
-        "4'b1111"
+        "4'hf"
     );
-    assert_eq!(session.eval("r").expect("read r").output, "8'b00111100");
+    assert_eq!(session.eval("r").expect("read r").output, "8'h3c");
 }
 
 #[test]
@@ -5554,9 +5591,9 @@ fn lhs_part_select_partial_overlap_drops_off_end() {
             .eval("r[5:2] = 4'b1111; r[5:2]")
             .expect("partial overlap")
             .output,
-        "4'bxx11"
+        "4'hx"
     );
-    assert_eq!(session.eval("r").expect("read r").output, "4'b1100");
+    assert_eq!(session.eval("r").expect("read r").output, "4'hc");
 }
 
 #[test]
@@ -5591,9 +5628,9 @@ fn lhs_concat_duplicate_bit_picks_msb_side_leaf() {
             .eval("{a[0], a[0]} = 2'b10; {a[0], a[0]}")
             .expect("duplicate-bit lvalue is not an error")
             .output,
-        "2'b11"
+        "2'h3"
     );
-    assert_eq!(session.eval("a").expect("read a").output, "4'b0001");
+    assert_eq!(session.eval("a").expect("read a").output, "4'h1");
 }
 
 #[test]
@@ -5621,7 +5658,7 @@ fn lhs_part_const_direction_mismatch_rejected() {
         err.contains("part-select direction"),
         "want direction error, got: {err}"
     );
-    assert_eq!(session.eval("r").expect("read r").output, "8'b00000000");
+    assert_eq!(session.eval("r").expect("read r").output, "8'h00");
 }
 
 #[test]
@@ -5686,7 +5723,7 @@ fn lhs_bit_select_real_index_runs_before_rhs_eval() {
         .eval("r[1.5] = undeclared_rhs")
         .expect_err("real index rejected");
     assert_eq!(err, "Semantic error: bit-select index cannot be real");
-    assert_eq!(session.eval("r").expect("read r").output, "4'b0000");
+    assert_eq!(session.eval("r").expect("read r").output, "4'h0");
 }
 
 #[test]
@@ -5702,7 +5739,7 @@ fn lhs_indexed_part_select_real_base_runs_before_rhs_eval() {
         err,
         "Semantic error: indexed part-select base cannot be real"
     );
-    assert_eq!(session.eval("r").expect("read r").output, "4'b0000");
+    assert_eq!(session.eval("r").expect("read r").output, "4'h0");
 }
 
 #[test]
@@ -5792,20 +5829,19 @@ fn lhs_rhs_zero_extends_to_concat_width() {
 
 #[test]
 fn echo_for_bare_name_lhs_uses_reg_metadata() {
-    // Sign-extension and the reg's stored base (Binary, set by the decl
-    // path) flow through, mirroring the pre-lvalue echo policy. -5 in
-    // an 8-bit signed two's-complement is 0b11111011.
+    // The first whole-reg assignment learns the RHS decimal display base.
+    // Signedness still comes from the declaration.
     let mut session = Session::new();
     session.eval("reg signed [7:0] r").expect("signed decl");
     assert_eq!(
         session.eval("r = -5; r").expect("signed assign").output,
-        "8'sb11111011"
+        "-8'sd5"
     );
 }
 
 #[test]
 fn echo_for_select_lhs_uses_select_width() {
-    // Select's width and the reg's base (Binary by default), not the
+    // Select's width and the reg's learned base, not the
     // RHS's natural display form.
     let mut session = Session::new();
     session.eval("reg [7:0] r = 8'h00").expect("decl");
@@ -5814,14 +5850,13 @@ fn echo_for_select_lhs_uses_select_width() {
             .eval("r[3:0] = 4'hA; r[3:0]")
             .expect("select-width echo")
             .output,
-        "4'b1010"
+        "4'ha"
     );
 }
 
 #[test]
 fn echo_for_concat_lhs_uses_leftmost_base() {
-    // The concat's width and the leftmost leaf's base — without
-    // re-stamping, the RHS's hex base would leak into the echo.
+    // The concat's width and the leftmost leaf's learned base.
     let mut session = Session::new();
     session.eval("reg [3:0] a = 4'h0").expect("decl a");
     session.eval("reg [3:0] b = 4'h0").expect("decl b");
@@ -5830,7 +5865,7 @@ fn echo_for_concat_lhs_uses_leftmost_base() {
             .eval("{a, b} = 8'hAB; {a, b}")
             .expect("concat echo")
             .output,
-        "8'b10101011"
+        "8'hab"
     );
 }
 
@@ -6428,7 +6463,7 @@ fn array_element_write_with_narrower_rhs_zero_extends() {
 fn array_element_write_signed_element_sign_extends_narrow_signed_rhs() {
     // A signed element context sign-extends a signed narrower RHS:
     // `2'sb11` (signed-binary -1) widens to `4'sb1111` (still -1).
-    // Element base is Binary (hardcoded at array decl time), so the
+    // Reg-array elements keep the fresh-reg binary fallback, so the
     // canonical rendering keeps the `'sb` signed-binary prefix rather
     // than collapsing to the signed-decimal form.
     let mut session = Session::new();
