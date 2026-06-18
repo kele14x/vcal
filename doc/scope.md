@@ -8,7 +8,7 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 
 - REPL shell with `rustyline` history
 - Integer and real literals, all LRM forms (LRM 3.5.2)
-- String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; display tasks are not included
+- String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; internal zero-width numeric display renders with one `0` digit; display tasks are not included
 - All operators between integers (see [operators.md](operators.md))
 - Real arithmetic and mixed integer/real promotion (LRM 5.1.5 / 5.1.7 / Tables 5-2, 5-3)
 - Two-pass context (width, signedness) propagation; leftmost-base propagation; `reg` display base starts as a weak binary fallback and resolves from the first whole-reg integer init/assignment

@@ -68,6 +68,7 @@ The general rules for how vcal evaluates expressions. Per-operator details live 
 - String literals are self-determined and have definite width, so they are legal in the same integer-expression positions as sized integer literals, including assignments, comparisons, concatenations, and casts.
 - Assignment to a narrower vector truncates from the MSB side, preserving the rightmost bytes. Assignment to a wider vector zero-extends on the left under the existing context rules.
 - Bare string literals render as escaped quoted text, while still comparing and computing as the packed numeric value. String-only concatenation and replication preserve string rendering (`{"A", "B"}` -> `"AB"`); mixing in numeric values or using display-base casts (`$hex`, `$dec`, `$bin`, `$oct`) renders numerically.
+- Empty source strings (`""`) are treated as one NUL byte, equivalent to `"\000"`. User syntax cannot create a zero-width vector; if an internal zero-width value reaches numeric display, vcal renders one zero digit (`0'h0`, `0'd0`).
 - Supported escapes are `\n`, `\t`, `\\`, `\"`, and 1-3 digit octal byte escapes.
 - vcal does not implement SystemVerilog's dynamic `string` type; there is no `string` declaration keyword.
 

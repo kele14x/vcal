@@ -1389,7 +1389,7 @@ fn visit_expr_structure<'a>(
         // a number, not bits) and only blow up at `materialize()` time.
         Expr::Literal(spec) => value::ensure_bit_width(spec.width, "literal")?,
         Expr::StringLiteral(bytes) => {
-            value::ensure_bit_width(bytes.len().saturating_mul(8), "string literal")?
+            value::ensure_bit_width(bytes.len().max(1).saturating_mul(8), "string literal")?
         }
         Expr::RealLiteral(_) => {}
         Expr::Grouped(inner) => work.push(ExprValidateTask::Visit(inner)),
@@ -1652,7 +1652,7 @@ fn visit_annotated<'b, 'a: 'b>(
             // that still hit literal leaves through this driver).
             Expr::Literal(spec) => value::ensure_bit_width(spec.width, "literal")?,
             Expr::StringLiteral(bytes) => {
-                value::ensure_bit_width(bytes.len().saturating_mul(8), "string literal")?
+                value::ensure_bit_width(bytes.len().max(1).saturating_mul(8), "string literal")?
             }
             Expr::RealLiteral(_) => {}
             Expr::Identifier(name) => {

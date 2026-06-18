@@ -49,7 +49,7 @@ vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same f
 
 ## String literals
 
-vcal implements Verilog string constants as packed 8-bit vectors, but it does not yet implement the display task family (`$display`, `$write`, `$strobe`, `$monitor`). As a REPL convenience, bare string literals render as escaped quoted text even though their value is still the packed vector. String-only concatenation and replication preserve that display style (`{"A", "B"}` -> `"AB"`); mixed numeric concatenation and display-base casts render numerically (`{"A", 8'h42}` -> `16'h4142`, `$dec("AB")` -> `16'd16706`).
+vcal implements Verilog string constants as packed 8-bit vectors, but it does not yet implement the display task family (`$display`, `$write`, `$strobe`, `$monitor`). As a REPL convenience, bare string literals render as escaped quoted text even though their value is still the packed vector. String-only concatenation and replication preserve that display style (`{"A", "B"}` -> `"AB"`); mixed numeric concatenation and display-base casts render numerically (`{"A", 8'h42}` -> `16'h4142`, `$dec("AB")` -> `16'd16706`). The LRM is ambiguous about the empty source literal `""`; vcal treats it as one NUL byte, equivalent to `"\000"`, so syntax cannot create a zero-width vector. Zero-width vectors may still exist internally for debug or fault-tolerance paths, and numeric display renders them with one zero digit (`0'h0`, `0'd0`).
 
 ## Conditional operator
 

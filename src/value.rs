@@ -201,6 +201,10 @@ impl IntegerValue {
     }
 
     fn render_decimal_digits(&self) -> String {
+        if self.width == 0 {
+            return "0".to_string();
+        }
+
         if self.bits.iter().all(|bit| *bit == LogicBit::X) {
             return "x".to_string();
         }
@@ -225,6 +229,10 @@ impl IntegerValue {
     }
 
     fn render_signed_decimal_digits(&self) -> Option<(bool, String)> {
+        if self.width == 0 {
+            return Some((false, "0".to_string()));
+        }
+
         if self.bits.iter().all(|bit| *bit == LogicBit::X) {
             return Some((false, "x".to_string()));
         }
@@ -256,6 +264,10 @@ impl IntegerValue {
     }
 
     fn render_grouped_digits(&self) -> String {
+        if self.width == 0 {
+            return "0".to_string();
+        }
+
         let group_size = self.base.group_size();
         let digit_count = self.width.div_ceil(group_size);
         let mut output = String::with_capacity(digit_count);

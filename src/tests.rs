@@ -4,7 +4,9 @@ use num_bigint::BigInt;
 
 use crate::lexer::{Token, tokenize};
 use crate::parser::{BinaryOp, Expr, UnaryOp, parse_expression, parse_integer};
-use crate::{Session, evaluate_input, parse_input, parse_input_with_depth, run_repl};
+use crate::{
+    Base, IntegerValue, Session, evaluate_input, parse_input, parse_input_with_depth, run_repl,
+};
 
 #[test]
 fn evaluates_unsized_decimal() {
@@ -114,6 +116,12 @@ fn evaluates_string_literals_as_packed_byte_vectors() {
             .output,
         "1'b1"
     );
+    assert_eq!(
+        evaluate_input("\"\" == 8'h00")
+            .expect("compare empty string")
+            .output,
+        "1'b1"
+    );
 }
 
 #[test]
@@ -122,6 +130,10 @@ fn displays_string_literals_as_escaped_text() {
     assert_eq!(
         evaluate_input("\"AB\"").expect("two-byte string").output,
         "\"AB\""
+    );
+    assert_eq!(
+        evaluate_input("\"\"").expect("empty string").output,
+        "\"\\000\""
     );
 }
 
@@ -157,7 +169,7 @@ fn string_display_survives_string_only_concat_and_replication() {
         evaluate_input("{\"A\", \"\", \"B\"}")
             .expect("string concat with empty")
             .output,
-        "\"AB\""
+        "\"A\\000B\""
     );
     assert_eq!(
         evaluate_input("{2{\"A\"}}")
@@ -182,6 +194,70 @@ fn string_display_drops_for_numeric_contexts() {
             .expect("mixed concat")
             .output,
         "16'h4142"
+    );
+}
+
+#[test]
+fn empty_string_literal_is_one_nul_byte() {
+    assert_eq!(
+        evaluate_input("$bin(\"\")")
+            .expect("empty string bin cast")
+            .output,
+        "8'b00000000"
+    );
+    assert_eq!(
+        evaluate_input("$oct(\"\")")
+            .expect("empty string oct cast")
+            .output,
+        "8'o000"
+    );
+    assert_eq!(
+        evaluate_input("$dec(\"\")")
+            .expect("empty string dec cast")
+            .output,
+        "8'd0"
+    );
+    assert_eq!(
+        evaluate_input("$dec($signed(\"\"))")
+            .expect("signed empty string dec cast")
+            .output,
+        "8'sd0"
+    );
+    assert_eq!(
+        evaluate_input("$hex(\"\")")
+            .expect("empty string hex cast")
+            .output,
+        "8'h00"
+    );
+    assert_eq!(
+        evaluate_input("1 ? \"\" : \"\"")
+            .expect("empty string conditional")
+            .output,
+        "8'h00"
+    );
+}
+
+#[test]
+fn internal_zero_width_numeric_display_renders_zero_digit() {
+    assert_eq!(
+        IntegerValue::computed(0, false, Base::Binary, Vec::new()).canonical(),
+        "0'b0"
+    );
+    assert_eq!(
+        IntegerValue::computed(0, false, Base::Octal, Vec::new()).canonical(),
+        "0'o0"
+    );
+    assert_eq!(
+        IntegerValue::computed(0, false, Base::Decimal, Vec::new()).canonical(),
+        "0'd0"
+    );
+    assert_eq!(
+        IntegerValue::computed(0, true, Base::Decimal, Vec::new()).canonical(),
+        "0'sd0"
+    );
+    assert_eq!(
+        IntegerValue::computed(0, false, Base::Hex, Vec::new()).canonical(),
+        "0'h0"
     );
 }
 

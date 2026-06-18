@@ -1788,14 +1788,19 @@ pub(crate) fn parse_integer(input: &str) -> Result<LiteralSpec, String> {
 }
 
 pub(crate) fn string_literal_spec(bytes: &[u8]) -> LiteralSpec {
-    let mut low_bits = Vec::with_capacity(bytes.len() * 8);
+    let width = bytes.len().max(1) * 8;
+    let mut low_bits = Vec::with_capacity(width);
     // Source order maps left-to-right onto MSB-to-LSB. Since IntegerValue
     // stores bits LSB-first, push bytes from the right end of the string.
-    for byte in bytes.iter().rev() {
-        push_integer_bits(*byte, 8, &mut low_bits);
+    if bytes.is_empty() {
+        push_integer_bits(0, 8, &mut low_bits);
+    } else {
+        for byte in bytes.iter().rev() {
+            push_integer_bits(*byte, 8, &mut low_bits);
+        }
     }
     LiteralSpec {
-        width: bytes.len() * 8,
+        width,
         signed: false,
         base: Base::Hex,
         unsized_literal: false,
