@@ -12,5 +12,6 @@ obj_dir/
 /target
 
 # Misc
+.claude/
 doc/*.v
 doc/*.pdf
