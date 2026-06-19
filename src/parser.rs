@@ -143,7 +143,7 @@ pub(crate) enum Expr {
     },
     // Every `$name` / `$name()` / `$name(args)` parses to this one shape —
     // the parser is purely syntactic for system identifiers. The
-    // validator (`classify_system_call` in eval.rs) owns the name table
+    // validator (`classify_system_call` in system_call.rs) owns the name table
     // and decides whether `name` is a math function (with arity), a real
     // conversion, a sign cast, a base cast, a system task, or unknown.
     // Math system functions today (LRM 17.11) carry the typed kind on
@@ -884,7 +884,7 @@ enum Pending {
     /// `)`. No name dispatch happens here — every `$name(args)` builds
     /// `Expr::SystemCall { name, args }`. Name validation, arity, and
     /// real-arg checks all live in the validator (`classify_system_call`
-    /// in eval.rs).
+    /// in system_call.rs).
     SystemCallArgs {
         name: String,
         args: Vec<Expr>,

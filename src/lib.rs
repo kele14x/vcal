@@ -9,6 +9,7 @@ mod eval;
 mod highlight;
 mod lexer;
 mod parser;
+mod system_call;
 mod value;
 
 #[cfg(test)]
@@ -18,6 +19,7 @@ use value::DisplayStyle;
 pub use value::{Base, IntegerValue, LogicBit, Value};
 
 use parser::{DeclKind, DeclName, Expr, LValue, SelectKind, Stmt};
+use system_call::SystemCallKind;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegRange {
@@ -173,6 +175,7 @@ impl RegValue {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Evaluation {
+    pub task_output: Vec<u8>,
     pub output: String,
     pub should_exit: bool,
 }
@@ -293,6 +296,7 @@ fn evaluate_input_with_session(session: &mut Session, input: &str) -> Result<Eva
     let input = input.trim();
     if input.is_empty() {
         return Ok(Evaluation {
+            task_output: Vec::new(),
             output: String::new(),
             should_exit: false,
         });
@@ -301,16 +305,18 @@ fn evaluate_input_with_session(session: &mut Session, input: &str) -> Result<Eva
     let (statements, trailing_semicolon) =
         parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
 
-    // IPython-style suppression: only the last statement's output is
-    // visible, and only if it's an expression (not a decl/assign/task)
-    // AND the input did not end with a `;`. Everything else collapses
-    // to an empty string, which the REPL renders as a bare blank line.
+    // IPython-style suppression applies only to value output: the last
+    // expression value is visible only if the input did not end with a `;`.
+    // System-task output is a side effect and accumulates independently.
+    let mut task_output = Vec::new();
     let mut last_output = String::new();
     let mut last_was_expr = false;
     for stmt in &statements {
-        let (output, should_exit) = apply_stmt(session, stmt)?;
+        let (stmt_task_output, output, should_exit) = apply_stmt(session, stmt)?;
+        task_output.extend(stmt_task_output);
         if should_exit {
             return Ok(Evaluation {
+                task_output,
                 output: String::new(),
                 should_exit: true,
             });
@@ -326,43 +332,43 @@ fn evaluate_input_with_session(session: &mut Session, input: &str) -> Result<Eva
     };
 
     Ok(Evaluation {
+        task_output,
         output,
         should_exit: false,
     })
 }
 
-// Drives a single top-level Stmt. Decls mutate the session and emit no Out
-// text (mirroring how `$finish`/`$stop` show an empty Out line). Assignments
-// mutate the session and emit the reg's new canonical form. Expression
-// statements just evaluate — except that an `Expr::SystemCall` whose name
-// classifies as a task (LRM 17.4: `$finish` / `$stop`) is hoisted to an
-// exit here, since tasks have no expression value. The hoist walks
-// through `Grouped` layers via the iterative `unwrap_grouped` so
-// `((($finish)))` exits cleanly without paying for a recursive walker.
-// Args on the SystemCall are parsed for syntactic validity but never
-// evaluated — vcal does not print exit diagnostics, so the message-
-// verbosity argument (LRM 17.4) has no observable effect.
-fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(String, bool), String> {
+// Drives a single top-level Stmt. Decls mutate the session and emit no value
+// output. Assignments mutate the session and emit the reg's new canonical
+// form. Expression statements just evaluate — except that an `Expr::SystemCall`
+// whose name classifies as a task is hoisted here, since tasks have no
+// expression value. The hoist walks through `Grouped` layers via the iterative
+// `unwrap_grouped` so `((($display("x"))))` still runs as a top-level task.
+fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(Vec<u8>, String, bool), String> {
     match stmt {
         Stmt::Expr(expr) => {
-            if let Expr::SystemCall { name, .. } = eval::unwrap_grouped(expr)
-                && matches!(
-                    eval::classify_system_call(name),
-                    Ok(eval::SystemCallKind::Task)
-                )
+            if let Expr::SystemCall { name, args } = eval::unwrap_grouped(expr)
+                && let Ok(SystemCallKind::Task(task)) = system_call::classify_system_call(name)
             {
-                return Ok((String::new(), true));
+                let result = system_call::execute_task(task, args, session)?;
+                return Ok((result.output, String::new(), result.should_exit));
             }
             let value = eval::evaluate_expr(expr, session)?;
-            Ok((value.canonical(), false))
+            Ok((Vec::new(), value.canonical(), false))
         }
         Stmt::Decl {
             kind,
             signed,
             range,
             names,
-        } => apply_decl(session, *kind, *signed, range.as_ref(), names),
-        Stmt::Assign { lvalue, rhs } => apply_assign(session, lvalue, rhs),
+        } => {
+            let (output, should_exit) = apply_decl(session, *kind, *signed, range.as_ref(), names)?;
+            Ok((Vec::new(), output, should_exit))
+        }
+        Stmt::Assign { lvalue, rhs } => {
+            let (output, should_exit) = apply_assign(session, lvalue, rhs)?;
+            Ok((Vec::new(), output, should_exit))
+        }
     }
 }
 
@@ -779,6 +785,7 @@ pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Res
 
         match session.eval(&line) {
             Ok(result) => {
+                writer.write_all(&result.task_output)?;
                 if result.output.is_empty() {
                     writeln!(writer)?;
                 } else {
@@ -826,6 +833,8 @@ pub fn run_interactive() -> io::Result<()> {
 
         match session.eval(&line) {
             Ok(result) => {
+                let mut stdout = io::stdout();
+                stdout.write_all(&result.task_output)?;
                 if result.output.is_empty() {
                     println!();
                 } else {

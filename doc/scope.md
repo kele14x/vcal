@@ -8,14 +8,14 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 
 - REPL shell with `rustyline` history
 - Integer and real literals, all LRM forms (LRM 3.5.2)
-- String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; internal zero-width numeric display renders with one `0` digit; display tasks are not included
+- String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; `$display` / `$write` support basic format strings and emit system-task output as raw bytes; internal zero-width numeric display renders with one `0` digit
 - All operators between integers (see [operators.md](operators.md))
 - Real arithmetic and mixed integer/real promotion (LRM 5.1.5 / 5.1.7 / Tables 5-2, 5-3)
 - Two-pass context (width, signedness) propagation; leftmost-base propagation; `reg` display base starts as a weak binary fallback and resolves from the first whole-reg integer init/assignment
 - `reg` / `integer` / `real` declarations and blocking assignment with the full LRM A.8.5 `variable_lvalue` — bare name, bit/part/indexed-part selects, and arbitrarily nested concatenations on the LHS (see [variables.md](variables.md))
 - 1-D unpacked arrays on `reg` / `integer` / `real` (LRM 4.9 / A.2.2.1); vector-array total storage is capped at the same 16,777,216-bit limit as scalar vectors
 - Static-semantic validation as a top-level pre-pass over every expression entry — errors prefixed `Syntax error:` (lex/parse) or `Semantic error:` (validator)
-- System tasks: `$finish`, `$stop` (LRM 17.4)
+- System tasks: `$finish`, `$stop` (LRM 17.4), `$display`, `$write` (LRM 17.1 display family, basic formatting subset including `%b`/`%o`/`%d`/`%h`/`%s`/`%c`/real controls). LRM display controls outside this subset are intentionally unsupported for now, including `%u`, `%z`, `%t`, `%m`, strength formats, and field-width / precision modifiers.
 - System functions:
   - Sign casts (LRM 5.5): `$signed`, `$unsigned`
   - Real conversions (LRM 17.7.1 / §3.5.3): `$rtoi`, `$itor`, `$realtobits`, `$bitstoreal`
@@ -29,6 +29,8 @@ Planned but not yet implemented:
 - **Multi-line edit.** The REPL accepts only single-line input today; the right TUI affordance for multi-line editing is still being explored.
 
 ## Known issues
+
+- On Windows console-mode stdout (for example `cargo run` in a VSCode / PowerShell terminal), `$display` / `$write` raw byte output can fail when it contains non-UTF-8 byte sequences such as `%s` on `8'h80`. Rust stdio rejects those writes with `Windows stdio in console mode does not support writing non-UTF-8 byte sequences`; redirected stdout / pipe behavior may differ. A future pass should decide the Windows-console policy for raw system-task bytes.
 
 - Malformed real literals like `1._0` or `9.` surface as `invalid decimal digits: 1.0` after the underscore-strip / digit-strip step, because the lexer's `real_after_dot` lookahead requires `.` followed by a digit and otherwise falls through to the integer path. The diagnostic is correct in spirit (the literal is not a valid real) but the message is misleading. A future pass should recognize "digit-run + `.`" as a real-literal commitment and emit a real-specific error.
 

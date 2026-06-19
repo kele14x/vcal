@@ -30,7 +30,7 @@ impl Value {
 // even though the LRM doesn't enumerate them — they only arise from the
 // "unspecified" real-power corners (§5.1.5), and emitting the literal Rust
 // names keeps them visible to the user instead of silently masking them.
-fn format_real(value: f64) -> String {
+pub(crate) fn format_real(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
     }
@@ -292,6 +292,27 @@ impl IntegerValue {
             .any(|bit| matches!(bit, LogicBit::X | LogicBit::Z))
     }
 
+    pub(crate) fn format_digits_in_base(&self, base: Base) -> String {
+        match base {
+            Base::Decimal if self.signed => {
+                let (negative, digits) = self
+                    .render_signed_decimal_digits()
+                    .expect("signed decimal rendering is total");
+                if negative {
+                    format!("-{digits}")
+                } else {
+                    digits
+                }
+            }
+            Base::Decimal => self.render_decimal_digits(),
+            Base::Binary | Base::Octal | Base::Hex => {
+                let mut value = self.clone();
+                value.base = base;
+                value.render_grouped_digits()
+            }
+        }
+    }
+
     pub(crate) fn resized_to_context(&self, width: usize, context_signed: bool) -> Self {
         // LRM Table 5-22 footnote a: unsized constants in an expression wider
         // than 32 bits extend per the literal itself, not per the propagated
@@ -423,19 +444,29 @@ impl IntegerValue {
     }
 
     fn render_string_literal(&self) -> Option<String> {
+        let bytes = self.render_string_bytes()?;
+        let mut output = String::with_capacity(bytes.len() + 2);
+        output.push('"');
+        for byte in bytes {
+            push_escaped_byte(byte, &mut output);
+        }
+        output.push('"');
+        Some(output)
+    }
+
+    pub(crate) fn render_string_bytes(&self) -> Option<Vec<u8>> {
         if self.width != self.bits.len() || !self.width.is_multiple_of(8) {
             return None;
         }
 
         let byte_count = self.width / 8;
-        let mut output = String::with_capacity(byte_count + 2);
-        output.push('"');
+        let mut bytes = Vec::with_capacity(byte_count);
         for byte_index in (0..byte_count).rev() {
-            let byte = byte_from_bits(&self.bits[byte_index * 8..byte_index * 8 + 8])?;
-            push_escaped_byte(byte, &mut output);
+            bytes.push(byte_from_bits(
+                &self.bits[byte_index * 8..byte_index * 8 + 8],
+            )?);
         }
-        output.push('"');
-        Some(output)
+        Some(bytes)
     }
 }
 

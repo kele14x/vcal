@@ -49,7 +49,11 @@ vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same f
 
 ## String literals
 
-vcal implements Verilog string constants as packed 8-bit vectors, but it does not yet implement the display task family (`$display`, `$write`, `$strobe`, `$monitor`). As a REPL convenience, bare string literals render as escaped quoted text even though their value is still the packed vector. String-only concatenation and replication preserve that display style (`{"A", "B"}` -> `"AB"`); mixed numeric concatenation and display-base casts render numerically (`{"A", 8'h42}` -> `16'h4142`, `$dec("AB")` -> `16'd16706`). The LRM is ambiguous about the empty source literal `""`; vcal treats it as one NUL byte, equivalent to `"\000"`, so syntax cannot create a zero-width vector. Zero-width vectors may still exist internally for debug or fault-tolerance paths, and numeric display renders them with one zero digit (`0'h0`, `0'd0`).
+vcal implements Verilog string constants as packed 8-bit vectors. As a REPL convenience, bare string literals render as escaped quoted text even though their value is still the packed vector. String-only concatenation and replication preserve that display style (`{"A", "B"}` -> `"AB"`); mixed numeric concatenation and display-base casts render numerically (`{"A", 8'h42}` -> `16'h4142`, `$dec("AB")` -> `16'd16706`). The LRM is ambiguous about the empty source literal `""`; vcal treats it as one NUL byte, equivalent to `"\000"`, so syntax cannot create a zero-width vector. Zero-width vectors may still exist internally for debug or fault-tolerance paths, and numeric display renders them with one zero digit (`0'h0`, `0'd0`).
+
+## Display tasks
+
+vcal implements `$display` and `$write`, but deliberately supports only the format controls useful in the calculator-style REPL today: `%b`, `%o`, `%d`, `%h` / `%x`, `%s`, `%c`, real controls (`%e`, `%f`, `%g` and uppercase spellings), and `%%`. For `%s` and `%c`, x/z bits in integer arguments are silently converted to zero bits before raw bytes are emitted; these controls do not fall back to canonical integer text. Other LRM display controls are intentionally unsupported for now, including `%u` / `%z` unformatted data, `%t` simulation time, `%m` hierarchy path, strength formats, and field-width / precision modifiers. `$strobe`, `$monitor`, and file display tasks are also outside the current scope.
 
 ## Conditional operator
 
