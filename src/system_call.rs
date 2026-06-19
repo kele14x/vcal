@@ -276,8 +276,28 @@ fn format_real_value(value: &Value, specifier: char) -> String {
     };
 
     match specifier {
-        'e' | 'E' => format!("{real:e}"),
-        'f' | 'F' | 'g' | 'G' => value::format_real(real),
+        'e' => format!("{real:e}"),
+        'E' => format!("{real:E}"),
+        'f' | 'F' => format_fixed_real(real),
+        'g' => value::format_real(real),
+        'G' => uppercase_exponent(&value::format_real(real)),
         _ => unreachable!("caller only passes real display controls"),
     }
+}
+
+fn format_fixed_real(real: f64) -> String {
+    if real.is_nan() || real.is_infinite() {
+        return value::format_real(real);
+    }
+
+    let formatted = format!("{real}");
+    if formatted.contains('.') || formatted.contains('e') || formatted.contains('E') {
+        formatted
+    } else {
+        format!("{formatted}.0")
+    }
+}
+
+fn uppercase_exponent(text: &str) -> String {
+    text.replace('e', "E")
 }

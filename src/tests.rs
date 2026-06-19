@@ -1076,20 +1076,19 @@ fn display_real_values_in_default_format() {
 
 #[test]
 fn display_real_values_with_format_controls() {
-    // %f / %F use fixed-point formatting via format_real
+    // %f / %F use fixed-point formatting.
     let result = evaluate_input("$display(\"%f %f\", 1.5, 42.0)").expect("%f");
     assert_eq!(result.task_output, b"1.5 42.0\n");
 
-    // %e uses scientific notation
+    let result = evaluate_input("$display(\"%f %f\", 1.0e10, 1.0e-5)").expect("%f fixed range");
+    assert_eq!(result.task_output, b"10000000000.0 0.00001\n");
+
+    // %e / %E use scientific notation and preserve the specifier case.
     let result = evaluate_input("$display(\"%e %E\", 1.5, 2.5)").expect("%e");
-    // Rust {:.e} produces e.g. "1.5e0" / "2.5e0" (no + sign on exponent).
-    // Accept any reasonable scientific form.
-    let output = String::from_utf8(result.task_output).expect("UTF-8");
-    assert!(output.starts_with("1.5e"), "got: {output}");
-    assert!(
-        output.ends_with(" 2.5E0\n") || output.ends_with(" 2.5e0\n"),
-        "got: {output}"
-    );
+    assert_eq!(result.task_output, b"1.5e0 2.5E0\n");
+
+    let result = evaluate_input("$display(\"%g %G\", 1.5e10, 2.5e-5)").expect("%g");
+    assert_eq!(result.task_output, b"1.5e+10 2.5E-5\n");
 }
 
 #[test]
