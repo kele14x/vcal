@@ -731,14 +731,26 @@ pub(crate) enum SystemTask {
     Finish,
     Stop,
     Display,
+    DisplayB,
+    DisplayO,
+    DisplayH,
     Write,
+    WriteB,
+    WriteO,
+    WriteH,
 }
 
 const SYSTEM_TASKS: &[(&str, SystemTask)] = &[
     ("$finish", SystemTask::Finish),
     ("$stop", SystemTask::Stop),
     ("$display", SystemTask::Display),
+    ("$displayb", SystemTask::DisplayB),
+    ("$displayo", SystemTask::DisplayO),
+    ("$displayh", SystemTask::DisplayH),
     ("$write", SystemTask::Write),
+    ("$writeb", SystemTask::WriteB),
+    ("$writeo", SystemTask::WriteO),
+    ("$writeh", SystemTask::WriteH),
 ];
 
 impl SystemTask {
@@ -746,6 +758,29 @@ impl SystemTask {
         SYSTEM_TASKS
             .iter()
             .find_map(|(n, k)| (*n == name).then_some(*k))
+    }
+
+    // LRM 17.1: `$display`/`$write` default to decimal, the `b`/`o`/`h`
+    // suffixed variants default to binary / octal / hex respectively.
+    // Explicit format controls in the format string still override this.
+    pub(crate) fn default_base(self) -> Base {
+        match self {
+            SystemTask::Display | SystemTask::Write => Base::Decimal,
+            SystemTask::DisplayB | SystemTask::WriteB => Base::Binary,
+            SystemTask::DisplayO | SystemTask::WriteO => Base::Octal,
+            SystemTask::DisplayH | SystemTask::WriteH => Base::Hex,
+            SystemTask::Finish | SystemTask::Stop => Base::Decimal,
+        }
+    }
+
+    pub(crate) fn appends_newline(self) -> bool {
+        matches!(
+            self,
+            SystemTask::Display
+                | SystemTask::DisplayB
+                | SystemTask::DisplayO
+                | SystemTask::DisplayH
+        )
     }
 }
 

@@ -69,12 +69,20 @@ pub(crate) fn execute_task(
             output: Vec::new(),
             should_exit: true,
         }),
-        SystemTask::Display => Ok(SystemTaskResult {
-            output: format_display_args(args, session, true)?,
-            should_exit: false,
-        }),
-        SystemTask::Write => Ok(SystemTaskResult {
-            output: format_display_args(args, session, false)?,
+        SystemTask::Display
+        | SystemTask::DisplayB
+        | SystemTask::DisplayO
+        | SystemTask::DisplayH
+        | SystemTask::Write
+        | SystemTask::WriteB
+        | SystemTask::WriteO
+        | SystemTask::WriteH => Ok(SystemTaskResult {
+            output: format_display_args(
+                args,
+                session,
+                task.appends_newline(),
+                task.default_base(),
+            )?,
             should_exit: false,
         }),
     }
@@ -84,6 +92,7 @@ fn format_display_args(
     args: &[SystemArg],
     session: &Session,
     append_newline: bool,
+    default_base: Base,
 ) -> Result<Vec<u8>, String> {
     let values = args
         .iter()
@@ -95,9 +104,9 @@ fn format_display_args(
 
     let mut output = if let Some((first, rest)) = values.split_first() {
         if let Some(format_bytes) = format_arg_string_bytes(first) {
-            format_with_controls(&format_bytes, rest)?
+            format_with_controls(&format_bytes, rest, default_base)?
         } else {
-            join_default_values(&values)
+            join_default_values(&values, default_base)
         }
     } else {
         Vec::new()
@@ -114,7 +123,11 @@ enum DisplayArg {
     Null,
 }
 
-fn format_with_controls(format_bytes: &[u8], args: &[DisplayArg]) -> Result<Vec<u8>, String> {
+fn format_with_controls(
+    format_bytes: &[u8],
+    args: &[DisplayArg],
+    default_base: Base,
+) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut arg_index = 0usize;
     let mut index = 0usize;
@@ -182,13 +195,13 @@ fn format_with_controls(format_bytes: &[u8], args: &[DisplayArg]) -> Result<Vec<
             }
             DisplayArg::Null => {}
         }
-        output.extend(format_default_arg(value));
+        output.extend(format_default_arg(value, default_base));
     }
 
     Ok(output)
 }
 
-fn join_default_values(values: &[DisplayArg]) -> Vec<u8> {
+fn join_default_values(values: &[DisplayArg], default_base: Base) -> Vec<u8> {
     let mut output = Vec::new();
     let mut previous_was_value = false;
     for (index, value) in values.iter().enumerate() {
@@ -196,15 +209,15 @@ fn join_default_values(values: &[DisplayArg]) -> Vec<u8> {
         if index > 0 && previous_was_value && current_is_value {
             output.push(b' ');
         }
-        output.extend(format_default_arg(value));
+        output.extend(format_default_arg(value, default_base));
         previous_was_value = current_is_value;
     }
     output
 }
 
-fn format_default_arg(value: &DisplayArg) -> Vec<u8> {
+fn format_default_arg(value: &DisplayArg, default_base: Base) -> Vec<u8> {
     match value {
-        DisplayArg::Value(value) => format_default_value(value),
+        DisplayArg::Value(value) => format_default_value(value, default_base),
         DisplayArg::Null => vec![b' '],
     }
 }
@@ -225,11 +238,11 @@ fn format_string_bytes(value: &Value) -> Option<Vec<u8>> {
     }
 }
 
-fn format_default_value(value: &Value) -> Vec<u8> {
+fn format_default_value(value: &Value, default_base: Base) -> Vec<u8> {
     match format_string_bytes(value) {
         Some(bytes) => bytes,
         None => match value {
-            Value::Integer(integer) => integer.format_digits_in_base(Base::Decimal).into_bytes(),
+            Value::Integer(integer) => integer.format_digits_in_base(default_base).into_bytes(),
             Value::Real(_) => value.canonical().into_bytes(),
         },
     }

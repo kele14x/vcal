@@ -1334,6 +1334,179 @@ fn display_format_with_only_extra_args_and_no_initial_string() {
     assert_eq!(result.task_output, b"10 15 1.5\n");
 }
 
+// ── $displayb / $displayo / $displayh / $writeb / $writeo / $writeh ──────
+//
+// LRM 21.2: the b/o/h suffixed variants behave exactly like $display/$write
+// except that the default format for unformatted integer arguments is
+// binary / octal / hex respectively (instead of decimal). Explicit format
+// controls in the format string still override the default.
+
+#[test]
+fn displayb_defaults_to_binary() {
+    let result = evaluate_input("$displayb(4'b1010)").expect("displayb default");
+    assert_eq!(result.task_output, b"1010\n");
+
+    // Unsized literal — 32-bit binary per LRM width rules.
+    let result = evaluate_input("$displayb(5)").expect("displayb unsized");
+    assert_eq!(result.task_output, b"00000000000000000000000000000101\n");
+}
+
+#[test]
+fn displayo_defaults_to_octal() {
+    let result = evaluate_input("$displayo(8'hff)").expect("displayo default");
+    assert_eq!(result.task_output, b"377\n");
+
+    // 9-bit value rounds up to two octal digits.
+    let result = evaluate_input("$displayo(9'o777)").expect("displayo 9-bit");
+    assert_eq!(result.task_output, b"777\n");
+}
+
+#[test]
+fn displayh_defaults_to_hex() {
+    let result = evaluate_input("$displayh(8'hff)").expect("displayh default");
+    assert_eq!(result.task_output, b"ff\n");
+
+    // Unsized literal — 32-bit hex (8 digits).
+    let result = evaluate_input("$displayh(255)").expect("displayh unsized");
+    assert_eq!(result.task_output, b"000000ff\n");
+}
+
+#[test]
+fn writeb_writeo_writeh_default_bases_without_newline() {
+    let b = evaluate_input("$writeb(4'b1010)").expect("writeb");
+    assert_eq!(b.task_output, b"1010");
+
+    let o = evaluate_input("$writeo(8'hff)").expect("writeo");
+    assert_eq!(o.task_output, b"377");
+
+    let h = evaluate_input("$writeh(8'hff)").expect("writeh");
+    assert_eq!(h.task_output, b"ff");
+}
+
+#[test]
+fn display_base_variants_join_multiple_args_with_spaces() {
+    let result = evaluate_input("$displayh(4'ha, 4'hb, 4'hc)").expect("multi hex");
+    assert_eq!(result.task_output, b"a b c\n");
+
+    let result = evaluate_input("$displayb(1, 2, 3)").expect("multi bin");
+    // Each unsized literal is 32 bits wide.
+    assert_eq!(
+        result.task_output,
+        b"00000000000000000000000000000001 \
+00000000000000000000000000000010 \
+00000000000000000000000000000011\n"
+    );
+}
+
+#[test]
+fn display_base_variants_explicit_controls_override_default() {
+    // %d inside $displayh still renders decimal.
+    let result = evaluate_input("$displayh(\"%d\", 8'hff)").expect("%d in displayh");
+    assert_eq!(result.task_output, b"255\n");
+
+    // %h inside $display still renders hex (sanity — unchanged behaviour).
+    let result = evaluate_input("$display(\"%h\", 8'hff)").expect("%h in display");
+    assert_eq!(result.task_output, b"ff\n");
+
+    // %b inside $displayo overrides octal.
+    let result = evaluate_input("$displayo(\"%b\", 4'b1010)").expect("%b in displayo");
+    assert_eq!(result.task_output, b"1010\n");
+}
+
+#[test]
+fn display_base_variants_extra_args_use_task_default_base() {
+    // Extra args after the format string are appended with the task's
+    // default base, not the $display decimal default.
+    let result = evaluate_input("$displayh(\"x=%s\", \"ok\", 8'haf)").expect("extra hex");
+    assert_eq!(result.task_output, b"x=ok af\n");
+
+    let result = evaluate_input("$displayb(\"v=%d\", 3, 4'b1010)").expect("extra bin");
+    assert_eq!(result.task_output, b"v=3 1010\n");
+}
+
+#[test]
+fn display_base_variants_preserve_string_display_style() {
+    // A string literal is still rendered as its bytes, not as hex/binary.
+    let result = evaluate_input("$displayh(\"hi\")").expect("string literal in displayh");
+    assert_eq!(result.task_output, b"hi\n");
+
+    let result = evaluate_input("$displayb(\"hi\")").expect("string literal in displayb");
+    assert_eq!(result.task_output, b"hi\n");
+}
+
+#[test]
+fn display_base_variants_render_reals_in_canonical_form() {
+    // Reals are not converted to the task's default base.
+    let result = evaluate_input("$displayh(1.5)").expect("real in displayh");
+    assert_eq!(result.task_output, b"1.5\n");
+
+    let result = evaluate_input("$displayb(-3.0)").expect("real in displayb");
+    assert_eq!(result.task_output, b"-3.0\n");
+}
+
+#[test]
+fn display_base_variants_null_arguments_emit_spaces() {
+    // Null arguments emit a single space regardless of the default base.
+    let result = evaluate_input("$displayh(,, 8'hff,)").expect("nulls in displayh");
+    assert_eq!(result.task_output, b"  ff \n");
+
+    let result = evaluate_input("$writeb(,)").expect("nulls in writeb");
+    assert_eq!(result.task_output, b"  ");
+}
+
+#[test]
+fn display_base_variants_unknown_bits_render_per_base_grouping() {
+    // Binary — per-bit unknowns are preserved.
+    let result = evaluate_input("$displayb(4'b01xx)").expect("binary unknowns");
+    assert_eq!(result.task_output, b"01xx\n");
+
+    // Hex — any unknown in a 4-bit group collapses the whole digit to x.
+    let result = evaluate_input("$displayh(4'b01xx)").expect("hex group unknown");
+    assert_eq!(result.task_output, b"x\n");
+
+    // All-x value collapses to a single x digit.
+    let result = evaluate_input("$displayh(1'bx)").expect("hex all x");
+    assert_eq!(result.task_output, b"x\n");
+
+    // All-z value collapses to a single z digit.
+    let result = evaluate_input("$displayo(1'bz)").expect("octal all z");
+    assert_eq!(result.task_output, b"z\n");
+}
+
+#[test]
+fn display_base_variants_in_expression_position_are_rejected() {
+    for input in [
+        "$displayb(\"x\")",
+        "$displayo(\"x\")",
+        "$displayh(\"x\")",
+        "$writeb(\"x\")",
+        "$writeo(\"x\")",
+        "$writeh(\"x\")",
+    ] {
+        let error = evaluate_input(&format!("1 + {input}")).expect_err(input);
+        assert!(
+            error.contains("is a system task") && error.contains("cannot be called as a function"),
+            "{input}: got {error}"
+        );
+    }
+}
+
+#[test]
+fn display_base_variant_identifiers_are_exact_matched() {
+    // `$displayfoo` is not `$display` + suffix; it is an unknown identifier.
+    let error = evaluate_input("$displayhex").expect_err("$displayhex is not supported");
+    assert!(
+        error.contains("unknown system identifier: $displayhex"),
+        "got: {error}"
+    );
+
+    let error = evaluate_input("$writebin").expect_err("$writebin is not supported");
+    assert!(
+        error.contains("unknown system identifier: $writebin"),
+        "got: {error}"
+    );
+}
+
 #[test]
 fn runs_repl_until_exit_command() {
     let mut input = Cursor::new("42\n$finish\nignored\n");

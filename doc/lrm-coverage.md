@@ -123,13 +123,13 @@ For "what works *today*" vs "what is the long-term target", see [scope.md](scope
 
 - [x] Display system tasks
   - [x] `$display`
-  - [ ] `$displayb`
-  - [ ] `$displayo`
-  - [ ] `$displayh`
+  - [x] `$displayb`
+  - [x] `$displayo`
+  - [x] `$displayh`
   - [x] `$write`
-  - [ ] `$writeb`
-  - [ ] `$writeo`
-  - [ ] `$writeh`
+  - [x] `$writeb`
+  - [x] `$writeo`
+  - [x] `$writeh`
 - [x] Simulation control system task
   - [x] `$finish`
   - [x] `$stop`
