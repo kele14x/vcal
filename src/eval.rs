@@ -4,7 +4,7 @@ use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{FromPrimitive, One, Signed, ToPrimitive, Zero};
 
 use crate::parser::{
-    BinaryOp, Expr, LValue, MathFunctionKind, RealConversionKind, SelectKind, UnaryOp,
+    BinaryOp, Expr, LValue, MathFunctionKind, RealConversionKind, SelectKind, SystemArg, UnaryOp,
     string_literal_spec,
 };
 use crate::system_call::{
@@ -225,6 +225,7 @@ enum AnnotateCombiner<'a> {
         expr: &'a Expr,
         kind: SystemCallKind,
         arg_count: usize,
+        expr_arg_count: usize,
     },
 }
 
@@ -329,13 +330,20 @@ pub(crate) fn annotate<'a>(root: &'a Expr, session: &Session) -> Result<Annotate
                             kind: AnnotatedKind::SystemTask,
                         }),
                         _ => {
+                            let expr_arg_count = args
+                                .iter()
+                                .filter(|arg| matches!(arg, SystemArg::Expr(_)))
+                                .count();
                             work.push(AnnotateTask::Combine(AnnotateCombiner::SystemCall {
                                 expr,
                                 kind,
                                 arg_count: args.len(),
+                                expr_arg_count,
                             }));
                             for arg in args.iter().rev() {
-                                work.push(AnnotateTask::Visit(arg));
+                                if let SystemArg::Expr(arg) = arg {
+                                    work.push(AnnotateTask::Visit(arg));
+                                }
                             }
                         }
                     }
@@ -573,13 +581,14 @@ fn annotate_combine<'a>(
             expr,
             kind,
             arg_count,
+            expr_arg_count,
         } => {
             // Pop args first so the early-return arity-error path drops
             // them at end of scope (via Annotated's iterative Drop) rather
             // than leaving them on the value stack.
-            let mut arg_annots = pop_n(vals, arg_count);
-            let system_call_name = match expr {
-                Expr::SystemCall { name, .. } => name.as_str(),
+            let mut arg_annots = pop_n(vals, expr_arg_count);
+            let (system_call_name, system_args) = match expr {
+                Expr::SystemCall { name, args } => (name.as_str(), args.as_slice()),
                 _ => unreachable!("AnnotateCombiner::SystemCall wraps only Expr::SystemCall"),
             };
             // Single source for the "wrong arity" diagnostic. Reads slightly
@@ -600,7 +609,8 @@ fn annotate_combine<'a>(
                     unreachable!("Task kind is built as a leaf in annotate's Visit arm")
                 }
                 SystemCallKind::Function(SystemFunction::SignCast { signed }) => {
-                    expect_arity(system_call_name, arg_annots.len(), 1)?;
+                    expect_arity(system_call_name, arg_count, 1)?;
+                    reject_null_system_args(system_call_name, system_args)?;
                     let arg = arg_annots.pop().expect("len == 1");
                     // LRM 5.5: width / base from arg, signedness from cast.
                     // Real arg rejected by validator; meta computed here is a
@@ -620,7 +630,8 @@ fn annotate_combine<'a>(
                     })
                 }
                 SystemCallKind::Function(SystemFunction::BaseCast(base)) => {
-                    expect_arity(system_call_name, arg_annots.len(), 1)?;
+                    expect_arity(system_call_name, arg_count, 1)?;
+                    reject_null_system_args(system_call_name, system_args)?;
                     let arg = arg_annots.pop().expect("len == 1");
                     let meta = arg.meta.map(|arg_meta| ExprMeta {
                         width: arg_meta.width,
@@ -637,7 +648,8 @@ fn annotate_combine<'a>(
                     })
                 }
                 SystemCallKind::Function(SystemFunction::RealConversion(conv_kind)) => {
-                    expect_arity(system_call_name, arg_annots.len(), 1)?;
+                    expect_arity(system_call_name, arg_count, 1)?;
+                    reject_null_system_args(system_call_name, system_args)?;
                     let arg = arg_annots.pop().expect("len == 1");
                     // LRM 17.8: $rtoi is 32-bit signed decimal; $realtobits is
                     // 64-bit unsigned hex; $itor and $bitstoreal are real-typed.
@@ -664,7 +676,8 @@ fn annotate_combine<'a>(
                     })
                 }
                 SystemCallKind::Function(SystemFunction::Math(math_kind)) => {
-                    expect_arity(system_call_name, arg_annots.len(), math_kind.arity())?;
+                    expect_arity(system_call_name, arg_count, math_kind.arity())?;
+                    reject_null_system_args(system_call_name, system_args)?;
                     // LRM 17.11: $clog2 → 32-bit signed decimal; the rest yield real.
                     let meta = if math_kind.is_real_result() {
                         None
@@ -686,6 +699,26 @@ fn annotate_combine<'a>(
                 }
             }
         }
+    }
+}
+
+fn reject_null_system_args(name: &str, args: &[SystemArg]) -> Result<(), String> {
+    if args.iter().any(|arg| matches!(arg, SystemArg::Null)) {
+        Err(format!("{name} argument cannot be null"))
+    } else {
+        Ok(())
+    }
+}
+
+fn system_arg_expr<'a>(
+    name: &str,
+    args: &'a [SystemArg],
+    index: usize,
+) -> Result<&'a Expr, String> {
+    match args.get(index) {
+        Some(SystemArg::Expr(expr)) => Ok(expr),
+        Some(SystemArg::Null) => Err(format!("{name} argument cannot be null")),
+        None => Err(format!("{name} is missing argument {}", index + 1)),
     }
 }
 
@@ -1397,21 +1430,21 @@ fn visit_expr_structure<'a>(
             let kind = classify_system_call(name)?;
             match kind {
                 SystemCallKind::Function(SystemFunction::SignCast { signed }) => {
-                    let arg = &args[0];
+                    let arg = system_arg_expr(name, args, 0)?;
                     work.push(ExprValidateTask::PostCheck(
                         ExprValidatePostCheck::SignCastArgReal { signed, arg },
                     ));
                     work.push(ExprValidateTask::Visit(arg));
                 }
                 SystemCallKind::Function(SystemFunction::BaseCast(base)) => {
-                    let arg = &args[0];
+                    let arg = system_arg_expr(name, args, 0)?;
                     work.push(ExprValidateTask::PostCheck(
                         ExprValidatePostCheck::BaseCastArgReal { base, arg },
                     ));
                     work.push(ExprValidateTask::Visit(arg));
                 }
                 SystemCallKind::Function(SystemFunction::RealConversion(conv_kind)) => {
-                    let arg = &args[0];
+                    let arg = system_arg_expr(name, args, 0)?;
                     match conv_kind {
                         RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {}
                         RealConversionKind::IntegerToReal => {
@@ -1428,15 +1461,21 @@ fn visit_expr_structure<'a>(
                     work.push(ExprValidateTask::Visit(arg));
                 }
                 SystemCallKind::Function(SystemFunction::Math(math_kind)) => {
+                    let first_arg = system_arg_expr(name, args, 0)?;
                     work.push(ExprValidateTask::PostCheck(
                         ExprValidatePostCheck::MathFunctionArgChecks {
                             kind: math_kind,
-                            first_arg: &args[0],
+                            first_arg,
                             whole: node,
                         },
                     ));
                     for arg in args.iter().rev() {
-                        work.push(ExprValidateTask::Visit(arg));
+                        match arg {
+                            SystemArg::Expr(arg) => work.push(ExprValidateTask::Visit(arg)),
+                            SystemArg::Null => {
+                                return Err(format!("{name} argument cannot be null"));
+                            }
+                        }
                     }
                 }
                 SystemCallKind::Task(_) => return Err(task_in_expression_error(name)),
@@ -4016,11 +4055,11 @@ fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
                             work.push(InferMetaTask::Combine(InferMetaCombiner::SignCast {
                                 signed,
                             }));
-                            work.push(InferMetaTask::Visit(&args[0]));
+                            work.push(InferMetaTask::Visit(system_arg_expr(name, args, 0)?));
                         }
                         SystemCallKind::Function(SystemFunction::BaseCast(base)) => {
                             work.push(InferMetaTask::Combine(InferMetaCombiner::BaseCast { base }));
-                            work.push(InferMetaTask::Visit(&args[0]));
+                            work.push(InferMetaTask::Visit(system_arg_expr(name, args, 0)?));
                         }
                         SystemCallKind::Function(SystemFunction::RealConversion(conv_kind)) => {
                             match conv_kind {

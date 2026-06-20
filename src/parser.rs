@@ -155,7 +155,7 @@ pub(crate) enum Expr {
     // verbosity argument has no observable effect.
     SystemCall {
         name: String,
-        args: Vec<Expr>,
+        args: Vec<SystemArg>,
     },
     // LRM A.8.3: a simple identifier as a `primary` — a reference to a
     // previously-declared `reg` (the only variable type vcal currently
@@ -195,6 +195,12 @@ pub(crate) enum Expr {
     // placeholder, while an `Identifier("…")` could plausibly be a
     // valid (if oddly-named) symbol.
     Truncated,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SystemArg {
+    Expr(Expr),
+    Null,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -275,7 +281,9 @@ fn truncate_expr_inner(expr: &mut Expr, depth: usize, max_depth: usize) {
         }
         Expr::SystemCall { args, .. } => {
             for arg in args {
-                truncate_expr_inner(arg, depth + 1, max_depth);
+                if let SystemArg::Expr(arg) = arg {
+                    truncate_expr_inner(arg, depth + 1, max_depth);
+                }
             }
         }
         Expr::Select { kind, inner, .. } => {
@@ -434,7 +442,11 @@ fn steal_expr_children(expr: &mut Expr, out: &mut Vec<Expr>) {
             out.append(items);
         }
         Expr::SystemCall { args, .. } => {
-            out.append(args);
+            for arg in args {
+                if let SystemArg::Expr(arg) = arg {
+                    out.push(std::mem::replace(arg, placeholder()));
+                }
+            }
         }
         Expr::Select { kind, inner, .. } => {
             steal_select_kind_children(kind, out);
@@ -710,6 +722,33 @@ impl MathFunctionKind {
     }
 }
 
+// System tasks (`$display`, `$write`, `$finish`, `$stop`). Owned here
+// alongside `MathFunctionKind` / `RealConversionKind` so the name ↔ kind
+// table is the single source of truth consulted by both the parser (null-
+// argument gating via `SystemTask::from_name`) and `system_call::classify`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SystemTask {
+    Finish,
+    Stop,
+    Display,
+    Write,
+}
+
+const SYSTEM_TASKS: &[(&str, SystemTask)] = &[
+    ("$finish", SystemTask::Finish),
+    ("$stop", SystemTask::Stop),
+    ("$display", SystemTask::Display),
+    ("$write", SystemTask::Write),
+];
+
+impl SystemTask {
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        SYSTEM_TASKS
+            .iter()
+            .find_map(|(n, k)| (*n == name).then_some(*k))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnaryOp {
     Plus,
@@ -887,7 +926,7 @@ enum Pending {
     /// in system_call.rs).
     SystemCallArgs {
         name: String,
-        args: Vec<Expr>,
+        args: Vec<SystemArg>,
         unary_wrap: Vec<UnaryOp>,
         saved_min_bp: u8,
     },
@@ -906,6 +945,10 @@ fn apply_prefix_unary_ops(mut expr: Expr, ops: Vec<UnaryOp>) -> Expr {
         };
     }
     expr
+}
+
+fn system_call_accepts_null_args(name: &str) -> bool {
+    SystemTask::from_name(name).is_some()
 }
 
 #[cfg(test)]
@@ -997,6 +1040,42 @@ impl<'a> Parser<'a> {
 
         loop {
             if value.is_none() {
+                if matches!(
+                    stack.last(),
+                    Some(Pending::SystemCallArgs { name, .. })
+                        if system_call_accepts_null_args(name)
+                ) {
+                    if matches!(self.peek(), Some(Token::Comma)) {
+                        self.index += 1;
+                        let Some(Pending::SystemCallArgs { args, .. }) = stack.last_mut() else {
+                            unreachable!("matched SystemCallArgs above");
+                        };
+                        args.push(SystemArg::Null);
+                        continue;
+                    }
+
+                    if matches!(self.peek(), Some(Token::RParen)) {
+                        self.index += 1;
+                        let frame = stack.pop().expect("just inspected via last()");
+                        let Pending::SystemCallArgs {
+                            name,
+                            mut args,
+                            unary_wrap,
+                            saved_min_bp,
+                        } = frame
+                        else {
+                            unreachable!("matched SystemCallArgs above");
+                        };
+                        args.push(SystemArg::Null);
+                        value = Some(apply_prefix_unary_ops(
+                            Expr::SystemCall { name, args },
+                            unary_wrap,
+                        ));
+                        min_bp = saved_min_bp;
+                        continue;
+                    }
+                }
+
                 // State: need an operand. Read prefix unary ops, then
                 // dispatch on the next token. The opening tokens that
                 // would otherwise re-enter `parse_expression` (`(`, `{`,
@@ -1303,7 +1382,7 @@ impl<'a> Parser<'a> {
                         let Some(Pending::SystemCallArgs { args, .. }) = stack.last_mut() else {
                             unreachable!("matched SystemCallArgs above");
                         };
-                        args.push(v);
+                        args.push(SystemArg::Expr(v));
                     } else if matches!(self.peek(), Some(Token::RParen)) {
                         self.index += 1;
                         let v = value.take().expect("value is Some when reducing");
@@ -1317,7 +1396,7 @@ impl<'a> Parser<'a> {
                         else {
                             unreachable!("matched SystemCallArgs above");
                         };
-                        args.push(v);
+                        args.push(SystemArg::Expr(v));
                         value = Some(apply_prefix_unary_ops(
                             Expr::SystemCall { name, args },
                             unary_wrap,

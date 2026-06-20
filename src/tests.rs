@@ -3,7 +3,7 @@ use std::io::Cursor;
 use num_bigint::BigInt;
 
 use crate::lexer::{Token, tokenize};
-use crate::parser::{BinaryOp, Expr, UnaryOp, parse_expression, parse_integer};
+use crate::parser::{BinaryOp, Expr, SystemArg, UnaryOp, parse_expression, parse_integer};
 use crate::{
     Base, IntegerValue, Session, evaluate_input, parse_input, parse_input_with_depth, run_repl,
 };
@@ -701,6 +701,20 @@ fn accepts_finish_and_stop_with_extra_arguments() {
     assert!(stop.should_exit);
 }
 
+// Null arguments (empty comma slots) are accepted by all system tasks,
+// not just `$display`/`$write`. For `$finish`/`$stop` the args are
+// discarded anyway, so nulls are harmless — this test guards the
+// task/function split in the parser's null-arg gate.
+#[test]
+fn finish_and_stop_accept_null_arguments() {
+    let finish = evaluate_input("$finish(,)").expect("null args should parse");
+    assert!(finish.should_exit);
+    let stop = evaluate_input("$stop(,,)").expect("null args should parse");
+    assert!(stop.should_exit);
+    let mixed = evaluate_input("$finish(, 0, )").expect("mixed null args should parse");
+    assert!(mixed.should_exit);
+}
+
 // Argument is parsed for syntactic validity but never evaluated, so a
 // would-be runtime error inside the argument still exits cleanly.
 #[test]
@@ -765,12 +779,11 @@ fn system_task_in_expression_is_rejected() {
 }
 
 // Syntactic malformation inside the argument list still surfaces a parse
-// error — leniency is about value/arity, not malformed syntax.
+// error — leniency is about value/arity/null-args, not malformed syntax.
+// A trailing comma is NOT malformed for tasks: it produces a null argument.
 #[test]
 fn system_task_with_malformed_argument_is_parse_error() {
     let error = evaluate_input("$finish(1 +)").expect_err("trailing + should be a parse error");
-    assert!(!error.is_empty());
-    let error = evaluate_input("$finish(1,)").expect_err("trailing comma should be a parse error");
     assert!(!error.is_empty());
     let error = evaluate_input("$finish(").expect_err("unclosed paren should be a parse error");
     assert!(!error.is_empty());
@@ -949,6 +962,54 @@ fn display_no_args_outputs_newline() {
 fn write_no_args_outputs_nothing() {
     let result = evaluate_input("$write()").expect("no args");
     assert_eq!(result.task_output, b"");
+}
+
+#[test]
+fn system_call_parser_preserves_null_arguments() {
+    let expr =
+        parse_expression("$display(, 1,,)").expect("system call with null arguments should parse");
+    let Expr::SystemCall { name, args } = &expr else {
+        panic!("expected system call");
+    };
+
+    assert_eq!(name, "$display");
+    assert_eq!(args.len(), 4);
+    assert!(matches!(&args[0], SystemArg::Null));
+    assert!(matches!(&args[1], SystemArg::Expr(Expr::Literal(_))));
+    assert!(matches!(&args[2], SystemArg::Null));
+    assert!(matches!(&args[3], SystemArg::Null));
+}
+
+#[test]
+fn display_and_write_null_arguments_emit_single_spaces() {
+    let display = evaluate_input("$display(,)").expect("two null display args");
+    assert_eq!(display.task_output, b"  \n");
+
+    let display = evaluate_input("$display(, 1,, 2,)").expect("mixed null display args");
+    assert_eq!(display.task_output, b" 1 2 \n");
+
+    let write = evaluate_input("$write(,,)").expect("three null write args");
+    assert_eq!(write.task_output, b"   ");
+}
+
+#[test]
+fn display_format_controls_consume_null_arguments_as_spaces() {
+    let result = evaluate_input("$display(\"%d:%s:%h\", , , )")
+        .expect("format controls should consume null args");
+    assert_eq!(result.task_output, b" : : \n");
+
+    let result =
+        evaluate_input("$display(\"x\", , 5)").expect("extra null args should append as spaces");
+    assert_eq!(result.task_output, b"x 5\n");
+}
+
+#[test]
+fn system_functions_reject_null_arguments() {
+    let error = evaluate_input("$pow(, 2)").expect_err("null function arg should reject");
+    assert!(!error.is_empty());
+
+    let error = evaluate_input("$clog2(,)").expect_err("null function slots should reject");
+    assert!(!error.is_empty());
 }
 
 #[test]
@@ -8769,7 +8830,7 @@ fn evaluate_of_deep_real_math_chain_does_not_overflow() {
     for _ in 0..50_000 {
         e = Expr::SystemCall {
             name: "$ln".to_string(),
-            args: vec![e],
+            args: vec![SystemArg::Expr(e)],
         };
     }
     let session = Session::new();
@@ -8789,7 +8850,10 @@ fn evaluate_of_deep_pow_chain_does_not_overflow() {
     for _ in 0..50_000 {
         e = Expr::SystemCall {
             name: "$pow".to_string(),
-            args: vec![Expr::Literal(parse_integer("2").expect("base literal")), e],
+            args: vec![
+                SystemArg::Expr(Expr::Literal(parse_integer("2").expect("base literal"))),
+                SystemArg::Expr(e),
+            ],
         };
     }
     let session = Session::new();
@@ -8807,7 +8871,7 @@ fn evaluate_of_deep_clog2_chain_does_not_overflow() {
     for _ in 0..50_000 {
         e = Expr::SystemCall {
             name: "$clog2".to_string(),
-            args: vec![e],
+            args: vec![SystemArg::Expr(e)],
         };
     }
     let session = Session::new();
@@ -8826,12 +8890,12 @@ fn evaluate_of_deep_rtoi_itor_alternation_does_not_overflow() {
         e = if i.is_multiple_of(2) {
             Expr::SystemCall {
                 name: "$itor".to_string(),
-                args: vec![e],
+                args: vec![SystemArg::Expr(e)],
             }
         } else {
             Expr::SystemCall {
                 name: "$rtoi".to_string(),
-                args: vec![e],
+                args: vec![SystemArg::Expr(e)],
             }
         };
     }
@@ -8851,12 +8915,12 @@ fn evaluate_of_deep_realtobits_bitstoreal_alternation_does_not_overflow() {
         e = if i.is_multiple_of(2) {
             Expr::SystemCall {
                 name: "$realtobits".to_string(),
-                args: vec![e],
+                args: vec![SystemArg::Expr(e)],
             }
         } else {
             Expr::SystemCall {
                 name: "$bitstoreal".to_string(),
-                args: vec![e],
+                args: vec![SystemArg::Expr(e)],
             }
         };
     }
@@ -8885,8 +8949,8 @@ fn evaluate_of_pow_with_deep_integer_arg_does_not_overflow() {
     let e = Expr::SystemCall {
         name: "$pow".to_string(),
         args: vec![
-            Expr::Literal(parse_integer("2").expect("base literal")),
-            chain,
+            SystemArg::Expr(Expr::Literal(parse_integer("2").expect("base literal"))),
+            SystemArg::Expr(chain),
         ],
     };
     let session = Session::new();
@@ -8909,7 +8973,7 @@ fn evaluate_of_itor_with_deep_integer_arg_does_not_overflow() {
     }
     let e = Expr::SystemCall {
         name: "$itor".to_string(),
-        args: vec![chain],
+        args: vec![SystemArg::Expr(chain)],
     };
     let session = Session::new();
     let value =

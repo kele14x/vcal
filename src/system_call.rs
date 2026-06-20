@@ -2,7 +2,7 @@ use num_traits::ToPrimitive;
 
 use crate::Session;
 use crate::eval;
-use crate::parser::{Expr, MathFunctionKind, RealConversionKind};
+use crate::parser::{MathFunctionKind, RealConversionKind, SystemArg, SystemTask};
 use crate::value::{self, Base, DisplayStyle, IntegerValue, LogicBit, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,14 +19,6 @@ pub(crate) enum SystemFunction {
     BaseCast(Base),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SystemTask {
-    Finish,
-    Stop,
-    Display,
-    Write,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SystemTaskResult {
     pub(crate) output: Vec<u8>,
@@ -34,6 +26,9 @@ pub(crate) struct SystemTaskResult {
 }
 
 pub(crate) fn classify_system_call(name: &str) -> Result<SystemCallKind, String> {
+    if let Some(task) = SystemTask::from_name(name) {
+        return Ok(SystemCallKind::Task(task));
+    }
     Ok(match name {
         "$signed" => SystemCallKind::Function(SystemFunction::SignCast { signed: true }),
         "$unsigned" => SystemCallKind::Function(SystemFunction::SignCast { signed: false }),
@@ -53,10 +48,6 @@ pub(crate) fn classify_system_call(name: &str) -> Result<SystemCallKind, String>
         "$bitstoreal" => SystemCallKind::Function(SystemFunction::RealConversion(
             RealConversionKind::BitsToReal,
         )),
-        "$finish" => SystemCallKind::Task(SystemTask::Finish),
-        "$stop" => SystemCallKind::Task(SystemTask::Stop),
-        "$display" => SystemCallKind::Task(SystemTask::Display),
-        "$write" => SystemCallKind::Task(SystemTask::Write),
         _ => match MathFunctionKind::from_name(name) {
             Some(math_kind) => SystemCallKind::Function(SystemFunction::Math(math_kind)),
             None => return Err(format!("unknown system identifier: {name}")),
@@ -70,7 +61,7 @@ pub(crate) fn task_in_expression_error(name: &str) -> String {
 
 pub(crate) fn execute_task(
     task: SystemTask,
-    args: &[Expr],
+    args: &[SystemArg],
     session: &Session,
 ) -> Result<SystemTaskResult, String> {
     match task {
@@ -90,17 +81,20 @@ pub(crate) fn execute_task(
 }
 
 fn format_display_args(
-    args: &[Expr],
+    args: &[SystemArg],
     session: &Session,
     append_newline: bool,
 ) -> Result<Vec<u8>, String> {
     let values = args
         .iter()
-        .map(|arg| eval::evaluate_expr(arg, session))
+        .map(|arg| match arg {
+            SystemArg::Expr(expr) => eval::evaluate_expr(expr, session).map(DisplayArg::Value),
+            SystemArg::Null => Ok(DisplayArg::Null),
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut output = if let Some((first, rest)) = values.split_first() {
-        if let Some(format_bytes) = format_string_bytes(first) {
+        if let Some(format_bytes) = format_arg_string_bytes(first) {
             format_with_controls(&format_bytes, rest)?
         } else {
             join_default_values(&values)
@@ -115,7 +109,12 @@ fn format_display_args(
     Ok(output)
 }
 
-fn format_with_controls(format_bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, String> {
+enum DisplayArg {
+    Value(Value),
+    Null,
+}
+
+fn format_with_controls(format_bytes: &[u8], args: &[DisplayArg]) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut arg_index = 0usize;
     let mut index = 0usize;
@@ -149,6 +148,15 @@ fn format_with_controls(format_bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, 
         };
         arg_index += 1;
 
+        if let DisplayArg::Null = value {
+            output.push(b' ');
+            continue;
+        }
+
+        let DisplayArg::Value(value) = value else {
+            unreachable!("null display argument handled above");
+        };
+
         match specifier {
             'b' | 'B' => push_text(&mut output, &format_integer_base(value, Base::Binary)),
             'o' | 'O' => push_text(&mut output, &format_integer_base(value, Base::Octal)),
@@ -164,24 +172,48 @@ fn format_with_controls(format_bytes: &[u8], args: &[Value]) -> Result<Vec<u8>, 
     }
 
     for value in &args[arg_index..] {
-        if !output.is_empty() && !output.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
-            output.push(b' ');
+        match value {
+            DisplayArg::Value(_) => {
+                if !output.is_empty()
+                    && !output.last().is_some_and(|byte| byte.is_ascii_whitespace())
+                {
+                    output.push(b' ');
+                }
+            }
+            DisplayArg::Null => {}
         }
-        output.extend(format_default_value(value));
+        output.extend(format_default_arg(value));
     }
 
     Ok(output)
 }
 
-fn join_default_values(values: &[Value]) -> Vec<u8> {
+fn join_default_values(values: &[DisplayArg]) -> Vec<u8> {
     let mut output = Vec::new();
+    let mut previous_was_value = false;
     for (index, value) in values.iter().enumerate() {
-        if index > 0 {
+        let current_is_value = matches!(value, DisplayArg::Value(_));
+        if index > 0 && previous_was_value && current_is_value {
             output.push(b' ');
         }
-        output.extend(format_default_value(value));
+        output.extend(format_default_arg(value));
+        previous_was_value = current_is_value;
     }
     output
+}
+
+fn format_default_arg(value: &DisplayArg) -> Vec<u8> {
+    match value {
+        DisplayArg::Value(value) => format_default_value(value),
+        DisplayArg::Null => vec![b' '],
+    }
+}
+
+fn format_arg_string_bytes(value: &DisplayArg) -> Option<Vec<u8>> {
+    match value {
+        DisplayArg::Value(value) => format_string_bytes(value),
+        DisplayArg::Null => None,
+    }
 }
 
 fn format_string_bytes(value: &Value) -> Option<Vec<u8>> {
