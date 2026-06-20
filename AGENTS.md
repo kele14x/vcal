@@ -32,6 +32,7 @@ Quick test for where a fact belongs: if it will still hold after the next featur
 
 ## Meta-rules
 
+- Do not commit, amend, tag, or push unless the user **explicitly** says so — "commit", "tag", "push", or equivalent. Staging files for review (`git add` without a following `git commit`) is fine; the commit/push step waits for the explicit word. This avoids accidental history changes.
 - Add LRM edge-case tests as new operators land.
 - Most design rules derive from LRM. Where vcal diverges intentionally, the divergence is documented in [doc/non-standard.md](doc/non-standard.md) — consult it before reading the LRM.
 - Do not infer scope from [doc/lrm-coverage.md](doc/lrm-coverage.md) — many checked boxes are long-term targets, not current scope. Confirm with the user before expanding beyond what [doc/scope.md](doc/scope.md) lists as active.
