@@ -11,7 +11,7 @@
 - `src/system_call.rs` — `SystemCallKind` / `SystemFunction` classification (`classify_system_call`), task execution (`execute_task` for `$finish` / `$stop` / `$display` / `$write`), and the `$display` / `$write` format-control walker (`format_display_args` and the `%`-specifier handlers).
 - `src/highlight.rs` — lenient span-aware tokenizer (`highlight_spans`, `TokenClass`) feeding the rustyline line highlighter; mirrors the lexer's boundary rules but never errors so partial input doesn't flash red mid-keystroke.
 - `src/color.rs` — ANSI color helpers and the rustyline `PromptHelper` (prompt coloring, token coloring, `NO_COLOR` / terminal gating).
-- `src/tests.rs` — unit tests, declared via `#[cfg(test)] mod tests;` in `lib.rs`.
+- `src/tests/` — unit tests, declared via `#[cfg(test)] mod tests;` in `lib.rs`. `mod.rs` lists the submodules; each `tests/<area>.rs` (literals, strings, parser_ast, arithmetic, system_tasks, display, repl, relational, logical, bitwise, shift, conditional, concat, casts, real, real_functions, variables, selects, lvalue, arrays, integer_real_decls, deep_nesting, limits) is self-contained with its own `use` imports, grouped by operator / feature area.
 
 ## REPL entry points
 
