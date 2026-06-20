@@ -105,7 +105,7 @@ A declared reg can be sliced four ways (LRM 4.2.1 / 5.2.1 / 5.2.2):
 | Syntax        | Form                       | Result width  |
 |---------------|----------------------------|---------------|
 | `r[expr]`     | bit-select                 | 1             |
-| `r[m:l]`      | part-select                | `|m-l|+1`     |
+| `r[m:l]`      | part-select                | `\|m-l\|+1`   |
 | `r[b +: w]`   | indexed part-select up     | `w`           |
 | `r[b -: w]`   | indexed part-select down   | `w`           |
 

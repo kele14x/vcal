@@ -2,7 +2,7 @@
 
 ## Prompt
 
-- Prompt format is `In [n]: ` / `Out[n]: ` (trailing space), where `n` is the index of the n-th user input, starting from 0.
+- Prompt format is `In [n]:` / `Out[n]:` (plus a trailing space), where `n` is the index of the n-th user input, starting from 0.
 - `In [n]:` accepts a single line of Verilog. Multi-line input is a backlog item; see [scope.md](scope.md).
 - Each input gets exactly one output slot, followed by a blank line so consecutive turns are visually separated. Following the IPython convention, the REPL prints:
   - `Out[n]: <value>` when the last statement is an expression and the input does not end with `;` — the value renders in canonical Verilog form `<width>'<base><digits>` (see [expressions.md](expressions.md) → "Base rules") — then a blank separator line before the next `In [n+1]:` prompt.

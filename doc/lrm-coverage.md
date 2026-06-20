@@ -1,8 +1,8 @@
 # LRM coverage
 
-This is the final support target matrix and grammar coverage for IEEE 1364-2005, not a snapshot of what is currently implemented. 
+This is the final support target matrix and grammar coverage for IEEE 1364-2005, not a snapshot of what is currently implemented.
 
-- Checked = supported (target). 
+- Checked = supported (target).
 - Unchecked = not supported (intentionally out of scope).
 - Not in list = not supported
 
@@ -13,7 +13,7 @@ For "what works *today*" vs "what is the long-term target", see [scope.md](scope
 - [x] 3. Lexical conventions
   - [x] 3.1 Lexical tokens
   - [x] 3.2 White spaces
-  - [ ] 3.3 Comments
+  - [x] 3.3 Comments
   - [x] 3.4 Operators
   - [x] 3.5 Numbers
   - [x] 3.6 Strings
@@ -57,7 +57,7 @@ For "what works *today*" vs "what is the long-term target", see [scope.md](scope
 - [ ] 15. Timing checks
 - [ ] 16. Backannotation using the standard delay format (SDF)
 - [ ] 17 System tasks and functions
-  - [ ] 17.1 Display system task
+  - [x] 17.1 Display system task
   - [ ] 17.2 File input-output system tasks
   - [ ] 17.3 Timescale system task
   - [x] 17.4 Simulation control system tasks
@@ -67,7 +67,7 @@ For "what works *today*" vs "what is the long-term target", see [scope.md](scope
   - [x] 17.8 Conversion functions
   - [ ] 17.9 Probabilistic distribution functions
   - [ ] 17.10 Command line input
-  - [ ] 17.11 Math functions
+  - [x] 17.11 Math functions
 - [ ] 18. Value change dump (VCD) files
 - [ ] 19. Compiler directives
 
@@ -121,11 +121,15 @@ For "what works *today*" vs "what is the long-term target", see [scope.md](scope
 
 ## Supported system tasks & functions
 
-- [ ] Display system tasks
-  - [ ] `$display`
+- [x] Display system tasks
+  - [x] `$display`
   - [ ] `$displayb`
   - [ ] `$displayo`
   - [ ] `$displayh`
+  - [x] `$write`
+  - [ ] `$writeb`
+  - [ ] `$writeo`
+  - [ ] `$writeh`
 - [x] Simulation control system task
   - [x] `$finish`
   - [x] `$stop`
@@ -298,18 +302,18 @@ For "what works *today*" vs "what is the long-term target", see [scope.md](scope
     - [x] exp ::= e | E
     - [x] decimal_number ::= unsigned_number
                            | [ size ] decimal_base unsigned_number
-                           | [ size ] decimal_base x_digit { _ }
-                           | [ size ] decimal_base z_digit { _ }
+                           | [ size ] decimal_base x_digit { \_ }
+                           | [ size ] decimal_base z_digit { \_ }
     - [x] binary_number ::= [ size ] binary_base binary_value
     - [x] octal_number ::= [ size ] octal_base octal_value
     - [x] hex_number ::= [ size ] hex_base hex_value
     - [x] sign ::= + | -
     - [x] size ::= non_zero_unsigned_number
-    - [x] non_zero_unsigned_number ::= non_zero_decimal_digit { _ | decimal_digit}
-    - [x] unsigned_number ::= decimal_digit { _ | decimal_digit }
-    - [x] binary_value ::= binary_digit { _ | binary_digit }
-    - [x] octal_value ::= octal_digit { _ | octal_digit }
-    - [x] hex_value ::= hex_digit { _ | hex_digit }
+    - [x] non_zero_unsigned_number ::= non_zero_decimal_digit { \_ | decimal_digit}
+    - [x] unsigned_number ::= decimal_digit { \_ | decimal_digit }
+    - [x] binary_value ::= binary_digit { \_ | binary_digit }
+    - [x] octal_value ::= octal_digit { \_ | octal_digit }
+    - [x] hex_value ::= hex_digit { \_ | hex_digit }
     - [x] decimal_base ::= '[s|S]d | '[s|S]D
     - [x] binary_base ::= '[s|S]b | '[s|S]B
     - [x] octal_base ::= '[s|S]o | '[s|S]O
@@ -322,11 +326,11 @@ For "what works *today*" vs "what is the long-term target", see [scope.md](scope
                       | a | b | c | d | e | f | A | B | C | D | E | F
     - [x] x_digit ::= x | X
     - [x] z_digit ::= z | Z | ?
-  - [ ] A.8.8 Strings
-    - [ ] string ::= " { Any_ASCII_Characters_except_new_line } "
+  - [x] A.8.8 Strings
+    - [x] string ::= " { Any_ASCII_Characters_except_new_line } "
 - [ ] A.9 General
   - [ ] A.9.1 Attributes
-  - [ ] A.9.2 Comments
+  - [x] A.9.2 Comments
   - [ ] A.9.3 Identifiers
     - [ ] escaped_identifier ::= \ { Any_ASCII_character_except_white_space } white_space
     - [x] identifier ::= simple_identifier
