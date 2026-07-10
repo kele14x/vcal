@@ -1,4 +1,7 @@
 # Editor
+.claude/
+.codex/
+.qoder/
 .vscode/
 
 # MacOS
@@ -12,6 +15,7 @@ obj_dir/
 /target
 
 # Misc
-.claude/
 doc/*.v
 doc/*.pdf
+*.bak
+*~

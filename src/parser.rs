@@ -41,29 +41,6 @@ pub(crate) enum LiteralPayload {
 }
 
 impl LiteralSpec {
-    // True if any X/Z appears in the materialized bit vector. For Bits we can
-    // answer from (low_bits, fill) without expanding. For Numeric the
-    // magnitude is by construction made of 0/1 digits only — never x/z.
-    pub(crate) fn has_unknown_bits(&self) -> bool {
-        match &self.payload {
-            LiteralPayload::Numeric { .. } => false,
-            LiteralPayload::Bits { low_bits, fill } => {
-                let fill_is_unknown = matches!(fill, LogicBit::X | LogicBit::Z);
-                // If fill is unknown and width extends past low_bits, the
-                // extended positions are unknown — short-circuit true.
-                if fill_is_unknown && self.width > low_bits.len() {
-                    return true;
-                }
-                // Otherwise scan only the live portion (truncated at width
-                // since extra low_bits get dropped at materialize time).
-                let live = low_bits.len().min(self.width);
-                low_bits[..live]
-                    .iter()
-                    .any(|bit| matches!(bit, LogicBit::X | LogicBit::Z))
-            }
-        }
-    }
-
     // Materializes the full IntegerValue. The only path that allocates
     // `width` bytes — gated by the validator's MAX_BIT_WIDTH check.
     pub(crate) fn materialize(&self) -> IntegerValue {

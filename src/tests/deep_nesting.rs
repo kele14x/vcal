@@ -403,8 +403,9 @@ fn deep_real_addition_chain_evaluates() {
 
 #[test]
 fn deep_power_exponent_chain_evaluates() {
-    // `2 ** (1+1+...+1)`. The exponent goes through
-    // evaluate_expr_as_math_bigint which is iterative as of P5.
+    // `2 ** (1+1+...+1)`. The self-determined exponent goes through the
+    // standard iterative integer pipeline (evaluate_subexpr_as_integer),
+    // so a deep operand chain stays off the Rust call stack.
     let n = DEEP_CHAIN_DEPTH;
     let inner: String = std::iter::once("1".to_string())
         .chain(std::iter::repeat_n("+1".to_string(), n))

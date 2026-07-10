@@ -153,6 +153,51 @@ fn evaluates_negative_base_power_cases_from_lrm_examples() {
 }
 
 #[test]
+fn power_with_huge_exponent_truncates_to_result_width() {
+    // LRM Table 5-3: `**` result width is L(base). We compute
+    // base ** exp mod 2^width via modular exponentiation, so a huge
+    // exponent evaluates instantly instead of materialising a
+    // multi-hundred-megabit intermediate. Values match iverilog / Verilator.
+    let big = evaluate_input("3 ** 32'd200000000").expect("huge exponent should evaluate");
+    let big_unsigned = evaluate_input("5 ** 32'd200000000").expect("huge exponent should evaluate");
+    let wraps_to_zero = evaluate_input("2 ** 200").expect("power should evaluate");
+
+    assert_eq!(big.output, "-32'sd1314592767");
+    assert_eq!(big_unsigned.output, "32'sd958265345");
+    assert_eq!(wraps_to_zero.output, "32'sd0");
+
+    // Negative signed base exercises the two's-complement residue fold
+    // (base % 2^width lands negative, then folds up into [0, 2^width)).
+    let neg_odd = evaluate_input("(-3) ** 32'd200000001").expect("neg base should evaluate");
+    let neg_even = evaluate_input("(-3) ** 32'd200000000").expect("neg base should evaluate");
+    // Explicitly unsigned base/result: same magnitude, unsigned rendering.
+    let unsigned = evaluate_input("32'd3 ** 32'd200000001").expect("unsigned base should evaluate");
+
+    assert_eq!(neg_odd.output, "-32'sd351188995");
+    assert_eq!(neg_even.output, "-32'sd1314592767");
+    assert_eq!(unsigned.output, "32'd351188995");
+}
+
+#[test]
+fn nested_power_exponent_is_self_determined() {
+    // LRM Table 5-3: the exponent is self-determined — evaluated at its own
+    // width, so it wraps mod 2^width just like any other subexpression. Thus
+    // `2 ** 40` is 0 (2^40 mod 2^32), which makes `2 ** (2 ** 40)` == 2^0 == 1.
+    // Matches iverilog / Verilator, which do not keep the exponent at full
+    // precision.
+    let inner = evaluate_input("2 ** 40").expect("power should evaluate");
+    let nested_two = evaluate_input("2 ** (2 ** 40)").expect("nested power should evaluate");
+    let nested_three = evaluate_input("3 ** (2 ** 40)").expect("nested power should evaluate");
+    let nested_huge =
+        evaluate_input("3 ** (5 ** 32'd200000000)").expect("nested huge power should evaluate");
+
+    assert_eq!(inner.output, "32'sd0");
+    assert_eq!(nested_two.output, "32'sd1");
+    assert_eq!(nested_three.output, "32'sd1");
+    assert_eq!(nested_huge.output, "32'sd1374756867");
+}
+
+#[test]
 fn binary_arithmetic_preserves_shared_operand_base() {
     let binary_add = evaluate_input("4'b0111 + 4'b1001").expect("binary add should evaluate");
     let hex_add = evaluate_input("8'h0a + 8'h05").expect("hex add should evaluate");

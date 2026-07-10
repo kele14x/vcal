@@ -3051,9 +3051,10 @@ fn visit_binary_eval<'b, 'a: 'b>(
         }
         BinaryOp::Power => {
             // lhs takes the result width but lhs's own signedness/base.
-            // rhs is the bigint exponent — handled inline at combine time
-            // via the legacy walker; deep exponents still crash here
-            // until P5.
+            // rhs (the exponent) is self-determined per LRM Table 5-3:
+            // evaluated at its own width in the BinaryPower combiner via the
+            // standard integer pipeline, then applied with modular
+            // exponentiation so the result stays bounded by the result width.
             let lhs_inner_ctx = ExprMeta {
                 width: effective_meta.width,
                 signed: lhs_meta.signed,
@@ -3331,10 +3332,24 @@ fn combine_eval<'b, 'a: 'b>(
                 ));
                 return Ok(());
             }
-            // Bigint exponent: still recursive at this phase. P5 will iterate.
-            let exponent_value = evaluate_expr_as_math_bigint(rhs_expr, session)?;
+            // LRM 5.1.6 / Table 5-3: the exponent is self-determined — it is
+            // evaluated at its own width (each nested operator truncating to
+            // its own width in turn), NOT at arbitrary precision. So we route
+            // it through the standard self-determined integer pipeline rather
+            // than a full-precision bigint walker. Unknown exponent bits make
+            // the whole result x.
+            let exponent_value = evaluate_subexpr_as_integer(rhs_expr, session)?;
+            if exponent_value.has_unknown_bits() {
+                vals.push(IntegerValue::all_x(
+                    effective_meta.width,
+                    lhs_meta.signed,
+                    lhs_meta.base,
+                ));
+                return Ok(());
+            }
+            let exponent_value = exponent_value.as_bigint(exponent_value.signed);
             let base_value = lhs_value.as_bigint(lhs_meta.signed);
-            let result = match evaluate_power(base_value, exponent_value) {
+            let result = match evaluate_power(base_value, exponent_value, effective_meta.width) {
                 Ok(r) => r,
                 Err(_) => {
                     vals.push(IntegerValue::all_x(
@@ -4714,231 +4729,16 @@ fn widen_relational_result(result: IntegerValue, context: Option<ExprMeta>) -> I
     }
 }
 
-// Used for the RHS of integer `**`, where the exponent must keep
-// arbitrary precision rather than be clamped to the result width. Two
-// strategies:
-//   - Arithmetic operators (+, -, *, /, %, **) and unary +/- recurse in
-//     bigint, so the computation stays width-free.
-//   - Everything else has a width- or signedness-dependent result that
-//     can't be reconstructed from a raw bigint, so we route through the
-//     standard pipeline (which materialises width/signedness on the
-//     `IntegerValue`), then read the bigint out via `value_to_math_bigint`.
-// `value_to_math_bigint` also rejects x/z bits — at the math-bigint layer
-// we have no way to represent unknown bits, so any unknown surfaces a
-// clean "expression contains unknown bits" error.
-// Iterative bigint evaluator. CES driver with `Vec<BigInt>` value stack,
-// mirroring `evaluate_annotated_as_real`'s shape. Recursive arms (Grouped,
-// Unary +/-, Binary arith) become Combine variants; non-arith / non-recursive
-// shapes route through `evaluate_subexpr_as_integer` (annotate +
-// `evaluate_annotated`) and collapse the resulting `IntegerValue` to a
-// BigInt via `value_to_math_bigint`.
-//
-// Used by integer Power exponents (LRM 5.1.6 / Table 5-3) — the exponent
-// must keep arbitrary precision. Safe under deep `2 ** (...)` for any
-// shape the parser accepts (arith chain, relational chain, conditional
-// chain, concat, etc.) because every nested integer subtree is dispatched
-// onto the heap-allocated work stack of the iterative driver.
-enum BigintEvalTask<'a> {
-    Visit(&'a Expr),
-    Combine(BigintCombiner),
-}
-
-enum BigintCombiner {
-    /// Unary `+` / `-`. Pops 1 BigInt.
-    UnaryPlus,
-    UnaryMinus,
-    /// Add / Subtract / Multiply / Divide / Modulus / Power on BigInts.
-    /// Pops 2 BigInts (lhs, rhs in push order).
-    BinaryArith {
-        op: BinaryOp,
-    },
-}
-
-fn evaluate_expr_as_math_bigint(root: &Expr, session: &Session) -> Result<BigInt, String> {
-    let mut work: Vec<BigintEvalTask> = vec![BigintEvalTask::Visit(root)];
-    let mut vals: Vec<BigInt> = Vec::new();
-
-    while let Some(task) = work.pop() {
-        match task {
-            BigintEvalTask::Visit(expr) => visit_bigint_eval(expr, &mut work, &mut vals, session)?,
-            BigintEvalTask::Combine(c) => combine_bigint_eval(c, &mut vals)?,
-        }
-    }
-
-    debug_assert_eq!(
-        vals.len(),
-        1,
-        "evaluate_expr_as_math_bigint produced {} values",
-        vals.len()
-    );
-    Ok(vals
-        .pop()
-        .expect("driver invariant: one root produces one BigInt"))
-}
-
-fn visit_bigint_eval<'a>(
-    expr: &'a Expr,
-    work: &mut Vec<BigintEvalTask<'a>>,
-    vals: &mut Vec<BigInt>,
-    session: &Session,
-) -> Result<(), String> {
-    match expr {
-        Expr::Literal(spec) => {
-            if spec.has_unknown_bits() {
-                return Err("expression contains unknown bits".to_string());
-            }
-            // Validator has gated spec.width against MAX_BIT_WIDTH, so this
-            // materialize is bounded. Numeric payload trivially yields the
-            // bigint; Bits with all 0/1 has to expand to read the value.
-            let value = spec.materialize();
-            vals.push(value.as_bigint(value.signed));
-        }
-        Expr::StringLiteral(bytes) => {
-            let value = string_literal_spec(bytes).materialize();
-            vals.push(value.as_bigint(value.signed));
-        }
-        // Reaching this helper with a real-typed expression means the
-        // integer-power exponent path was entered with a real exponent,
-        // which `expression_is_real` would have caught earlier.
-        Expr::RealLiteral(_) => {
-            return Err("real value cannot be used as an integer here".to_string());
-        }
-        Expr::Grouped(inner) => work.push(BigintEvalTask::Visit(inner)),
-        Expr::Unary { op, expr: operand } => match op {
-            UnaryOp::Plus => {
-                work.push(BigintEvalTask::Combine(BigintCombiner::UnaryPlus));
-                work.push(BigintEvalTask::Visit(operand));
-            }
-            UnaryOp::Minus => {
-                work.push(BigintEvalTask::Combine(BigintCombiner::UnaryMinus));
-                work.push(BigintEvalTask::Visit(operand));
-            }
-            // Other unary ops have width-dependent results that can't be
-            // reconstructed in bigint alone — route the operand through
-            // the iterative integer pipeline and collapse the result.
-            UnaryOp::LogicalNot
-            | UnaryOp::BitwiseNot
-            | UnaryOp::ReductionAnd
-            | UnaryOp::ReductionNand
-            | UnaryOp::ReductionOr
-            | UnaryOp::ReductionNor
-            | UnaryOp::ReductionXor
-            | UnaryOp::ReductionXnor => {
-                vals.push(value_to_math_bigint(evaluate_subexpr_as_integer(
-                    expr, session,
-                )?)?);
-            }
-        },
-        Expr::Binary { op, lhs, rhs } => {
-            if matches!(
-                op,
-                BinaryOp::Add
-                    | BinaryOp::Subtract
-                    | BinaryOp::Multiply
-                    | BinaryOp::Divide
-                    | BinaryOp::Modulus
-                    | BinaryOp::Power
-            ) {
-                work.push(BigintEvalTask::Combine(BigintCombiner::BinaryArith {
-                    op: *op,
-                }));
-                work.push(BigintEvalTask::Visit(rhs));
-                work.push(BigintEvalTask::Visit(lhs));
-            } else {
-                // Non-arithmetic binary ops (relational/equality/logical/
-                // bitwise/shift) have width- or 1-bit-unsigned-by-
-                // construction results — route the whole binary through
-                // the iterative integer pipeline so a deep operand chain
-                // stays off the C stack, then collapse to bigint.
-                vals.push(value_to_math_bigint(evaluate_subexpr_as_integer(
-                    expr, session,
-                )?)?);
-            }
-        }
-        // Conditional, concatenation/replication, sign casts, real
-        // conversions, and math functions: route the whole subtree
-        // through the iterative integer pipeline (`evaluate_subexpr_as_integer`
-        // = annotate + evaluate_annotated), then collapse to bigint.
-        // Using the legacy `evaluate_expr_in_context` here would re-enter
-        // the recursive walker and overflow on a deep child.
-        Expr::Conditional { .. }
-        | Expr::Concatenation { .. }
-        | Expr::Replication { .. }
-        | Expr::Identifier(_)
-        | Expr::Select { .. } => {
-            vals.push(value_to_math_bigint(evaluate_subexpr_as_integer(
-                expr, session,
-            )?)?);
-        }
-        // `$name(args)`: route through the iterative integer pipeline,
-        // which surfaces "task in expression position" for $finish /
-        // $stop via the annotated SystemTask arm. Math / cast /
-        // conversion calls all collapse to a bigint here.
-        Expr::SystemCall { .. } => {
-            vals.push(value_to_math_bigint(evaluate_subexpr_as_integer(
-                expr, session,
-            )?)?);
-        }
-        Expr::Truncated => unreachable!(
-            "Expr::Truncated is a display-only sentinel; never reaches evaluate_expr_as_math_bigint"
-        ),
-    }
-    Ok(())
-}
-
-fn combine_bigint_eval(combiner: BigintCombiner, vals: &mut Vec<BigInt>) -> Result<(), String> {
-    match combiner {
-        BigintCombiner::UnaryPlus => {
-            // Identity.
-        }
-        BigintCombiner::UnaryMinus => {
-            let v = vals.pop().expect("UnaryMinus: operand missing");
-            vals.push(-v);
-        }
-        BigintCombiner::BinaryArith { op } => {
-            let rhs = vals.pop().expect("BinaryArith: rhs missing");
-            let lhs = vals.pop().expect("BinaryArith: lhs missing");
-            let result = match op {
-                BinaryOp::Add => lhs + rhs,
-                BinaryOp::Subtract => lhs - rhs,
-                BinaryOp::Multiply => lhs * rhs,
-                BinaryOp::Divide => {
-                    if rhs.is_zero() {
-                        return Err("expression division by zero".to_string());
-                    }
-                    lhs / rhs
-                }
-                BinaryOp::Modulus => {
-                    if rhs.is_zero() {
-                        return Err("expression modulus by zero".to_string());
-                    }
-                    lhs % rhs
-                }
-                BinaryOp::Power => evaluate_power(lhs, rhs)?,
-                _ => unreachable!("BinaryArith Combine got non-arith op"),
-            };
-            vals.push(result);
-        }
-    }
-    Ok(())
-}
-
-// Reject x/z (math-bigint has no representation for unknown bits) and
-// convert the materialised integer to BigInt using the value's own
-// signedness flag. Note: concat/replication and the 1-bit
-// relational/equality/logical/reduction results all carry signed = false
-// by construction, so `value.signed` produces the same bigint as an
-// explicit `false` would; passing the flag through keeps the rule
-// uniform for the callers that do preserve signedness (bitwise, shift,
-// sign casts, $rtoi, etc.).
-fn value_to_math_bigint(value: IntegerValue) -> Result<BigInt, String> {
-    if value.has_unknown_bits() {
-        return Err("expression contains unknown bits".to_string());
-    }
-    Ok(value.as_bigint(value.signed))
-}
-
-fn evaluate_power(base: BigInt, exponent: BigInt) -> Result<BigInt, String> {
+// Integer `**` per LRM Table 5-3. `width` is the result width (L(base));
+// the LRM guarantees the result is only `width` bits wide, so we compute
+// `base ** exponent mod 2^width` via modular exponentiation instead of
+// materialising the full-precision power and truncating afterwards. This
+// keeps every intermediate bounded by `width` bits, matching iverilog /
+// Verilator and avoiding the pathological blow-up on huge exponents
+// (e.g. `3 ** 32'd200000000`). The special small-magnitude results
+// (0 / 1 / -1) are returned directly and truncated to `width` by the
+// caller's `IntegerValue::from_bigint`.
+fn evaluate_power(base: BigInt, exponent: BigInt, width: usize) -> Result<BigInt, String> {
     if exponent.is_zero() {
         return Ok(BigInt::one());
     }
@@ -4973,22 +4773,21 @@ fn evaluate_power(base: BigInt, exponent: BigInt) -> Result<BigInt, String> {
         .to_biguint()
         .expect("non-negative exponent should convert to BigUint");
 
-    let mut result = BigInt::one();
-    let mut factor = base;
-    let mut remaining = exponent;
-
-    while !remaining.is_zero() {
-        if remaining.bit(0) {
-            result *= &factor;
-        }
-
-        remaining >>= 1u32;
-        if !remaining.is_zero() {
-            factor = &factor * &factor;
-        }
+    // Modulus is 2^width. Reduce the (possibly negative) base into
+    // [0, 2^width) first — `(a mod m)^e mod m == a^e mod m`, and folding a
+    // negative base up by the modulus yields its two's-complement residue,
+    // which is exactly what the caller reinterprets under the result's
+    // signedness. A zero-width result collapses to the empty modulus 1.
+    let modulus = BigUint::one() << width;
+    let mut base_res = base % BigInt::from(modulus.clone());
+    if base_res.sign() == Sign::Minus {
+        base_res += BigInt::from(modulus.clone());
     }
-
-    Ok(result)
+    let base_res = base_res
+        .to_biguint()
+        .expect("residue folded into [0, 2^width) is non-negative");
+    let result = base_res.modpow(&exponent, &modulus);
+    Ok(BigInt::from(result))
 }
 
 // LRM 5.1.11 reduction: fold the binary operator across all operand bits.
