@@ -860,13 +860,11 @@ pub(crate) fn evaluate_constant_expr(
 // Self-determined integer evaluation that goes through the iterative
 // `annotate` + `evaluate_annotated` pipeline. Used wherever a leaf-side
 // helper would otherwise call the recursive `evaluate_expr_in_context`
-// on a user-supplied sub-expression: bit-select index, indexed-base,
-// part-select range halves, and the bigint-exponent walker's fallback
-// for non-arith / leaf-ish shapes. The enclosing expression has
-// already been validated (either by `validate_annotated` at the top of
-// `evaluate_expr`/`evaluate_assignment_rhs`, or by per-form structural
-// checks like `validate_select_kind_structure`), so we skip
-// `validate_annotated` here.
+// on a user-supplied sub-expression: bit-select index, indexed-base, and
+// part-select range halves. The enclosing expression has already been
+// validated (either by `validate_annotated` at the top of
+// `evaluate_expr`/`evaluate_assignment_rhs`, or by per-form structural checks
+// like `validate_select_kind_structure`), so we skip `validate_annotated` here.
 fn evaluate_subexpr_as_integer(expr: &Expr, session: &Session) -> Result<IntegerValue, String> {
     let annotated = annotate(expr, session)?;
     evaluate_annotated(&annotated, None, session)
@@ -1951,13 +1949,10 @@ fn binary_op_name(op: BinaryOp) -> &'static str {
 // `AnnotatedKind::Leaf` arm, which `annotate` emits for `Literal`,
 // `RealLiteral`, `SystemTask`, `Identifier`, and `Select` only. All
 // other Expr shapes go through dedicated `AnnotatedKind` arms in the
-// iterative CES driver, never through here — they can't appear as a
-// leaf in the annotated tree, and the bigint-exponent walker now
-// routes its sub-expressions through `evaluate_subexpr_as_integer`
-// (annotate + evaluate_annotated) rather than re-entering the legacy
-// per-shape helpers. Surface an `unreachable!` on anything else so a
-// future regression that wires a non-leaf shape into the Leaf path
-// fails loudly instead of silently re-introducing the recursive walker.
+// iterative CES driver, never through here — they can't appear as a leaf in
+// the annotated tree. Surface an `unreachable!` on anything else so a future
+// regression that wires a non-leaf shape into the Leaf path fails loudly
+// instead of silently re-introducing a recursive per-shape evaluator.
 fn evaluate_leaf_expr_in_context(
     expr: &Expr,
     context: Option<ExprMeta>,
@@ -2057,14 +2052,10 @@ fn evaluate_leaf_expr_in_context(
 // in the order they were pushed, so each Combine pops them in reverse of
 // the push order (rhs first, then lhs).
 //
-// Only the integer pipeline drives the iterative driver. Real-typed
-// operands and the bigint exponent of `Power` route to the legacy
-// `evaluate_expr_as_real` / `evaluate_expr_as_math_bigint` helpers, which
-// are still recursive at this stage — P4 / P5 will iterate them. Deep
-// chains in those positions still crash here; deep chains anywhere else
-// (Binary integer, Unary integer, Conditional, Grouped, Concatenation,
-// Replication, casts, conversions, integer math functions) are now O(1)
-// in Rust stack regardless of nesting depth.
+// Integer and real evaluation share this iterative driver. Bridges between
+// the two value stacks, plus self-determined power exponents, are represented
+// as work-stack tasks as well, so every expression shape stays O(1) in Rust
+// stack regardless of nesting depth.
 //
 // Conditional needs a 2-stage Combine: first the cond_value is popped to
 // decide which branch to evaluate (LRM 5.1.13: cond=0 → only else, cond=1
@@ -2104,13 +2095,12 @@ enum EvalCombiner<'b, 'a: 'b> {
         op: BinaryOp,
         effective_meta: ExprMeta,
     },
-    /// Integer power. Pops 1 value (lhs); the exponent is evaluated as a
-    /// BigInt via the legacy walker at combine time. `rhs_expr` is the
-    /// raw exponent expression; deep exponent chains still crash until P5.
+    /// Integer power. Pops 2 values (lhs, rhs); the RHS is scheduled through
+    /// the same work stack with no propagated context, then applied with
+    /// width-bounded modular exponentiation.
     BinaryPower {
         effective_meta: ExprMeta,
         lhs_meta: ExprMeta,
-        rhs_expr: &'a Expr,
     },
     /// Less / Greater / LessOrEq / GreaterOrEq on integers. Pops 2 values
     /// already extended to the unified comparison context.
@@ -3025,7 +3015,14 @@ fn visit_binary_eval<'b, 'a: 'b>(
     let meta = combine_binary_meta(op, lhs_meta, rhs_meta);
     let effective_meta = ExprMeta {
         width: ctx.map_or(meta.width, |c| usize::max(c.width, meta.width)),
-        signed: meta.signed,
+        // Arithmetic and bitwise operands take the surrounding expression's
+        // propagated signedness. Power keeps its LHS-derived signedness; its
+        // RHS is self-determined and never contributes to the result type.
+        signed: if matches!(op, BinaryOp::Power) {
+            meta.signed
+        } else {
+            ctx.map_or(meta.signed, |c| c.signed)
+        },
         base: meta.base,
     };
 
@@ -3063,8 +3060,11 @@ fn visit_binary_eval<'b, 'a: 'b>(
             work.push(EvalTask::Combine(EvalCombiner::BinaryPower {
                 effective_meta,
                 lhs_meta,
-                rhs_expr: rhs.expr,
             }));
+            work.push(EvalTask::Visit {
+                node: rhs,
+                ctx: None,
+            });
             work.push(EvalTask::Visit {
                 node: lhs,
                 ctx: Some(lhs_inner_ctx),
@@ -3240,7 +3240,7 @@ fn combine_eval<'b, 'a: 'b>(
     work: &mut Vec<EvalTask<'b, 'a>>,
     vals: &mut Vec<IntegerValue>,
     real_vals: &mut Vec<f64>,
-    session: &Session,
+    _session: &Session,
 ) -> Result<(), String> {
     match combiner {
         EvalCombiner::BinaryArith {
@@ -3253,13 +3253,13 @@ fn combine_eval<'b, 'a: 'b>(
             if lhs_value.has_unknown_bits() || rhs_value.has_unknown_bits() {
                 vals.push(IntegerValue::all_x(
                     effective_meta.width,
-                    meta.signed,
+                    effective_meta.signed,
                     meta.base,
                 ));
                 return Ok(());
             }
-            let lhs_int = lhs_value.as_bigint(meta.signed);
-            let rhs_int = rhs_value.as_bigint(meta.signed);
+            let lhs_int = lhs_value.as_bigint(effective_meta.signed);
+            let rhs_int = rhs_value.as_bigint(effective_meta.signed);
             let result = match op {
                 BinaryOp::Add => lhs_int + rhs_int,
                 BinaryOp::Subtract => lhs_int - rhs_int,
@@ -3268,7 +3268,7 @@ fn combine_eval<'b, 'a: 'b>(
                     if rhs_int.is_zero() {
                         vals.push(IntegerValue::all_x(
                             effective_meta.width,
-                            meta.signed,
+                            effective_meta.signed,
                             meta.base,
                         ));
                         return Ok(());
@@ -3279,7 +3279,7 @@ fn combine_eval<'b, 'a: 'b>(
                     if rhs_int.is_zero() {
                         vals.push(IntegerValue::all_x(
                             effective_meta.width,
-                            meta.signed,
+                            effective_meta.signed,
                             meta.base,
                         ));
                         return Ok(());
@@ -3291,7 +3291,7 @@ fn combine_eval<'b, 'a: 'b>(
             vals.push(IntegerValue::from_bigint(
                 result,
                 effective_meta.width,
-                meta.signed,
+                effective_meta.signed,
                 meta.base,
             ));
         }
@@ -3321,8 +3321,8 @@ fn combine_eval<'b, 'a: 'b>(
         EvalCombiner::BinaryPower {
             effective_meta,
             lhs_meta,
-            rhs_expr,
         } => {
+            let exponent_value = vals.pop().expect("BinaryPower: rhs missing");
             let lhs_value = vals.pop().expect("BinaryPower: lhs missing");
             if lhs_value.has_unknown_bits() {
                 vals.push(IntegerValue::all_x(
@@ -3332,13 +3332,9 @@ fn combine_eval<'b, 'a: 'b>(
                 ));
                 return Ok(());
             }
-            // LRM 5.1.6 / Table 5-3: the exponent is self-determined — it is
-            // evaluated at its own width (each nested operator truncating to
-            // its own width in turn), NOT at arbitrary precision. So we route
-            // it through the standard self-determined integer pipeline rather
-            // than a full-precision bigint walker. Unknown exponent bits make
-            // the whole result x.
-            let exponent_value = evaluate_subexpr_as_integer(rhs_expr, session)?;
+            // LRM 5.1.6 / Table 5-3: the exponent was visited with no context,
+            // so each nested operator has already truncated at its own width.
+            // Unknown exponent bits make the whole result x.
             if exponent_value.has_unknown_bits() {
                 vals.push(IntegerValue::all_x(
                     effective_meta.width,
@@ -5455,7 +5451,9 @@ fn lvalue_meta(root: &LValue, session: &Session) -> Result<ExprMeta, String> {
                 let mut total_width = 0usize;
                 let mut leftmost_base = Base::Binary;
                 for (idx, item_meta) in vals.drain(start..).enumerate() {
-                    total_width = total_width.saturating_add(item_meta.width);
+                    total_width = total_width.checked_add(item_meta.width).ok_or_else(|| {
+                        format!("lvalue width exceeds limit {}", value::MAX_BIT_WIDTH)
+                    })?;
                     if idx == 0 {
                         leftmost_base = item_meta.base;
                     }
@@ -5465,6 +5463,7 @@ fn lvalue_meta(root: &LValue, session: &Session) -> Result<ExprMeta, String> {
                         "lvalue must have at least one operand with positive size".to_string()
                     );
                 }
+                value::ensure_bit_width(total_width, "lvalue")?;
                 vals.push(ExprMeta {
                     width: total_width,
                     signed: false,

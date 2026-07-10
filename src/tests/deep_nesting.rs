@@ -403,15 +403,26 @@ fn deep_real_addition_chain_evaluates() {
 
 #[test]
 fn deep_power_exponent_chain_evaluates() {
-    // `2 ** (1+1+...+1)`. The self-determined exponent goes through the
-    // standard iterative integer pipeline (evaluate_subexpr_as_integer),
-    // so a deep operand chain stays off the Rust call stack.
+    // `2 ** (1+1+...+1)`. The self-determined exponent is scheduled on the
+    // standard iterative integer work stack, so a deep operand chain stays
+    // off the Rust call stack.
     let n = DEEP_CHAIN_DEPTH;
     let inner: String = std::iter::once("1".to_string())
         .chain(std::iter::repeat_n("+1".to_string(), n))
         .collect();
     let chain = format!("2 ** ({inner})");
     evaluate_input(&chain).expect("deep power exponent evaluates");
+}
+
+#[test]
+fn deeply_right_nested_integer_power_stays_on_work_stack() {
+    // `1 ** (1 ** (... ** 1))`. Each RHS power must be scheduled on the
+    // evaluator's heap work stack; recursively starting a fresh evaluator for
+    // every exponent overflows the default test-thread stack around depth 1K.
+    let n = DEEP_CHAIN_DEPTH;
+    let chain = "1**(".repeat(n) + "1" + &")".repeat(n);
+    let evaluation = evaluate_input(&chain).expect("right-nested power chain evaluates");
+    assert_eq!(evaluation.output, "32'sd1");
 }
 
 #[test]
@@ -732,11 +743,8 @@ fn evaluate_of_itor_with_deep_integer_arg_does_not_overflow() {
 
 #[test]
 fn evaluate_of_power_with_deep_non_arith_exponent_does_not_overflow() {
-    // `2 ** (1<1<...<1)` — pre-fix the bigint-exponent walker's
-    // non-arith fallback called the recursive `evaluate_binary_expr`
-    // for each chain link. Re-routed through the iterative
-    // `evaluate_subexpr_as_integer` (annotate + evaluate_annotated)
-    // so depth stays off the C stack.
+    // `2 ** (1<1<...<1)` — the annotated exponent is scheduled directly on
+    // the iterative evaluator work stack, so depth stays off the C stack.
     let mut chain = Expr::Literal(parse_integer("1").expect("seed literal"));
     for _ in 0..50_000 {
         chain = Expr::Binary {

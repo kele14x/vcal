@@ -176,6 +176,7 @@ run_case "eval replication-nested   {1{{1{..}}}}"       "n=$EVAL_DEPTH; print('{
 run_case "eval signed-nested        \$signed(\$signed(..))"     "n=$EVAL_DEPTH; print('\$signed('*n + '1' + ')'*n)"
 run_case "eval unsigned-nested      \$unsigned(\$unsigned(..))" "n=$EVAL_DEPTH; print('\$unsigned('*n + '1' + ')'*n)"
 run_case "eval pow-rhs              \$pow(2,\$pow(2,..))"       "n=$EVAL_DEPTH; print('\$pow(2,'*n + '1' + ')'*n)"
+run_case "eval integer-power-rhs    1**(1**(..))"               "n=$EVAL_DEPTH; print('1**('*n + '1' + ')'*n)"
 run_case "eval clog2-nested         \$clog2(\$clog2(..))"       "n=$EVAL_DEPTH; print('\$clog2('*n + '4' + ')'*n)"
 run_case "eval rtoi-itor            \$rtoi(\$itor(..))"         "n=$EVAL_DEPTH; print(('\$rtoi(\$itor('*(n//2)) + '1' + (')'*((n//2)*2)))"
 run_case "eval ln-arity1            \$ln(\$ln(..))"             "n=$EVAL_DEPTH; print('\$ln('*n + '1.0' + ')'*n)"

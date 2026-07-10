@@ -113,6 +113,23 @@ fn zero_extends_signed_operands_in_mixed_unsigned_expressions() {
 }
 
 #[test]
+fn outer_unsigned_context_propagates_through_nested_arithmetic() {
+    // The outer unsigned operand controls extension throughout the nested
+    // context-determined subtree. The signed 4-bit value must zero-extend to
+    // 8 before the inner operation, rather than sign-extending to 8'hf8.
+    let addition = evaluate_input("(4'sb1000 + 4'sb0000) + 8'b0")
+        .expect("nested mixed-signedness addition should evaluate");
+    let multiply = evaluate_input("(4'sb1000 * 4'sb0001) + 8'b0")
+        .expect("nested mixed-signedness multiply should evaluate");
+    let relational = evaluate_input("(4'sb1000 + 4'sb0000) < 8'd16")
+        .expect("nested arithmetic in comparison should evaluate");
+
+    assert_eq!(addition.output, "8'b00001000");
+    assert_eq!(multiply.output, "8'b00001000");
+    assert_eq!(relational.output, "1'b1");
+}
+
+#[test]
 fn preserves_signed_results_when_all_operands_are_signed() {
     let addition = evaluate_input("4'sd15 + 4'sd1").expect("signed add should evaluate");
     let division = evaluate_input("4'sd8 / 4'sd2").expect("signed divide should evaluate");

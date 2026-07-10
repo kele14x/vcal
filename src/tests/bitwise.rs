@@ -270,6 +270,13 @@ fn bitwise_binary_widens_through_outer_arithmetic_context() {
 }
 
 #[test]
+fn outer_unsigned_context_propagates_through_nested_bitwise() {
+    let widened = evaluate_input("(4'sb1000 | 4'sb0000) + 8'b0")
+        .expect("nested bitwise expression should evaluate");
+    assert_eq!(widened.output, "8'b00001000");
+}
+
+#[test]
 fn bitwise_band_precedence_below_equality() {
     // `4'd1 == 4'd1 & 4'd1` parses as `(4'd1 == 4'd1) & 4'd1`. The 1-bit
     // 1'b1 zero-extends to 4'b0001 under the unified 4-bit context, then

@@ -95,6 +95,17 @@ fn huge_array_dim_rejected() {
 }
 
 #[test]
+fn array_element_count_limit_applies_to_vector_and_real_arrays() {
+    for declaration in ["reg a [0:65536];", "real r [0:65536];"] {
+        let err = evaluate_input(declaration).unwrap_err();
+        assert_eq!(
+            err,
+            "Semantic error: array element count 65537 exceeds limit 65536"
+        );
+    }
+}
+
+#[test]
 fn vector_array_total_width_at_cap_accepted() {
     // 4096-bit elements * 4096 elements = 16,777,216 total bits.
     let mut session = Session::new();
@@ -110,6 +121,22 @@ fn vector_array_total_width_over_cap_rejected() {
     assert_eq!(
         err,
         "Semantic error: array total width 16781312 exceeds limit 16777216"
+    );
+}
+
+#[test]
+fn lvalue_concatenation_over_width_cap_is_rejected() {
+    // Keep the stored reg small while repeating it enough times for the LHS
+    // context to cross MAX_BIT_WIDTH: 65,536 * 257 = 16,842,752 bits.
+    let mut session = Session::new();
+    session
+        .eval("reg [65535:0] a;")
+        .expect("source reg declaration");
+    let leaves = std::iter::repeat_n("a", 257).collect::<Vec<_>>().join(",");
+    let err = session.eval(&format!("{{{leaves}}}=1")).unwrap_err();
+    assert_eq!(
+        err,
+        "Semantic error: lvalue width 16842752 exceeds limit 16777216"
     );
 }
 

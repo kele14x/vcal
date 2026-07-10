@@ -10,10 +10,11 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 - Integer and real literals, all LRM forms (LRM 3.5.2)
 - String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; `$display` / `$write` support basic format strings, null arguments, and raw-byte system-task output; internal zero-width numeric display renders with one `0` digit
 - All operators between integers (see [operators.md](operators.md))
+- Integer `**` evaluates its exponent as a self-determined expression and uses width-bounded modular exponentiation, so nested or very large exponents wrap correctly without unbounded intermediates
 - Real arithmetic and mixed integer/real promotion (LRM 5.1.5 / 5.1.7 / Tables 5-2, 5-3)
 - Two-pass context (width, signedness) propagation; leftmost-base propagation; `reg` display base starts as a weak binary fallback and resolves from the first whole-reg integer init/assignment
 - `reg` / `integer` / `real` declarations and blocking assignment with the full LRM A.8.5 `variable_lvalue` — bare name, bit/part/indexed-part selects, and arbitrarily nested concatenations on the LHS (see [variables.md](variables.md))
-- 1-D unpacked arrays on `reg` / `integer` / `real` (LRM 4.9 / A.2.2.1); vector-array total storage is capped at the same 16,777,216-bit limit as scalar vectors
+- 1-D unpacked arrays on `reg` / `integer` / `real` (LRM 4.9 / A.2.2.1); arrays are capped at 65,536 elements, and vector-array payload is additionally capped at the same 16,777,216-bit limit as scalar vectors
 - Static-semantic validation as a top-level pre-pass over every expression entry — errors prefixed `Syntax error:` (lex/parse) or `Semantic error:` (validator)
 - System tasks: `$finish`, `$stop` (LRM 17.4), `$display` / `$write` and the `b`/`o`/`h` suffixed variants `$displayb` / `$displayo` / `$displayh` / `$writeb` / `$writeo` / `$writeh` (LRM 17.1 display family, basic formatting subset including `%b`/`%o`/`%d`/`%h`/`%s`/`%c`/real controls). Suffixed variants default the unformatted-integer base to binary / octal / hex respectively; explicit format controls still override. All system tasks accept null arguments (empty comma slots); `$display`/`$write` family emit one space per null, `$finish`/`$stop` discard them. LRM display controls outside this subset are intentionally unsupported for now, including `%u`, `%z`, `%t`, `%m`, strength formats, and field-width / precision modifiers.
 - System functions:

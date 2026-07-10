@@ -5,13 +5,18 @@ The general evaluation model — width, signedness, leaf extension, base inherit
 ## Arithmetic operators
 
 - There are six binary arithmetic operators: `+`, `-`, `*`, `/`, `%`, and `**`; and two unary arithmetic operators: unary `+` and unary `-`.
-- Arithmetic operators are context-determined in width, including the `unary +` and `unary -` operators.
+- The `+`, `-`, `*`, `/`, and `%` operands are context-determined in width, as are the operands of unary `+` and unary `-`. The exponent (RHS) of `**` is self-determined.
 - Natural width:
-  - binary arithmetic = `max(L(lhs), L(rhs))`
+  - `+`, `-`, `*`, `/`, `%` = `max(L(lhs), L(rhs))`
+  - `**` = `L(lhs)`
   - unary `+` / unary `-` = `L(operand)`
 - Effective evaluation width under propagated outer context:
-  - binary arithmetic = `max(L(lhs), L(rhs), L(context))`
+  - `+`, `-`, `*`, `/`, `%` = `max(L(lhs), L(rhs), L(context))`
+  - `**` = `max(L(lhs), L(context))`; only the LHS is widened to this width
   - unary `+` / unary `-` = `max(L(operand), L(context))`
+- For `**`, the RHS is evaluated through the normal self-determined integer rules at its own width and signedness. Nested operations therefore wrap before their value is used as an exponent; for example, `2 ** 40` wraps to zero at 32 bits, so `2 ** (2 ** 40)` is `1`.
+- Integer power is evaluated modulo `2^result_width`. This is equivalent to truncating the mathematical result to the expression width while keeping intermediate values bounded even for very large exponents.
+- The result signedness and display base of `**` come from the LHS; the RHS does not affect either.
 - Width/context resize happens before unary `-` is evaluated, so `-4'sb0001` is not always interchangeable with the already-resized bit pattern `4'sb1111`.
 - Resizing follows the propagated context signedness, so even a signed operand may be zero-extended in an unsigned context.
   - Example: `4'sb1000 + 8'b0` -> `8'b00001000`, because the propagated context is unsigned and `4'sb1000` is extended with zeros before evaluation.

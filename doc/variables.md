@@ -242,6 +242,9 @@ the current session).
 - Multi-dimensional arrays, packed-array-of-array forms, and array
   initializers are out of scope — only the single unpacked dimension
   shown above is accepted, regardless of the element type.
+- Every unpacked array is limited to 65,536 elements so the per-element
+  storage and staging metadata remain bounded. Vector arrays are additionally
+  limited to 16,777,216 total payload bits across all elements.
 - An array decl cannot carry an init expression: `reg [3:0] a [0:7] = ...`
   / `integer a [0:3] = 5` / `real r [0:3] = 1.5` are all rejected. Each
   element starts at the element type's default: all-`x` of the packed

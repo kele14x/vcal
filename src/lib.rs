@@ -21,6 +21,12 @@ pub use value::{Base, IntegerValue, LogicBit, Value};
 use parser::{DeclKind, DeclName, Expr, LValue, SelectKind, Stmt};
 use system_call::SystemCallKind;
 
+// Arrays store one independently addressable value per element, so their
+// allocation cost includes per-element metadata (and, for vector arrays, a
+// separately owned bit buffer) in addition to payload bits. Keep that object
+// count bounded independently of MAX_BIT_WIDTH's payload-bit cap.
+pub(crate) const MAX_ARRAY_ELEMENTS: usize = 1 << 16;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RegRange {
     pub(crate) msb: BigInt,
@@ -454,6 +460,7 @@ fn apply_decl(
                     evaluate_reg_range(dim_msb_expr, dim_lsb_expr, view)
                 })?;
                 let count = dim_range.width()?;
+                ensure_array_element_count(count)?;
                 ensure_array_total_bits(element_width, count)?;
                 let element_template = IntegerValue {
                     width: element_width,
@@ -481,6 +488,7 @@ fn apply_decl(
                     evaluate_reg_range(dim_msb_expr, dim_lsb_expr, view)
                 })?;
                 let count = dim_range.width()?;
+                ensure_array_element_count(count)?;
                 RegStorage::RealArray {
                     dim: dim_range,
                     elements: vec![0.0; count],
@@ -522,6 +530,16 @@ fn apply_decl(
     }
     session.variables = staged;
     Ok((String::new(), false))
+}
+
+fn ensure_array_element_count(count: usize) -> Result<(), String> {
+    if count > MAX_ARRAY_ELEMENTS {
+        Err(format!(
+            "Semantic error: array element count {count} exceeds limit {MAX_ARRAY_ELEMENTS}"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn ensure_array_total_bits(element_width: usize, count: usize) -> Result<(), String> {
