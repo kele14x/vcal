@@ -728,7 +728,6 @@ fn evaluate_real_value(expr: &Expr, session: &Session) -> Result<f64, String> {
     match value {
         Value::Real(f) => Ok(f),
         Value::Integer(int_val) => {
-            use num_traits::ToPrimitive;
             // LRM §5.1.7 + §3.5.3: an integer operand converts to its
             // equivalent real value (x/z bits already folded to zero by
             // `as_bigint`). `BigInt::to_f64` is total (saturates huge

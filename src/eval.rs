@@ -179,7 +179,7 @@ fn steal_annotated_children<'a>(annot: &mut Annotated<'a>, out: &mut Vec<Annotat
 //
 // Real-result branches store `meta = None`; integer branches store
 // `Some(meta)` computed from the children's metas using the same combination
-// rules `infer_expr_meta` previously walked the tree for. The Select arm
+// rules the meta walkers previously re-derived from the tree. The Select arm
 // stays a leaf in the annotated tree — its index / range sub-expressions are
 // short, self-determined, and outside the chain spine, so re-walking them in
 // the legacy helpers is a non-issue for the O(N²) regression.
@@ -218,7 +218,6 @@ enum AnnotateCombiner<'a> {
     },
     Replication {
         expr: &'a Expr,
-        count_expr: &'a Expr,
         item_count: usize,
     },
     SystemCall {
@@ -305,7 +304,6 @@ pub(crate) fn annotate<'a>(root: &'a Expr, session: &Session) -> Result<Annotate
                 Expr::Replication { count, items } => {
                     work.push(AnnotateTask::Combine(AnnotateCombiner::Replication {
                         expr,
-                        count_expr: count,
                         item_count: items.len(),
                     }));
                     for item in items.iter().rev() {
@@ -535,13 +533,16 @@ fn annotate_combine<'a>(
                 kind: AnnotatedKind::Concatenation(item_annots),
             })
         }
-        AnnotateCombiner::Replication {
-            expr,
-            count_expr,
-            item_count,
-        } => {
+        AnnotateCombiner::Replication { expr, item_count } => {
             let item_annots = pop_n(vals, item_count);
             let count_annot = vals.pop().expect("Replication: count missing");
+            // Validate the count subtree before anything else: a real-typed
+            // count can still carry a structural error (task-in-expression,
+            // operator-on-real, $signed-on-real, $bitstoreal-width, ...),
+            // and that specific diagnostic must surface ahead of the
+            // generic "replication count cannot be real" the validator
+            // emits for plain real counts.
+            validate_annotated(&count_annot, session)?;
             // Width depends on the count's evaluated value. Skip the eager
             // evaluation when the count or any item is real-typed — the
             // validator surfaces "replication count cannot be real" /
@@ -551,7 +552,13 @@ fn annotate_combine<'a>(
             let count_value = if count_annot.is_real() || item_annots.iter().any(|i| i.is_real()) {
                 None
             } else {
-                Some(evaluate_replication_count_allow_zero(count_expr, session)?)
+                // The count is constant-evaluated here — before the
+                // whole-tree validate pass runs — because the width meta
+                // needs its value. Evaluators assume validated input
+                // (`unreachable!` on validator-rejected shapes like
+                // `1.0 % 2`); the validate_annotated call above guarantees
+                // that invariant holds.
+                Some(replication_count_value(&count_annot, session)?)
             };
             let mut inner_width = 0usize;
             let mut leftmost_base = Base::Binary;
@@ -707,18 +714,6 @@ fn reject_null_system_args(name: &str, args: &[SystemArg]) -> Result<(), String>
         Err(format!("{name} argument cannot be null"))
     } else {
         Ok(())
-    }
-}
-
-fn system_arg_expr<'a>(
-    name: &str,
-    args: &'a [SystemArg],
-    index: usize,
-) -> Result<&'a Expr, String> {
-    match args.get(index) {
-        Some(SystemArg::Expr(expr)) => Ok(expr),
-        Some(SystemArg::Null) => Err(format!("{name} argument cannot be null")),
-        None => Err(format!("{name} is missing argument {}", index + 1)),
     }
 }
 
@@ -1143,16 +1138,28 @@ fn apply_real_math_function(kind: MathFunctionKind, args: &[f64]) -> f64 {
     }
 }
 
+// Structural validation for one SelectKind sub-expression (bit-select
+// index, part-select endpoint, indexed base / width). Runs the same
+// annotate + validate_annotated pipeline the top-level entry points use —
+// the sub-expressions are short and self-determined, but deep chains
+// inside `a[1+1+...+1]` still need the iterative drivers. Errors return
+// unprefixed; the public entry points add the "Semantic error: " stage
+// prefix.
+fn validate_subexpr_structure(expr: &Expr, session: &Session) -> Result<(), String> {
+    let annotated = annotate(expr, session)?;
+    validate_annotated(&annotated, session)
+}
+
 fn validate_select_kind_structure(kind: &SelectKind, session: &Session) -> Result<(), String> {
     match kind {
-        SelectKind::Bit { index } => validate_expr_structure(index, session),
+        SelectKind::Bit { index } => validate_subexpr_structure(index, session),
         SelectKind::PartConst { msb, lsb } => {
-            validate_expr_structure(msb, session)?;
-            validate_expr_structure(lsb, session)
+            validate_subexpr_structure(msb, session)?;
+            validate_subexpr_structure(lsb, session)
         }
         SelectKind::PartIndexedUp { base, width } | SelectKind::PartIndexedDown { base, width } => {
-            validate_expr_structure(base, session)?;
-            validate_expr_structure(width, session)
+            validate_subexpr_structure(base, session)?;
+            validate_subexpr_structure(width, session)
         }
     }
 }
@@ -1176,369 +1183,13 @@ fn validate_select_expr_structure(
     Ok(())
 }
 
-// Iterative validator for raw `&Expr`. Used only on Select index / range
-// sub-expressions today (the modern annotate pipeline routes everything
-// else through `validate_annotated`), but a deep chain inside
-// `a[1+1+...+1]` still has to survive — so this gets the same flatten-
-// then-drain treatment as `validate_annotated`.
-//
-// `PostCheck` tasks defer node-local checks until after children's
-// subtrees have been validated, matching the original recursive
-// walker's diagnostic priority — e.g., for `~undef_var` the
-// "undeclared identifier" surfaces before the bitwise-on-real check
-// even has a chance to fire.
-enum ExprValidateTask<'a> {
-    Visit(&'a Expr),
-    PostCheck(ExprValidatePostCheck<'a>),
-    ConcatItem { item: &'a Expr, role: &'static str },
-    PostConcatItemRealCheck { item: &'a Expr, role: &'static str },
-    PostCollectBits { items: &'a [Expr] },
-}
-
-enum ExprValidatePostCheck<'a> {
-    UnaryOpReal {
-        op: UnaryOp,
-        operand: &'a Expr,
-    },
-    BinaryOpReal {
-        op: BinaryOp,
-        lhs: &'a Expr,
-        rhs: &'a Expr,
-    },
-    SignCastArgReal {
-        signed: bool,
-        arg: &'a Expr,
-    },
-    BaseCastArgReal {
-        base: Base,
-        arg: &'a Expr,
-    },
-    ItorArgReal {
-        arg: &'a Expr,
-    },
-    BitsToRealArgChecks {
-        arg: &'a Expr,
-    },
-    MathFunctionArgChecks {
-        kind: MathFunctionKind,
-        first_arg: &'a Expr,
-        whole: &'a Expr,
-    },
-    ReplicationCountReal {
-        count: &'a Expr,
-    },
-    /// Constant-evaluates the count and rejects negative / unknown-bits /
-    /// out-of-range values (and rejects zero in the strict variant).
-    /// Runs after Visit(count) has structurally validated the count
-    /// expression, and after every item has been validated.
-    ReplicationCountCheck {
-        count: &'a Expr,
-        count_check: fn(&Expr, &Session) -> Result<usize, String>,
-    },
-}
-
-fn validate_expr_structure(expr: &Expr, session: &Session) -> Result<(), String> {
-    let mut work: Vec<ExprValidateTask> = vec![ExprValidateTask::Visit(expr)];
-    while let Some(task) = work.pop() {
-        match task {
-            ExprValidateTask::Visit(node) => visit_expr_structure(node, &mut work, session)?,
-            ExprValidateTask::PostCheck(check) => match check {
-                ExprValidatePostCheck::UnaryOpReal { op, operand } => {
-                    if expression_is_real(operand, session)
-                        && matches!(
-                            op,
-                            UnaryOp::BitwiseNot
-                                | UnaryOp::ReductionAnd
-                                | UnaryOp::ReductionNand
-                                | UnaryOp::ReductionOr
-                                | UnaryOp::ReductionNor
-                                | UnaryOp::ReductionXor
-                                | UnaryOp::ReductionXnor
-                        )
-                    {
-                        return Err(format!(
-                            "operator {} not allowed on real operand",
-                            unary_op_name(op)
-                        ));
-                    }
-                }
-                ExprValidatePostCheck::BinaryOpReal { op, lhs, rhs } => {
-                    if expression_is_real(lhs, session) || expression_is_real(rhs, session) {
-                        match op {
-                            BinaryOp::Add
-                            | BinaryOp::Subtract
-                            | BinaryOp::Multiply
-                            | BinaryOp::Divide
-                            | BinaryOp::Power
-                            | BinaryOp::LessThan
-                            | BinaryOp::GreaterThan
-                            | BinaryOp::LessThanOrEqual
-                            | BinaryOp::GreaterThanOrEqual
-                            | BinaryOp::Equal
-                            | BinaryOp::NotEqual
-                            | BinaryOp::LogicalAnd
-                            | BinaryOp::LogicalOr => {}
-                            _ => {
-                                return Err(format!(
-                                    "operator {} not allowed on real operand",
-                                    binary_op_name(op)
-                                ));
-                            }
-                        }
-                    }
-                }
-                ExprValidatePostCheck::SignCastArgReal { signed, arg } => {
-                    if expression_is_real(arg, session) {
-                        return Err(format!(
-                            "{} argument cannot be real",
-                            if signed { "$signed" } else { "$unsigned" }
-                        ));
-                    }
-                }
-                ExprValidatePostCheck::BaseCastArgReal { base, arg } => {
-                    if expression_is_real(arg, session) {
-                        return Err(format!("{} argument cannot be real", base_cast_name(base)));
-                    }
-                }
-                ExprValidatePostCheck::ItorArgReal { arg } => {
-                    if expression_is_real(arg, session) {
-                        return Err("$itor argument cannot be real".to_string());
-                    }
-                }
-                ExprValidatePostCheck::BitsToRealArgChecks { arg } => {
-                    if expression_is_real(arg, session) {
-                        return Err("$bitstoreal argument cannot be real".to_string());
-                    }
-                    let arg_meta = infer_expr_meta(arg, session)?;
-                    if arg_meta.width != 64 {
-                        return Err(format!(
-                            "$bitstoreal argument must be 64 bits wide, got {}",
-                            arg_meta.width
-                        ));
-                    }
-                }
-                ExprValidatePostCheck::MathFunctionArgChecks {
-                    kind,
-                    first_arg,
-                    whole,
-                } => {
-                    if !kind.is_real_result() {
-                        if expression_is_real(first_arg, session) {
-                            return Err(format!("{} argument cannot be real", kind.name()));
-                        }
-                        let _ = infer_expr_meta(whole, session)?;
-                    }
-                }
-                ExprValidatePostCheck::ReplicationCountReal { count } => {
-                    if expression_is_real(count, session) {
-                        return Err("replication count cannot be real".to_string());
-                    }
-                }
-                ExprValidatePostCheck::ReplicationCountCheck { count, count_check } => {
-                    let _ = count_check(count, session)?;
-                }
-            },
-            ExprValidateTask::ConcatItem { item, role } => {
-                let unwrapped = unwrap_grouped(item);
-                if let Expr::Replication { count, items } = unwrapped {
-                    push_replication_validation_expr(
-                        count,
-                        items,
-                        evaluate_replication_count_allow_zero,
-                        &mut work,
-                    );
-                } else {
-                    work.push(ExprValidateTask::PostConcatItemRealCheck { item, role });
-                    work.push(ExprValidateTask::Visit(item));
-                }
-            }
-            ExprValidateTask::PostConcatItemRealCheck { item, role } => {
-                if expression_is_real(item, session) {
-                    return Err(format!("{role} operand cannot be real"));
-                }
-            }
-            ExprValidateTask::PostCollectBits { items } => {
-                let _ = collect_concatenation_bits(items, session)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn visit_expr_structure<'a>(
-    node: &'a Expr,
-    work: &mut Vec<ExprValidateTask<'a>>,
-    session: &Session,
-) -> Result<(), String> {
-    match node {
-        // MAX_BIT_WIDTH cap was historically gated in the parser, but
-        // `LiteralSpec` defers materialization to eval time precisely so
-        // this check can live in the validator phase. Without this gate,
-        // `9999999999999'd1` would parse cleanly (the spec carries width as
-        // a number, not bits) and only blow up at `materialize()` time.
-        Expr::Literal(spec) => value::ensure_bit_width(spec.width, "literal")?,
-        Expr::StringLiteral(bytes) => {
-            value::ensure_bit_width(bytes.len().max(1).saturating_mul(8), "string literal")?
-        }
-        Expr::RealLiteral(_) => {}
-        Expr::Grouped(inner) => work.push(ExprValidateTask::Visit(inner)),
-        Expr::Unary { op, expr } => {
-            work.push(ExprValidateTask::PostCheck(
-                ExprValidatePostCheck::UnaryOpReal {
-                    op: *op,
-                    operand: expr,
-                },
-            ));
-            work.push(ExprValidateTask::Visit(expr));
-        }
-        Expr::Binary { op, lhs, rhs } => {
-            work.push(ExprValidateTask::PostCheck(
-                ExprValidatePostCheck::BinaryOpReal { op: *op, lhs, rhs },
-            ));
-            work.push(ExprValidateTask::Visit(rhs));
-            work.push(ExprValidateTask::Visit(lhs));
-        }
-        Expr::Conditional {
-            cond,
-            then_expr,
-            else_expr,
-        } => {
-            work.push(ExprValidateTask::Visit(else_expr));
-            work.push(ExprValidateTask::Visit(then_expr));
-            work.push(ExprValidateTask::Visit(cond));
-        }
-        Expr::Concatenation { items } => {
-            work.push(ExprValidateTask::PostCollectBits { items });
-            for item in items.iter().rev() {
-                work.push(ExprValidateTask::ConcatItem {
-                    item,
-                    role: "concatenation",
-                });
-            }
-        }
-        Expr::Replication { count, items } => {
-            push_replication_validation_expr(count, items, evaluate_replication_count, work);
-        }
-        Expr::SystemCall { name, args } => {
-            // Classify resolves the name (surfacing "unknown system
-            // identifier" up front) and selects the per-kind structural
-            // checks. Arity is already enforced by `annotate` before
-            // structural validation runs, so a wrong-arity SystemCall
-            // never reaches here.
-            let kind = classify_system_call(name)?;
-            match kind {
-                SystemCallKind::Function(SystemFunction::SignCast { signed }) => {
-                    let arg = system_arg_expr(name, args, 0)?;
-                    work.push(ExprValidateTask::PostCheck(
-                        ExprValidatePostCheck::SignCastArgReal { signed, arg },
-                    ));
-                    work.push(ExprValidateTask::Visit(arg));
-                }
-                SystemCallKind::Function(SystemFunction::BaseCast(base)) => {
-                    let arg = system_arg_expr(name, args, 0)?;
-                    work.push(ExprValidateTask::PostCheck(
-                        ExprValidatePostCheck::BaseCastArgReal { base, arg },
-                    ));
-                    work.push(ExprValidateTask::Visit(arg));
-                }
-                SystemCallKind::Function(SystemFunction::RealConversion(conv_kind)) => {
-                    let arg = system_arg_expr(name, args, 0)?;
-                    match conv_kind {
-                        RealConversionKind::RealToInteger | RealConversionKind::RealToBits => {}
-                        RealConversionKind::IntegerToReal => {
-                            work.push(ExprValidateTask::PostCheck(
-                                ExprValidatePostCheck::ItorArgReal { arg },
-                            ));
-                        }
-                        RealConversionKind::BitsToReal => {
-                            work.push(ExprValidateTask::PostCheck(
-                                ExprValidatePostCheck::BitsToRealArgChecks { arg },
-                            ));
-                        }
-                    }
-                    work.push(ExprValidateTask::Visit(arg));
-                }
-                SystemCallKind::Function(SystemFunction::Math(math_kind)) => {
-                    let first_arg = system_arg_expr(name, args, 0)?;
-                    work.push(ExprValidateTask::PostCheck(
-                        ExprValidatePostCheck::MathFunctionArgChecks {
-                            kind: math_kind,
-                            first_arg,
-                            whole: node,
-                        },
-                    ));
-                    for arg in args.iter().rev() {
-                        match arg {
-                            SystemArg::Expr(arg) => work.push(ExprValidateTask::Visit(arg)),
-                            SystemArg::Null => {
-                                return Err(format!("{name} argument cannot be null"));
-                            }
-                        }
-                    }
-                }
-                SystemCallKind::Task(_) => return Err(task_in_expression_error(name)),
-            }
-        }
-        Expr::Identifier(name) => {
-            let reg = session
-                .lookup(name)
-                .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-            // Real identifiers route through the f64 pipeline, so the
-            // vector-only check would wrongly reject them here. Arrays
-            // are still rejected because their value-as-a-whole has no
-            // numeric type (LRM 4.9 only allows element selects).
-            if !reg.is_real() {
-                let _ = reg.require_vector(name)?;
-            }
-        }
-        Expr::Select { name, kind, inner } => {
-            validate_select_expr_structure(name, kind, inner.as_deref(), session)?;
-        }
-        Expr::Truncated => unreachable!(
-            "Expr::Truncated is a display-only sentinel; never reaches validate_expr_structure"
-        ),
-    }
-    Ok(())
-}
-
-fn push_replication_validation_expr<'a>(
-    count: &'a Expr,
-    items: &'a [Expr],
-    count_check: fn(&Expr, &Session) -> Result<usize, String>,
-    work: &mut Vec<ExprValidateTask<'a>>,
-) {
-    // Schedule the same sequence the recursive walker did:
-    //   1. Visit(count) — full structural recursion on count
-    //   2. PostCheck::ReplicationCountReal — local real-rejection
-    //   3. ConcatItem(item) for each item — recurses + role real-check
-    //   4. PostCollectBits + count_check  — final whole-replication checks
-    // The strict/lenient count_check choice is encoded in step 4 only;
-    // by the time we reach it, count's structural validation has
-    // succeeded, so feeding it to evaluate_replication_count{,_allow_zero}
-    // is safe.
-    work.push(ExprValidateTask::PostCollectBits { items });
-    work.push(ExprValidateTask::PostCheck(
-        ExprValidatePostCheck::ReplicationCountCheck { count, count_check },
-    ));
-    for item in items.iter().rev() {
-        work.push(ExprValidateTask::ConcatItem {
-            item,
-            role: "replication",
-        });
-    }
-    work.push(ExprValidateTask::PostCheck(
-        ExprValidatePostCheck::ReplicationCountReal { count },
-    ));
-    work.push(ExprValidateTask::Visit(count));
-}
-
-// Annotated counterpart to `validate_expr_structure`. Reads `is_real()` and
+// Static-semantic validator over the annotated tree. Reads `is_real()` and
 // `meta()` from precomputed annotations instead of re-walking every Binary
 // node's lhs/rhs to ask the same questions, dropping the old O(N²) helper-walk
-// pattern to O(N) on long chains. Sub-expressions that aren't annotated yet
-// (index / range expressions inside `SelectKind`) are still validated by the
-// legacy `validate_expr_structure` — those are short, self-determined, and
-// outside the chain spine that drove the regression.
+// pattern to O(N) on long chains. `SelectKind` index / range sub-expressions
+// hang off `Leaf` nodes and re-enter this same pipeline through
+// `validate_subexpr_structure` — they're short and self-determined, outside
+// the chain spine that drove the regression.
 // Iterative implementation. Each parent's node-local checks (real-operand
 // rejection, $bitstoreal width, $clog2 real-arg, replication count_check,
 // concatenation bit-collection) run eagerly at Visit time, then child
@@ -1572,6 +1223,16 @@ enum AnnValidateTask<'b, 'a: 'b> {
         item: &'b Annotated<'a>,
         role: &'static str,
     },
+    /// Constant-evaluates a replication count and applies the
+    /// position-sensitive zero rule (strict rejects zero, lenient allows
+    /// it). Scheduled *after* `Visit(count)` so the count's structure is
+    /// validated before any evaluation runs — the evaluator assumes
+    /// validated input and would trip its invariants on a count like
+    /// `1.0 % 2`.
+    PostEvalReplicationCount {
+        count: &'b Annotated<'a>,
+        strict: bool,
+    },
     /// Final pass for a Concatenation/Replication node, run after every
     /// item has been structurally validated. Enforces LRM 5.1.14's two
     /// list-level constraints:
@@ -1582,7 +1243,7 @@ enum AnnValidateTask<'b, 'a: 'b> {
     ///
     /// Both reads are cached on the Annotated children, so this is O(N)
     /// in the operand count rather than O(N) in the subtree size — the
-    /// O(N²) re-walk that used to live in `collect_concatenation_bits`
+    /// O(N²) re-walk that used to collect concatenation bits eagerly
     /// is gone. The variant carries `&[Annotated]` directly; raw `&Expr`
     /// is no longer needed since width comes from cached meta.
     PostCheckConcatWidth {
@@ -1599,7 +1260,7 @@ fn validate_annotated(annot: &Annotated, session: &Session) -> Result<(), String
                 let unwrapped = unwrap_grouped_annotated(item);
                 if let AnnotatedKind::Replication { count, items } = &unwrapped.kind {
                     push_replication_validation_annotated(
-                        count, items, /* strict = */ false, &mut work, session,
+                        count, items, /* strict = */ false, &mut work,
                     )?;
                 } else {
                     // Schedule Visit first (surfaces system-task / structural
@@ -1611,6 +1272,15 @@ fn validate_annotated(annot: &Annotated, session: &Session) -> Result<(), String
             AnnValidateTask::PostConcatItemRealCheck { item, role } => {
                 if item.is_real() {
                     return Err(format!("{role} operand cannot be real"));
+                }
+            }
+            AnnValidateTask::PostEvalReplicationCount { count, strict } => {
+                // Runs after Visit(count) has structurally validated the
+                // count subtree, so the evaluator's validated-input
+                // invariants hold.
+                let count_value = replication_count_value(count, session)?;
+                if strict && count_value == 0 {
+                    return Err("replication count must be positive in this context".to_string());
                 }
             }
             AnnValidateTask::PostCheckConcatWidth { items } => {
@@ -1745,7 +1415,7 @@ fn visit_annotated<'b, 'a: 'b>(
             // before the indefinite-width / positive-width checks —
             // matching the original recursive walker's diagnostic
             // priority. Width is read from cached meta(), so this no
-            // longer re-walks subtrees the way `collect_concatenation_bits`
+            // longer re-walks subtrees the way the eager bit-collection
             // did.
             work.push(AnnValidateTask::PostCheckConcatWidth { items });
             for item in items.iter().rev() {
@@ -1756,9 +1426,7 @@ fn visit_annotated<'b, 'a: 'b>(
             }
         }
         AnnotatedKind::Replication { count, items } => {
-            push_replication_validation_annotated(
-                count, items, /* strict = */ true, work, session,
-            )?;
+            push_replication_validation_annotated(count, items, /* strict = */ true, work)?;
         }
         AnnotatedKind::SignCast { signed, arg } => {
             if arg.is_real() {
@@ -1815,42 +1483,20 @@ fn push_replication_validation_annotated<'b, 'a: 'b>(
     items: &'b [Annotated<'a>],
     strict: bool,
     work: &mut Vec<AnnValidateTask<'b, 'a>>,
-    session: &Session,
 ) -> Result<(), String> {
-    // The original recursive validator did:
-    //   1. validate(count)        // structural recursion
-    //   2. real-check count       // local
-    //   3. validate each item     // structural recursion
-    //   4. count_check            // constant-eval count
-    //   5. collect_concat_bits    // evaluate each item & combine
-    // We keep the ordering: real-check runs first (cheap, local); the
-    // eager count constant-eval runs before pushing the count's Visit
-    // (mirroring how the legacy walker called `count_check` outside the
-    // recursion); items are validated via ConcatItem; the final
-    // indefinite-width / positive-width check fires through
-    // PostCheckConcatWidth.
+    // Execution order (work stack is LIFO): Visit(count) validates the
+    // count's structure first; PostEvalReplicationCount then constant-
+    // evaluates it; items follow via ConcatItem; PostCheckConcatWidth
+    // runs the list-level width checks last. The count evaluation must
+    // not run ahead of Visit(count) — the evaluator assumes validated
+    // input, and an unvalidated count like `1.0 % 2` would trip its
+    // invariants instead of surfacing the real-operand diagnostic.
     //
-    // The count is evaluated through `evaluate_annotated` (iterative)
-    // rather than the legacy recursive `evaluate_expr_in_context`, so a
-    // deep arithmetic chain inside the count no longer crashes.
-    // `strict = true` rejects count = 0 (top-level replication); `strict
-    // = false` allows zero (replication directly inside a concat list).
+    // `strict = true` rejects count = 0 (top-level replication);
+    // `strict = false` allows zero (replication directly inside a
+    // concatenation list, LRM 5.1.14).
     if count.is_real() {
         return Err("replication count cannot be real".to_string());
-    }
-    let count_val = evaluate_annotated(count, None, session)?;
-    if count_val.has_unknown_bits() {
-        return Err("replication count contains unknown bits".to_string());
-    }
-    let count_bigint = count_val.as_bigint(count_val.signed);
-    if count_bigint.sign() == Sign::Minus {
-        return Err("replication count must be non-negative".to_string());
-    }
-    let count_usize = count_bigint
-        .to_usize()
-        .ok_or_else(|| "replication count too large".to_string())?;
-    if strict && count_usize == 0 {
-        return Err("replication count must be positive in this context".to_string());
     }
     work.push(AnnValidateTask::PostCheckConcatWidth { items });
     for item in items.iter().rev() {
@@ -1859,6 +1505,7 @@ fn push_replication_validation_annotated<'b, 'a: 'b>(
             role: "replication",
         });
     }
+    work.push(AnnValidateTask::PostEvalReplicationCount { count, strict });
     work.push(AnnValidateTask::Visit(count));
     Ok(())
 }
@@ -2212,7 +1859,7 @@ enum EvalCombiner<'b, 'a: 'b> {
     /// (`item_count` IntegerValues on top of the stack). Joins them into
     /// `inner_bits` and replicates `count` times. In strict mode (top-
     /// level) an empty `inner_bits` is rejected with the same diagnostic
-    /// the legacy `collect_concatenation_bits` emitted; in lenient mode
+    /// the concatenation combine emits; in lenient mode
     /// (inside a concat) the result is allowed to be zero-width.
     ReplicationFinalize {
         item_count: usize,
@@ -2738,7 +2385,7 @@ fn visit_eval<'b, 'a: 'b>(
         AnnotatedKind::Concatenation(items) => {
             // `meta()` is the cached LRM 5.1.14 meta computed in
             // `annotate`'s Combine; reading items[0]'s base is O(1) and
-            // replaces the legacy `infer_expr_meta(items[0])` re-walk.
+            // replaces a per-call subtree re-walk for the leftmost item.
             let leftmost_base = items[0].meta().base;
             work.push(EvalTask::Combine(EvalCombiner::Concatenation {
                 item_count: items.len(),
@@ -3921,306 +3568,6 @@ fn compute_equality_from_values(
     widen_relational_result(comparison_result_value(bit), context)
 }
 
-// CES-style iterative implementation. Parent shapes (Grouped, Unary
-// width-preserving, Binary, Conditional, Concatenation, Replication,
-// SignCast, BaseCast) push a Combine task that knows how to fold their
-// children's metas; leaves push their meta directly onto `vals`. Each
-// node contributes O(1) Rust stack depth.
-enum InferMetaTask<'a> {
-    Visit(&'a Expr),
-    Combine(InferMetaCombiner<'a>),
-}
-
-enum InferMetaCombiner<'a> {
-    GroupedOrPropagate,
-    Binary {
-        op: BinaryOp,
-    },
-    Conditional,
-    Concatenation {
-        item_count: usize,
-    },
-    // Replication's count expression is self-determined and gets evaluated
-    // at combine time (the iterative `evaluate_constant_expr` path is the
-    // recursion break). We carry the original count expression for that
-    // call.
-    Replication {
-        count_expr: &'a Expr,
-        item_count: usize,
-    },
-    SignCast {
-        signed: bool,
-    },
-    BaseCast {
-        base: Base,
-    },
-}
-
-fn infer_expr_meta(expr: &Expr, session: &Session) -> Result<ExprMeta, String> {
-    let mut work: Vec<InferMetaTask> = vec![InferMetaTask::Visit(expr)];
-    let mut vals: Vec<ExprMeta> = Vec::new();
-
-    while let Some(task) = work.pop() {
-        match task {
-            InferMetaTask::Visit(node) => match node {
-                Expr::Literal(value) => vals.push(ExprMeta {
-                    width: value.width,
-                    signed: value.signed,
-                    base: value.base,
-                }),
-                Expr::StringLiteral(bytes) => {
-                    let spec = string_literal_spec(bytes);
-                    vals.push(ExprMeta {
-                        width: spec.width,
-                        signed: spec.signed,
-                        base: spec.base,
-                    });
-                }
-                // Real has no width/sign/base; reaching this branch means
-                // an integer-pipeline operator looked at a real-typed
-                // sub-expression for context, which the dispatch should
-                // have prevented.
-                Expr::RealLiteral(_) => {
-                    return Err("real value has no integer width or signedness".to_string());
-                }
-                Expr::Grouped(inner) => {
-                    work.push(InferMetaTask::Combine(
-                        InferMetaCombiner::GroupedOrPropagate,
-                    ));
-                    work.push(InferMetaTask::Visit(inner));
-                }
-                Expr::Unary { op, expr: operand } => match op {
-                    UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitwiseNot => {
-                        work.push(InferMetaTask::Combine(
-                            InferMetaCombiner::GroupedOrPropagate,
-                        ));
-                        work.push(InferMetaTask::Visit(operand));
-                    }
-                    UnaryOp::LogicalNot
-                    | UnaryOp::ReductionAnd
-                    | UnaryOp::ReductionNand
-                    | UnaryOp::ReductionOr
-                    | UnaryOp::ReductionNor
-                    | UnaryOp::ReductionXor
-                    | UnaryOp::ReductionXnor => vals.push(ExprMeta {
-                        width: 1,
-                        signed: false,
-                        base: Base::Binary,
-                    }),
-                },
-                Expr::Binary { op, lhs, rhs } => {
-                    work.push(InferMetaTask::Combine(InferMetaCombiner::Binary {
-                        op: *op,
-                    }));
-                    work.push(InferMetaTask::Visit(rhs));
-                    work.push(InferMetaTask::Visit(lhs));
-                }
-                // LRM 5.1.13: cond is self-determined and contributes nothing
-                // to the result meta; then/else are context-determined and
-                // unify width (max) and signedness (any unsigned → unsigned,
-                // §5.5.1).
-                Expr::Conditional {
-                    then_expr,
-                    else_expr,
-                    ..
-                } => {
-                    work.push(InferMetaTask::Combine(InferMetaCombiner::Conditional));
-                    work.push(InferMetaTask::Visit(else_expr));
-                    work.push(InferMetaTask::Visit(then_expr));
-                }
-                // LRM 5.1.14: width = sum of operand widths, always
-                // unsigned. Base follows leftmost-wins.
-                Expr::Concatenation { items } => {
-                    work.push(InferMetaTask::Combine(InferMetaCombiner::Concatenation {
-                        item_count: items.len(),
-                    }));
-                    for item in items.iter().rev() {
-                        work.push(InferMetaTask::Visit(item));
-                    }
-                }
-                // Replication width depends on the constant count value, so
-                // we evaluate it eagerly at Combine time. The lenient count
-                // helper accepts zero — that's structurally valid and the
-                // per-position constraint is enforced separately by
-                // `evaluate_replication_expr` / `collect_concatenation_bits`.
-                Expr::Replication { count, items } => {
-                    work.push(InferMetaTask::Combine(InferMetaCombiner::Replication {
-                        count_expr: count,
-                        item_count: items.len(),
-                    }));
-                    for item in items.iter().rev() {
-                        work.push(InferMetaTask::Visit(item));
-                    }
-                }
-                // `$name(args)`: dispatch by classified kind. Sign /
-                // base casts inherit width / base from the argument.
-                // LRM 17.8: $rtoi → 32-bit signed; $realtobits → 64-bit
-                // unsigned hex; the real-result variants ($itor / $bitstoreal)
-                // shouldn't reach the integer pipeline. LRM 17.11:
-                // $clog2 yields 32-bit signed; real-result math functions
-                // have no integer meta. Tasks reject up-front.
-                Expr::SystemCall { name, args } => {
-                    let kind = classify_system_call(name)?;
-                    match kind {
-                        SystemCallKind::Function(SystemFunction::SignCast { signed }) => {
-                            work.push(InferMetaTask::Combine(InferMetaCombiner::SignCast {
-                                signed,
-                            }));
-                            work.push(InferMetaTask::Visit(system_arg_expr(name, args, 0)?));
-                        }
-                        SystemCallKind::Function(SystemFunction::BaseCast(base)) => {
-                            work.push(InferMetaTask::Combine(InferMetaCombiner::BaseCast { base }));
-                            work.push(InferMetaTask::Visit(system_arg_expr(name, args, 0)?));
-                        }
-                        SystemCallKind::Function(SystemFunction::RealConversion(conv_kind)) => {
-                            match conv_kind {
-                                RealConversionKind::RealToInteger => vals.push(ExprMeta {
-                                    width: 32,
-                                    signed: true,
-                                    base: Base::Decimal,
-                                }),
-                                RealConversionKind::RealToBits => vals.push(ExprMeta {
-                                    width: 64,
-                                    signed: false,
-                                    base: Base::Hex,
-                                }),
-                                RealConversionKind::IntegerToReal
-                                | RealConversionKind::BitsToReal => {
-                                    return Err(
-                                        "real value has no integer width or signedness".to_string()
-                                    );
-                                }
-                            }
-                        }
-                        SystemCallKind::Function(SystemFunction::Math(math_kind)) => {
-                            if math_kind.is_real_result() {
-                                return Err(
-                                    "real value has no integer width or signedness".to_string()
-                                );
-                            }
-                            vals.push(ExprMeta {
-                                width: 32,
-                                signed: true,
-                                base: Base::Decimal,
-                            });
-                        }
-                        SystemCallKind::Task(_) => return Err(task_in_expression_error(name)),
-                    }
-                }
-                // A reg's meta is exactly the IntegerValue's stored
-                // (width, signed, base) — same shape `Expr::Literal`
-                // produces from its value.
-                Expr::Identifier(name) => {
-                    let reg = session
-                        .lookup(name)
-                        .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-                    let value = reg.require_vector(name)?;
-                    vals.push(ExprMeta {
-                        width: value.width,
-                        signed: value.signed,
-                        base: value.base,
-                    });
-                }
-                // Select width is fixed by its form; index/range
-                // sub-expressions stay outside this fold (handled by
-                // `infer_select_meta` directly). Selects are always
-                // leaf-shaped from this function's perspective.
-                Expr::Select { name, kind, inner } => {
-                    vals.push(infer_select_meta(name, kind, inner.as_deref(), session)?);
-                }
-                Expr::Truncated => unreachable!(
-                    "Expr::Truncated is a display-only sentinel; never reaches infer_expr_meta"
-                ),
-            },
-            InferMetaTask::Combine(combiner) => match combiner {
-                InferMetaCombiner::GroupedOrPropagate => {
-                    // Grouped + width-preserving Unary (+, -, ~) propagate the
-                    // child meta verbatim. The child is already on top of
-                    // `vals`; nothing to do.
-                }
-                InferMetaCombiner::Binary { op } => {
-                    let rhs_meta = vals.pop().expect("Binary infer: rhs missing");
-                    let lhs_meta = vals.pop().expect("Binary infer: lhs missing");
-                    vals.push(combine_binary_meta(op, lhs_meta, rhs_meta));
-                }
-                InferMetaCombiner::Conditional => {
-                    let else_meta = vals.pop().expect("Conditional infer: else missing");
-                    let then_meta = vals.pop().expect("Conditional infer: then missing");
-                    vals.push(ExprMeta {
-                        width: usize::max(then_meta.width, else_meta.width),
-                        signed: then_meta.signed && else_meta.signed,
-                        base: then_meta.base,
-                    });
-                }
-                InferMetaCombiner::Concatenation { item_count } => {
-                    let start = vals.len() - item_count;
-                    let items: Vec<ExprMeta> = vals.drain(start..).collect();
-                    let mut total_width = 0usize;
-                    let mut leftmost_base = Base::Binary;
-                    for (idx, m) in items.iter().enumerate() {
-                        total_width = total_width.saturating_add(m.width);
-                        if idx == 0 {
-                            leftmost_base = m.base;
-                        }
-                    }
-                    vals.push(ExprMeta {
-                        width: total_width,
-                        signed: false,
-                        base: leftmost_base,
-                    });
-                }
-                InferMetaCombiner::Replication {
-                    count_expr,
-                    item_count,
-                } => {
-                    let start = vals.len() - item_count;
-                    let items: Vec<ExprMeta> = vals.drain(start..).collect();
-                    let count = evaluate_replication_count_allow_zero(count_expr, session)?;
-                    let mut inner_width = 0usize;
-                    let mut leftmost_base = Base::Binary;
-                    for (idx, m) in items.iter().enumerate() {
-                        inner_width = inner_width.saturating_add(m.width);
-                        if idx == 0 {
-                            leftmost_base = m.base;
-                        }
-                    }
-                    vals.push(ExprMeta {
-                        width: inner_width.saturating_mul(count),
-                        signed: false,
-                        base: leftmost_base,
-                    });
-                }
-                InferMetaCombiner::SignCast { signed } => {
-                    let arg_meta = vals.pop().expect("SignCast infer: arg missing");
-                    vals.push(ExprMeta {
-                        width: arg_meta.width,
-                        signed,
-                        base: arg_meta.base,
-                    });
-                }
-                InferMetaCombiner::BaseCast { base } => {
-                    let arg_meta = vals.pop().expect("BaseCast infer: arg missing");
-                    vals.push(ExprMeta {
-                        width: arg_meta.width,
-                        signed: arg_meta.signed,
-                        base,
-                    });
-                }
-            },
-        }
-    }
-
-    debug_assert_eq!(
-        vals.len(),
-        1,
-        "infer_expr_meta produced {} values",
-        vals.len()
-    );
-    Ok(vals
-        .pop()
-        .expect("driver invariant: one root produces one meta"))
-}
-
 fn infer_select_meta(
     name: &str,
     kind: &SelectKind,
@@ -4530,18 +3877,21 @@ fn is_indefinite_width(expr: &Expr) -> bool {
 // Replication count must be a constant, non-negative, non-x, non-z value
 // (LRM 5.1.14). `to_usize` doubles as the "fits in addressable space" check;
 // vcal uses `usize` for widths, so an oversized count surfaces as a clean
-// error rather than overflowing. Zero is allowed at parse-meta level — the
+// error rather than overflowing. Zero is allowed here — the
 // position-sensitive rule (zero is valid only inside a concatenation whose
-// other operands sum to positive width) is enforced separately in
-// `evaluate_replication_count` (top-level) and `collect_concatenation_bits`
-// (the surrounding-list check).
-fn evaluate_replication_count_allow_zero(
-    count_expr: &Expr,
-    session: &Session,
-) -> Result<usize, String> {
+// other operands sum to positive width) is enforced separately by the
+// validator's strict count check (top-level replication) and the lenient
+// concat-item dispatch (`push_concat_item_eval`).
+//
+// Operates on an already-annotated count subtree. Both callers validate the
+// count before getting here (annotate's Replication combine runs
+// `validate_annotated` on the count first; the validator schedules this after
+// `Visit(count)`), so the `evaluate_annotated` call below runs on validated
+// input and can't trip the evaluator's real-operand invariants.
+fn replication_count_value(count: &Annotated<'_>, session: &Session) -> Result<usize, String> {
     // Route through the iterative annotated driver so a deep
     // `{(1+1+...+1){...}}` count chain stays off the C stack.
-    let value = evaluate_subexpr_as_integer(count_expr, session)?;
+    let value = evaluate_annotated(count, None, session)?;
     if value.has_unknown_bits() {
         return Err("replication count contains unknown bits".to_string());
     }
@@ -4552,18 +3902,6 @@ fn evaluate_replication_count_allow_zero(
     count
         .to_usize()
         .ok_or_else(|| "replication count too large".to_string())
-}
-
-// Strict variant: a top-level replication (one whose result is the whole
-// expression, or whose only consumers are non-concatenation operators) needs
-// a positive count, since it would otherwise produce a zero-width
-// `IntegerValue` in a position where vcal can't represent it.
-fn evaluate_replication_count(count_expr: &Expr, session: &Session) -> Result<usize, String> {
-    let count = evaluate_replication_count_allow_zero(count_expr, session)?;
-    if count == 0 {
-        return Err("replication count must be positive in this context".to_string());
-    }
-    Ok(count)
 }
 
 // Walk through `Grouped` wrappers without evaluating. Used so that
@@ -4577,73 +3915,6 @@ pub(crate) fn unwrap_grouped(expr: &Expr) -> &Expr {
         cur = inner;
     }
     cur
-}
-
-// Joins the bit patterns of every item in a concatenation list (used both
-// for plain `{a, b, ...}` and for the inner list of `{N{a, b, ...}}`).
-//
-// LRM 5.1.14 lets a replication's count be zero when it sits directly inside
-// a concatenation — the zero-rep contributes no bits, but the surrounding
-// list must still have at least one operand of positive size. So we
-// special-case Replication items here (looking through `Grouped`) to permit
-// a zero count, then verify the joined width is non-zero. This rejects
-// `{ {0{1'b1}} }` and `{N{ {0{1'b1}} }}` (no positive-size sibling) while
-// accepting `{ {0{1'b1}}, 1'b1 }` and `{N{ {0{1'b1}}, 1'b1 }}`.
-fn collect_concatenation_bits(items: &[Expr], session: &Session) -> Result<Vec<LogicBit>, String> {
-    if items.is_empty() {
-        return Err("concatenation requires at least one operand".to_string());
-    }
-    for item in items {
-        if is_indefinite_width(item) {
-            return Err("concatenation operand has indefinite width".to_string());
-        }
-    }
-    // Items are in source order (leftmost first → MSB-side). Our bit vectors
-    // are LSB-first, so we feed bits starting from the rightmost item.
-    // Cap the running total after each item so a `{a, a, a, ...}` concat
-    // inside replication rejects before the inner buffer ever gets near
-    // the OS allocator. saturating_add keeps usize overflow from masking
-    // the cap.
-    let mut bits = Vec::new();
-    for item in items.iter().rev() {
-        let item_bits = evaluate_concatenation_item_bits(item, session)?;
-        let total = bits.len().saturating_add(item_bits.len());
-        value::ensure_bit_width(total, "concatenation")
-            .map_err(|e| format!("Semantic error: {e}"))?;
-        bits.extend(item_bits);
-    }
-    if bits.is_empty() {
-        // Every operand collapsed to zero width — the concatenation has no
-        // positive-size operand, which is the case LRM 5.1.14 forbids.
-        return Err("concatenation must have at least one operand with positive size".to_string());
-    }
-    Ok(bits)
-}
-
-fn evaluate_concatenation_item_bits(
-    item: &Expr,
-    session: &Session,
-) -> Result<Vec<LogicBit>, String> {
-    if let Expr::Replication { count, items } = unwrap_grouped(item) {
-        let count = evaluate_replication_count_allow_zero(count, session)?;
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        let inner_bits = collect_concatenation_bits(items, session)?;
-        let total = inner_bits.len().saturating_mul(count);
-        value::ensure_bit_width(total, "replication")
-            .map_err(|e| format!("Semantic error: {e}"))?;
-        let mut bits = Vec::with_capacity(total);
-        for _ in 0..count {
-            bits.extend(inner_bits.iter().copied());
-        }
-        return Ok(bits);
-    }
-    // Route through the iterative annotated driver so a deep concat
-    // item (e.g. `{1+1+...+1}` in a validator pre-collect) stays off
-    // the C stack.
-    let value = evaluate_subexpr_as_integer(item, session)?;
-    Ok(value.bits)
 }
 
 // Concatenation/replication results are unsigned; if an outer context is
@@ -5381,7 +4652,7 @@ pub(crate) fn evaluate_lvalue_assignment(
     session: &Session,
 ) -> Result<(HashMap<String, RegValue>, IntegerValue), String> {
     // `lvalue_meta` plays the structural pre-pass role for LValues (the same
-    // job `validate_expr_structure` does for RValues), so its errors carry
+    // job `validate_annotated` does for RValues), so its errors carry
     // the "Semantic error: " stage prefix to stay consistent with the RHS
     // path. The RHS is prefixed via `evaluate_assignment_rhs` -> `semantic_check`.
     let meta = lvalue_meta(lvalue, session).map_err(|e| format!("Semantic error: {e}"))?;
@@ -5430,8 +4701,8 @@ pub(crate) fn evaluate_lvalue_assignment(
 // direction / scalar-reg / indexed-width checks the RHS select helpers
 // do, so any structural problem on the LHS surfaces before the RHS is
 // even looked at. Returning an `ExprMeta` keeps the call shape parallel
-// to `infer_expr_meta` so the surrounding context-propagation story
-// stays one-paradigm.
+// to the annotated tree's cached metas so the surrounding
+// context-propagation story stays one-paradigm.
 //
 // Iterative CES driver to handle `{{{...a}}}` deep-concat lvalues
 // without overflowing the C stack on a recursive `lvalue_meta(item)`.

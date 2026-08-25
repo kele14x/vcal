@@ -12,8 +12,8 @@ use crate::{Session, evaluate_input, parse_input, parse_input_with_depth};
 fn huge_sized_literal_width_rejected() {
     // FINDINGS.md #2 repro 1: 10 trillion-bit literal. The parser builds a
     // LiteralSpec carrying width=9999999999999 without allocating it;
-    // validate_expr_structure runs ensure_bit_width before the evaluator
-    // would try to materialize.
+    // the validator's literal-leaf arm runs ensure_bit_width before the
+    // evaluator would try to materialize.
     let err = evaluate_input("9999999999999'd1").unwrap_err();
     assert_eq!(
         err,
@@ -187,8 +187,8 @@ fn concatenation_of_wide_operands_at_cap_accepted() {
 fn nested_concat_inside_replication_rejected_at_inner_concat() {
     // `{N{...wide concat...}}` would balloon the replication-side
     // multiplier, but the inner concat itself trips the gate first —
-    // confirming collect_concatenation_bits enforces the running total
-    // before it ever returns to the replication multiplier.
+    // confirming the concatenation combine enforces the width cap before
+    // the replication multiplier gets a chance.
     let mut session = Session::new();
     session
         .eval("reg [9000000:0] a;")

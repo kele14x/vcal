@@ -1018,7 +1018,7 @@ pub(crate) fn parse_statements(input: &str) -> Result<(Vec<Stmt>, bool), String>
 
 impl<'a> Parser<'a> {
     fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_expr_bp(0)
+        self.parse_expr_bp()
     }
 
     // Iterative shift-reduce Pratt parser. Replaces the recursive Pratt
@@ -1041,12 +1041,8 @@ impl<'a> Parser<'a> {
     // Same parse tree as the recursive version: left-associativity and
     // right-associative `?:` come from the (lbp, rbp) table; `**` is left-
     // associative; precedence ordering matches LRM Table 5-4.
-    //
-    // The `min_bp` parameter is kept for API compatibility but only ever
-    // called as `parse_expr_bp(0)` from `parse_expression`. The state
-    // machine's local `min_bp` variable is what does the actual work.
-    fn parse_expr_bp(&mut self, initial_min_bp: u8) -> Result<Expr, String> {
-        let mut min_bp = initial_min_bp;
+    fn parse_expr_bp(&mut self) -> Result<Expr, String> {
+        let mut min_bp = 0u8;
         let mut stack: Vec<Pending> = Vec::new();
         let mut value: Option<Expr> = None;
 

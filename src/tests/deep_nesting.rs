@@ -4,8 +4,8 @@ use crate::{Session, evaluate_input};
 #[test]
 fn long_addition_chain_evaluates_without_quadratic_blowup() {
     // Regression for the O(N²) helper-walk pattern: validation and
-    // evaluation used to call `expression_is_real` and `infer_expr_meta`
-    // on lhs/rhs at every Binary node, each one a fresh recursive
+    // evaluation used to re-derive real-typedness and result meta by
+    // walking lhs/rhs at every Binary node, each one a fresh recursive
     // subtree walk. The annotated-AST refactor caches both up front so
     // each chain level is O(1).
     //
@@ -260,9 +260,8 @@ fn semantic_check_of_deep_grouped_does_not_overflow() {
 
 #[test]
 fn semantic_check_of_deep_binary_does_not_overflow() {
-    // Exercises validate_annotated's Binary arm + the iterative
-    // expression_is_real / infer_expr_meta walks that fire for binary
-    // operators with real-rejection rules.
+    // Exercises validate_annotated's Binary arm, where the real-operand
+    // rejection rule reads the children's cached annotations at depth.
     let mut e = Expr::Literal(parse_integer("1").expect("literal should parse"));
     for _ in 0..100_000 {
         e = Expr::Binary {
@@ -455,10 +454,10 @@ fn deep_select_index_chain_evaluates() {
 //
 // Pre-fix: `evaluate_annotated`'s CES driver fell through to the
 // recursive `evaluate_expr_in_context` for `AnnotatedKind::Concatenation`,
-// and `validate_annotated`'s `PostCollectBits` task re-entered the
-// recursive `collect_concatenation_bits`. Both walkers re-walked nested
+// and `validate_annotated`'s eager bit-collection task re-entered the
+// recursive concatenation walker. Both walkers re-walked nested
 // items per level, which combined a stack-overflow risk with O(N²)
-// re-walk cost (`infer_expr_meta(items[0])` + `is_indefinite_width(item)`
+// re-walk cost (leftmost-item meta inference + `is_indefinite_width(item)`
 // per concat level). Post-fix: the eval CES handles Concatenation /
 // Replication directly off cached `Annotated::meta()`, and validation
 // reads the cached widths without re-walking.
@@ -483,9 +482,8 @@ fn semantic_check_of_deep_concatenation_does_not_overflow() {
     // semantic_check = annotate + validate_annotated. The validator
     // dispatches each concat via ConcatItem (iterative) and the new
     // PostCheckConcatWidth reads the cached `meta().width` rather than
-    // re-walking. Pre-fix this overflowed via `PostCollectBits` →
-    // `collect_concatenation_bits` → `evaluate_concatenation_item_bits`
-    // → recursive `evaluate_concatenation_expr`.
+    // re-walking. Pre-fix this overflowed via the eager bit-collection
+    // task re-entering the recursive concatenation walker.
     let mut e = Expr::Literal(parse_integer("1'b1").expect("literal should parse"));
     for _ in 0..100_000 {
         e = Expr::Concatenation { items: vec![e] };

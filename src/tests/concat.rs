@@ -290,6 +290,103 @@ fn replication_rejects_unknown_count() {
     );
 }
 
+// Regression (P1): annotate() constant-evaluates a replication's count to
+// derive the width meta. That evaluation must not run ahead of validation —
+// an invalid count (real operand of an integer-only op, or a concat of real
+// items) used to reach the evaluator's validated-input `unreachable!` and
+// panic instead of surfacing a clean diagnostic. The count subtree is now
+// validated before it is evaluated, in both the select-subexpression path
+// and the top-level path.
+#[test]
+fn replication_count_with_real_binary_operand_is_a_clean_error() {
+    // Top-level: the count `1.0 % 2` applies `%` to a real operand.
+    let err = evaluate_input("{(1.0 % 2){1}}").expect_err("real % in count");
+    assert_eq!(
+        err,
+        "Semantic error: operator % not allowed on real operand"
+    );
+}
+
+#[test]
+fn replication_count_concat_of_real_is_a_clean_error() {
+    // Top-level: the count `({1.0})` is a concatenation whose operand is
+    // real — concatenation requires definite bit widths.
+    let err = evaluate_input("{({1.0}){1}}").expect_err("real concat in count");
+    assert_eq!(err, "Semantic error: concatenation operand cannot be real");
+}
+
+#[test]
+fn invalid_replication_count_in_select_index_is_a_clean_error() {
+    // The select-subexpression position routes through the same eager
+    // count evaluation via validate_subexpr_structure; it must produce the
+    // same diagnostics, not panic.
+    let mut session = Session::new();
+    session.eval("reg [7:0] a").expect("decl");
+
+    let real_op = session
+        .eval("a[{(1.0 % 2){1}}]")
+        .expect_err("real % in select-index count");
+    assert_eq!(
+        real_op,
+        "Semantic error: operator % not allowed on real operand"
+    );
+
+    let real_concat = session
+        .eval("a[{({1.0}){1}}]")
+        .expect_err("real concat in select-index count");
+    assert_eq!(
+        real_concat,
+        "Semantic error: concatenation operand cannot be real"
+    );
+}
+
+#[test]
+fn real_typed_count_with_structural_error_keeps_specific_diagnostic() {
+    // A real-typed count skips the eager constant-evaluation, but its
+    // subtree is still validated — the specific structural diagnostic
+    // must surface ahead of the generic "replication count cannot be
+    // real". Covers the four count shapes that are real-typed *because*
+    // of the error they contain.
+    let mut session = Session::new();
+    session.eval("reg [7:0] a").expect("decl");
+
+    let task = session.eval("a[{($finish){1}}]").expect_err("task count");
+    assert_eq!(
+        task,
+        "Semantic error: $finish() is a system task, it cannot be called as a function."
+    );
+
+    let op_on_real = session.eval("a[{(~1.0){1}}]").expect_err("~ on real count");
+    assert_eq!(
+        op_on_real,
+        "Semantic error: operator ~ not allowed on real operand"
+    );
+
+    let signed_real = session
+        .eval("a[{($signed(1.0)){1}}]")
+        .expect_err("$signed(real) count");
+    assert_eq!(
+        signed_real,
+        "Semantic error: $signed argument cannot be real"
+    );
+
+    let bitstoreal = session
+        .eval("a[{($bitstoreal(1)){1}}]")
+        .expect_err("$bitstoreal width count");
+    assert_eq!(
+        bitstoreal,
+        "Semantic error: $bitstoreal argument must be 64 bits wide, got 32"
+    );
+
+    // A plain real count (no structural error) still gets the generic
+    // diagnostic.
+    let plain_real = session.eval("a[{(1.0){1}}]").expect_err("plain real count");
+    assert_eq!(
+        plain_real,
+        "Semantic error: replication count cannot be real"
+    );
+}
+
 #[test]
 fn empty_braces_is_a_parse_error() {
     // `{}` — no expressions inside; LRM grammar requires at least one.
