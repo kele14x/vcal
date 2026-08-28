@@ -94,13 +94,7 @@ fn format_display_args(
     append_newline: bool,
     default_base: Base,
 ) -> Result<Vec<u8>, String> {
-    let values = args
-        .iter()
-        .map(|arg| match arg {
-            SystemArg::Expr(expr) => eval::evaluate_expr(expr, session).map(DisplayArg::Value),
-            SystemArg::Null => Ok(DisplayArg::Null),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let values = evaluate_display_args(args, session)?;
 
     let mut output = if let Some((first, rest)) = values.split_first() {
         if let Some(format_bytes) = format_arg_string_bytes(first) {
@@ -116,6 +110,41 @@ fn format_display_args(
         output.push(b'\n');
     }
     Ok(output)
+}
+
+// REPL calculator output is a unified one-or-more display-argument list.
+// A leading string in a multi-argument list uses the same control walker and
+// decimal fallback as `$display`; otherwise each argument keeps vcal's
+// canonical width / signed / base rendering, extending the traditional
+// single-expression echo to `a, b` without losing Verilog value metadata.
+// Requiring another argument preserves the established bare-string echo:
+// `"hello"` remains the canonical escaped string rather than silently becoming
+// a no-argument format string.
+pub(crate) fn format_repl_echo_args(
+    args: &[SystemArg],
+    session: &Session,
+) -> Result<Vec<u8>, String> {
+    let values = evaluate_display_args(args, session)?;
+    let Some((first, rest)) = values.split_first() else {
+        return Ok(Vec::new());
+    };
+
+    if !rest.is_empty()
+        && let Some(format_bytes) = format_arg_string_bytes(first)
+    {
+        format_with_controls(&format_bytes, rest, Base::Decimal)
+    } else {
+        Ok(join_canonical_values(&values))
+    }
+}
+
+fn evaluate_display_args(args: &[SystemArg], session: &Session) -> Result<Vec<DisplayArg>, String> {
+    args.iter()
+        .map(|arg| match arg {
+            SystemArg::Expr(expr) => eval::evaluate_expr(expr, session).map(DisplayArg::Value),
+            SystemArg::Null => Ok(DisplayArg::Null),
+        })
+        .collect()
 }
 
 enum DisplayArg {
@@ -210,6 +239,23 @@ fn join_default_values(values: &[DisplayArg], default_base: Base) -> Vec<u8> {
             output.push(b' ');
         }
         output.extend(format_default_arg(value, default_base));
+        previous_was_value = current_is_value;
+    }
+    output
+}
+
+fn join_canonical_values(values: &[DisplayArg]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut previous_was_value = false;
+    for (index, value) in values.iter().enumerate() {
+        let current_is_value = matches!(value, DisplayArg::Value(_));
+        if index > 0 && previous_was_value && current_is_value {
+            output.push(b' ');
+        }
+        match value {
+            DisplayArg::Value(value) => output.extend(value.canonical().bytes()),
+            DisplayArg::Null => output.push(b' '),
+        }
         previous_was_value = current_is_value;
     }
     output

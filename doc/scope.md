@@ -7,6 +7,7 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 ## What works
 
 - REPL shell with `rustyline` history
+- Unified REPL echo lists: every top-level expression input is a one-or-more display-argument list, so `a` retains canonical calculator output, `a, b` echoes both values canonically, and a leading string such as `"a=%d", a` uses the `$display` format-control engine; trailing `;` suppresses the whole echo
 - Integer and real literals, all LRM forms (LRM 3.5.2)
 - String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; `$display` / `$write` support basic format strings, null arguments, and raw-byte system-task output; internal zero-width numeric display renders with one `0` digit
 - All operators between integers (see [operators.md](operators.md))

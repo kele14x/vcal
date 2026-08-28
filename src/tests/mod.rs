@@ -21,6 +21,7 @@ mod real;
 mod real_functions;
 mod relational;
 mod repl;
+mod repl_echo;
 mod selects;
 mod shift;
 mod strings;

@@ -5,8 +5,8 @@
 - Prompt format is `In [n]:` / `Out[n]:` (plus a trailing space), where `n` is the index of the n-th user input, starting from 0.
 - `In [n]:` accepts a single line of Verilog. Multi-line input is a backlog item; see [scope.md](scope.md).
 - Each input gets exactly one output slot, followed by a blank line so consecutive turns are visually separated. Following the IPython convention, the REPL prints:
-  - `Out[n]: <value>` when the last statement is an expression and the input does not end with `;` — the value renders in canonical Verilog form `<width>'<base><digits>` (see [expressions.md](expressions.md) → "Base rules") — then a blank separator line before the next `In [n+1]:` prompt.
-  - a bare blank line (acting as both the output and the separator) for everything else: declarations, assignments, system tasks (`$finish`, `$stop`), or any expression whose input ends with `;`. Trailing `;` is the IPython-style suppression marker; see [non-standard.md](non-standard.md).
+  - `Out[n]: <values>` when the last statement is a REPL echo list and the input does not end with `;`. Every top-level expression is a one-or-more argument echo list: `a` has one argument, while `a, b` has two. Without a leading format string, every value renders in canonical Verilog form `<width>'<base><digits>` (see [expressions.md](expressions.md) → "Base rules") and values are space-separated. In a multi-argument list, a string-valued first argument activates the `$display` format-control engine, so `"a=%d", a` prints `a=10`. The output is followed by a blank separator line before the next `In [n+1]:` prompt.
+  - a bare blank line (acting as both the output and the separator) for everything else: declarations, assignments, system tasks (`$finish`, `$stop`), or any echo list whose input ends with `;`. Trailing `;` is the IPython-style suppression marker; see [non-standard.md](non-standard.md).
   - an error message followed by a blank separator line, on evaluation failure. The `In [n]` counter still advances.
 
 ## Session
@@ -22,8 +22,19 @@ Out[2]: 8'b00011110
 In [3]: a + 4'b1
 Out[3]: 8'b00011111
 
-In [4]:
+In [4]: a, $hex(a + 8'd1)
+Out[4]: 8'b00011110 8'h1f
+
+In [5]: "a is %d", a
+Out[5]: a is 30
+
+In [6]:
 ```
+
+The comma is a REPL echo-argument separator, not a Verilog comma operator or
+tuple constructor. Semicolons still sequence statements, so assignment followed
+by inspection is written `a = 10; a, b`; `a = 10, a` is rejected with a hint to
+use `;`.
 
 A `Session` owns the variable map (`RegValue`, not just bare `IntegerValue`) and is threaded through every evaluator entry. Reg metadata (width, signedness, base, declared msb/lsb) survives across turns; only redeclaration replaces it. See [variables.md](variables.md) for details.
 

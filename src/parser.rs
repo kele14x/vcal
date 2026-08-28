@@ -329,7 +329,13 @@ fn truncate_lvalue_inner(lvalue: &mut LValue, depth: usize, max_depth: usize) {
 // callsite repeating the descent.
 pub(crate) fn truncate_stmt_for_display(stmt: &mut Stmt, max_depth: usize) {
     match stmt {
-        Stmt::Expr(e) => truncate_expr_for_display(e, max_depth),
+        Stmt::ReplEcho(args) => {
+            for arg in args {
+                if let SystemArg::Expr(expr) = arg {
+                    truncate_expr_for_display(expr, max_depth);
+                }
+            }
+        }
         Stmt::Decl { range, names, .. } => {
             if let Some((msb, lsb)) = range {
                 truncate_expr_for_display(msb, max_depth);
@@ -487,11 +493,15 @@ fn steal_lvalue_children(lvalue: &mut LValue, out: &mut Vec<LValue>) {
 }
 
 // Top-level inputs. A REPL line / piped script segment between semicolons is
-// one `Stmt`. Expressions still drive the evaluator, but declarations and
-// blocking assignments mutate the session rather than producing a value.
+// one `Stmt`. A calculator expression is represented as a one-or-more
+// display-argument list: the traditional bare `a` input is `ReplEcho([a])`,
+// while `a, b` is `ReplEcho([a, b])`. This is REPL syntax, not a tuple value
+// or comma operator in the Verilog expression grammar. Declarations and
+// blocking assignments remain separate statement forms that mutate the
+// session rather than producing a value.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Stmt {
-    Expr(Expr),
+    ReplEcho(Vec<SystemArg>),
     // LRM A.2.1.3 variable declarations. `kind` distinguishes which
     // keyword introduced the decl — `reg` allows `[signed] [range]` and
     // an optional per-name unpacked dimension; `integer` and `real` per
@@ -1419,16 +1429,16 @@ impl<'a> Parser<'a> {
     }
 
     // Statement-level dispatch (LRM A.2.1.3 reg decl / A.6.2 blocking
-    // assignment / expression as a calculator line). Keyword recognition is
-    // string-based on `Token::Identifier`; with only two keywords (`reg`,
-    // `signed`) a dedicated `Token::Keyword` would be premature.
+    // assignment / expression list as a calculator line). The small set of
+    // declaration words is recognized directly from `Token::Identifier`; a
+    // dedicated `Token::Keyword` would be premature.
     //
     // The blocking-assignment LHS can be a bare name, a bit/part-select on
     // a name, or an arbitrarily nested concatenation of those — `name`,
     // `name[...]`, and `{...}` are all already valid `Expr` shapes, so we
     // parse the LHS as an `Expr` first and convert it to an `LValue` via
     // `expression_to_lvalue` only after spotting `=`. If `=` doesn't follow
-    // we keep the parsed `Expr` as the statement payload — no rewind, no
+    // we keep the parsed `Expr` as the first echo argument — no rewind, no
     // double parse. The leading-token gate keeps the existing
     // `$finish`/expression path undisturbed.
     fn parse_statement(&mut self) -> Result<Stmt, String> {
@@ -1451,9 +1461,23 @@ impl<'a> Parser<'a> {
                 let lvalue = expression_to_lvalue(expr)?;
                 self.index += 1; // consume `=`
                 let rhs = self.parse_expression()?;
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    return Err(
+                        "assignment is a statement; use `;` before a REPL echo list".to_string()
+                    );
+                }
                 return Ok(Stmt::Assign { lvalue, rhs });
             }
-            return Ok(Stmt::Expr(expr));
+            return self.parse_repl_echo(Some(expr));
+        }
+
+        // Null display arguments are valid in the explicit display family,
+        // so the unified REPL form accepts the same leading / adjacent /
+        // trailing comma slots. `,a` is the two-argument list `[null, a]`;
+        // a line containing only commas is similarly an echo list rather
+        // than an expression.
+        if matches!(self.peek(), Some(Token::Comma)) {
+            return self.parse_repl_echo(None);
         }
 
         // Top-level system tasks (`$finish`, optionally wrapped in
@@ -1463,7 +1487,25 @@ impl<'a> Parser<'a> {
         // the task and exit. Keeping that recognition out of the parser
         // means `((($finish)))` doesn't pay for a recursive walker.
         let expr = self.parse_expression()?;
-        Ok(Stmt::Expr(expr))
+        self.parse_repl_echo(Some(expr))
+    }
+
+    fn parse_repl_echo(&mut self, first: Option<Expr>) -> Result<Stmt, String> {
+        let mut args = vec![match first {
+            Some(expr) => SystemArg::Expr(expr),
+            None => SystemArg::Null,
+        }];
+
+        while matches!(self.peek(), Some(Token::Comma)) {
+            self.index += 1;
+            if self.peek().is_none() || matches!(self.peek(), Some(Token::Comma)) {
+                args.push(SystemArg::Null);
+            } else {
+                args.push(SystemArg::Expr(self.parse_expression()?));
+            }
+        }
+
+        Ok(Stmt::ReplEcho(args))
     }
 
     fn parse_decl(&mut self, kind: DeclKind) -> Result<Stmt, String> {

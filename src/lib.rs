@@ -182,6 +182,14 @@ impl RegValue {
 #[derive(Debug, PartialEq, Eq)]
 pub struct Evaluation {
     pub task_output: Vec<u8>,
+    /// Exact bytes produced by the final unsuppressed REPL echo list. This is
+    /// normally UTF-8 canonical text, but `%s` / `%c` can deliberately emit
+    /// arbitrary bytes just like `$display`, so the REPL frontends write this
+    /// buffer rather than round-tripping through `String`.
+    pub value_output: Vec<u8>,
+    /// Backward-compatible text view of `value_output`. For raw non-UTF-8
+    /// formatted output this is lossy; callers that require exact output use
+    /// `value_output`.
     pub output: String,
     pub should_exit: bool,
 }
@@ -303,6 +311,7 @@ fn evaluate_input_with_session(session: &mut Session, input: &str) -> Result<Eva
     if input.is_empty() {
         return Ok(Evaluation {
             task_output: Vec::new(),
+            value_output: Vec::new(),
             output: String::new(),
             should_exit: false,
         });
@@ -312,55 +321,63 @@ fn evaluate_input_with_session(session: &mut Session, input: &str) -> Result<Eva
         parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
 
     // IPython-style suppression applies only to value output: the last
-    // expression value is visible only if the input did not end with a `;`.
+    // echo-list value is visible only if the input did not end with a `;`.
     // System-task output is a side effect and accumulates independently.
     let mut task_output = Vec::new();
-    let mut last_output = String::new();
-    let mut last_was_expr = false;
+    let mut last_value_output = Vec::new();
+    let mut last_was_echo = false;
     for stmt in &statements {
-        let (stmt_task_output, output, should_exit) = apply_stmt(session, stmt)?;
+        let (stmt_task_output, value_output, should_exit) = apply_stmt(session, stmt)?;
         task_output.extend(stmt_task_output);
         if should_exit {
             return Ok(Evaluation {
                 task_output,
+                value_output: Vec::new(),
                 output: String::new(),
                 should_exit: true,
             });
         }
-        last_output = output;
-        last_was_expr = matches!(stmt, Stmt::Expr(_));
+        last_value_output = value_output;
+        last_was_echo = matches!(stmt, Stmt::ReplEcho(_));
     }
 
-    let output = if trailing_semicolon || !last_was_expr {
-        String::new()
+    let value_output = if trailing_semicolon || !last_was_echo {
+        Vec::new()
     } else {
-        last_output
+        last_value_output
     };
+    let output = String::from_utf8_lossy(&value_output).into_owned();
 
     Ok(Evaluation {
         task_output,
+        value_output,
         output,
         should_exit: false,
     })
 }
 
 // Drives a single top-level Stmt. Decls mutate the session and emit no value
-// output. Assignments mutate the session and emit the reg's new canonical
-// form. Expression statements just evaluate — except that an `Expr::SystemCall`
-// whose name classifies as a task is hoisted here, since tasks have no
-// expression value. The hoist walks through `Grouped` layers via the iterative
-// `unwrap_grouped` so `((($display("x"))))` still runs as a top-level task.
-fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(Vec<u8>, String, bool), String> {
+// output. Assignments mutate the session and emit no REPL value. Echo lists
+// evaluate through the unified canonical / format-string renderer — except
+// that a singleton `Expr::SystemCall` whose name classifies as a task is
+// hoisted here, since tasks have no expression value. The hoist walks through
+// `Grouped` layers via the iterative `unwrap_grouped` so
+// `((($display("x"))))` still runs as a top-level task.
+fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
     match stmt {
-        Stmt::Expr(expr) => {
-            if let Expr::SystemCall { name, args } = eval::unwrap_grouped(expr)
+        Stmt::ReplEcho(args) => {
+            if let [parser::SystemArg::Expr(expr)] = args.as_slice()
+                && let Expr::SystemCall {
+                    name,
+                    args: task_args,
+                } = eval::unwrap_grouped(expr)
                 && let Ok(SystemCallKind::Task(task)) = system_call::classify_system_call(name)
             {
-                let result = system_call::execute_task(task, args, session)?;
-                return Ok((result.output, String::new(), result.should_exit));
+                let result = system_call::execute_task(task, task_args, session)?;
+                return Ok((result.output, Vec::new(), result.should_exit));
             }
-            let value = eval::evaluate_expr(expr, session)?;
-            Ok((Vec::new(), value.canonical(), false))
+            let output = system_call::format_repl_echo_args(args, session)?;
+            Ok((Vec::new(), output, false))
         }
         Stmt::Decl {
             kind,
@@ -369,11 +386,11 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(Vec<u8>, String, bo
             names,
         } => {
             let (output, should_exit) = apply_decl(session, *kind, *signed, range.as_ref(), names)?;
-            Ok((Vec::new(), output, should_exit))
+            Ok((Vec::new(), output.into_bytes(), should_exit))
         }
         Stmt::Assign { lvalue, rhs } => {
             let (output, should_exit) = apply_assign(session, lvalue, rhs)?;
-            Ok((Vec::new(), output, should_exit))
+            Ok((Vec::new(), output.into_bytes(), should_exit))
         }
     }
 }
@@ -803,10 +820,12 @@ pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Res
         match session.eval(&line) {
             Ok(result) => {
                 writer.write_all(&result.task_output)?;
-                if result.output.is_empty() {
+                if result.value_output.is_empty() {
                     writeln!(writer)?;
                 } else {
-                    writeln!(writer, "Out[{index}]: {}", result.output)?;
+                    write!(writer, "Out[{index}]: ")?;
+                    writer.write_all(&result.value_output)?;
+                    writeln!(writer)?;
                     writeln!(writer)?;
                 }
                 if result.should_exit {
@@ -852,8 +871,8 @@ pub fn run_interactive() -> io::Result<()> {
             Ok(result) => {
                 let mut stdout = io::stdout();
                 stdout.write_all(&result.task_output)?;
-                if result.output.is_empty() {
-                    println!();
+                if result.value_output.is_empty() {
+                    writeln!(stdout)?;
                 } else {
                     let prefix = format!("Out[{index}]: ");
                     let prefix = if use_color {
@@ -861,8 +880,10 @@ pub fn run_interactive() -> io::Result<()> {
                     } else {
                         prefix
                     };
-                    println!("{prefix}{}", result.output);
-                    println!();
+                    stdout.write_all(prefix.as_bytes())?;
+                    stdout.write_all(&result.value_output)?;
+                    writeln!(stdout)?;
+                    writeln!(stdout)?;
                 }
                 if result.should_exit {
                     break;

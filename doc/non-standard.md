@@ -4,13 +4,16 @@ vcal-specific divergences from IEEE 1364-2005. Full operator rules live in [oper
 
 ## Top-level input
 
-The LRM defines `statement ::= blocking_assignment ; | system_task_enable` inside a module, with declarations at the module-item level (Annex A.2). vcal has no module wrapper and no separate elaboration stage, so the REPL accepts a flat top-level stream `{ statement | system_task_enable | declaration | expression }`. `declaration` (`reg`, `integer`, `real`) is hoisted from module-item level so users can introduce a variable without a module. `expression` lets a bare expression like `a + 1` evaluate and display its value — the calculator-mode behavior, which has no LRM counterpart.
+The LRM defines `statement ::= blocking_assignment ; | system_task_enable` inside a module, with declarations at the module-item level (Annex A.2). vcal has no module wrapper and no separate elaboration stage, so the REPL accepts a flat top-level stream `{ statement | system_task_enable | declaration | repl_echo }`. `declaration` (`reg`, `integer`, `real`) is hoisted from module-item level so users can introduce a variable without a module. `repl_echo ::= display_argument { , display_argument }` is the calculator-mode behavior, which has no LRM counterpart: a bare expression such as `a + 1` is the one-argument case, while `a, b` evaluates and displays both values. The comma exists only at this top level; it does not introduce a tuple value or a general comma operator, and assignment remains a statement (`a = 1; a` is valid sequencing, while `a = 1, a` is rejected).
+
+Unformatted REPL echo arguments retain their canonical vcal rendering and are space-separated. In a multi-argument echo list, a string-valued first argument activates the same format-control engine as `$display`, so `"a=%d", a` prints `a=10`. A lone string remains an ordinary canonical string echo (including quotes and escapes), preserving the established calculator behavior. Explicit `$display` remains distinct: it uses the LRM decimal default for unformatted integers, is emitted as system-task output without an `Out[n]:` prefix, and is not suppressed by a trailing semicolon.
 
 ## Trailing semicolons
 
 The Verilog LRM requires a trailing semicolon for each statement. This is annoying for a calculator app, so vcal makes the trailing `;` optional and repurposes it as a REPL-only **output-suppression marker** following the IPython convention:
 
 - `1 + 1` → `Out[n]: 32'sd2`
+- `1, 2` → `Out[n]: 32'sd1 32'sd2`
 - `1 + 1;` → blank line (value computed but not displayed)
 
 This convention has no LRM counterpart — it exists only at the REPL prompt. Multi-statement input like `1; 2; 3` is `;`-separated by definition, and only the *last* statement's result is eligible to print, so the trailing-`;` rule applies uniformly to the input as a whole rather than per statement.
@@ -53,7 +56,7 @@ vcal implements Verilog string constants as packed 8-bit vectors. As a REPL conv
 
 ## Display tasks
 
-vcal implements `$display` and `$write`, but deliberately supports only the format controls useful in the calculator-style REPL today: `%b`, `%o`, `%d`, `%h` / `%x`, `%s`, `%c`, real controls (`%e`, `%f`, `%g` and uppercase spellings), and `%%`. For `%s` and `%c`, x/z bits in integer arguments are silently converted to zero bits before raw bytes are emitted; these controls do not fall back to canonical integer text. Null arguments from leading, trailing, or adjacent commas are accepted by all system tasks (not just `$display` / `$write`); for `$display` / `$write` each null argument emits one space, while for `$finish` / `$stop` the null arguments are discarded along with all other arguments. Other LRM display controls are intentionally unsupported for now, including `%u` / `%z` unformatted data, `%t` simulation time, `%m` hierarchy path, strength formats, and field-width / precision modifiers. `$strobe`, `$monitor`, and file display tasks are also outside the current scope.
+vcal implements `$display` and `$write`, but deliberately supports only the format controls useful in the calculator-style REPL today: `%b`, `%o`, `%d`, `%h` / `%x`, `%s`, `%c`, real controls (`%e`, `%f`, `%g` and uppercase spellings), and `%%`. The REPL echo-list format mode uses this same subset. For `%s` and `%c`, x/z bits in integer arguments are silently converted to zero bits before raw bytes are emitted; these controls do not fall back to canonical integer text. Null arguments from leading, trailing, or adjacent commas are accepted by all system tasks and by REPL echo lists; for `$display` / `$write` and echo lists each null argument emits one space, while for `$finish` / `$stop` the null arguments are discarded along with all other arguments. Other LRM display controls are intentionally unsupported for now, including `%u` / `%z` unformatted data, `%t` simulation time, `%m` hierarchy path, strength formats, and field-width / precision modifiers. `$strobe`, `$monitor`, and file display tasks are also outside the current scope.
 
 ## Conditional operator
 
