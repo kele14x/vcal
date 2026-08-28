@@ -226,3 +226,34 @@ fn unterminated_block_comment_is_an_error() {
     let err = evaluate_input("/* unterminated").expect_err("should error");
     assert_eq!(err, "Syntax error: unterminated block comment");
 }
+
+// The Windows-console byte policy: raw formatter bytes pass through untouched
+// on every destination except a Windows console, where Rust's stdio rejects
+// non-UTF-8 writes. Valid UTF-8 (which is all canonical output) is a no-op
+// everywhere, so only deliberate `%s` / `%c` raw bytes are affected.
+
+#[test]
+fn console_safe_bytes_preserves_raw_bytes_off_windows_console() {
+    let raw = [0xa9u8, 0xff];
+    assert_eq!(crate::console_safe_bytes(&raw, false).as_ref(), raw);
+}
+
+#[test]
+fn console_safe_bytes_preserves_valid_utf8_everywhere() {
+    let utf8 = "label 8'hff";
+    assert_eq!(
+        crate::console_safe_bytes(utf8.as_bytes(), false).as_ref(),
+        utf8.as_bytes()
+    );
+    assert_eq!(
+        crate::console_safe_bytes(utf8.as_bytes(), true).as_ref(),
+        utf8.as_bytes()
+    );
+}
+
+#[test]
+fn console_safe_bytes_lossily_converts_raw_bytes_on_windows_console() {
+    let raw = [0xa9u8, 0xff];
+    let expected = "\u{fffd}\u{fffd}".as_bytes();
+    assert_eq!(crate::console_safe_bytes(&raw, true).as_ref(), expected);
+}

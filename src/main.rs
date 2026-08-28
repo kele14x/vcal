@@ -60,10 +60,11 @@ fn main() -> ExitCode {
         let stdin = io::stdin();
         let stdout = io::stdout();
         let mut reader = stdin.lock();
-        let mut writer = stdout.lock();
         if parse_only {
+            let mut writer = stdout.lock();
             vcal::run_parse_repl(&mut reader, &mut writer, depth)
         } else {
+            let mut writer = vcal::ConsoleSafeWriter::new(stdout.lock());
             vcal::run_repl(&mut reader, &mut writer)
         }
     };

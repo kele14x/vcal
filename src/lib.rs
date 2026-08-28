@@ -1,5 +1,6 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
@@ -803,6 +804,46 @@ fn evaluate_range_endpoint(expr: &Expr, session: &Session, role: &str) -> Result
     Ok(value.as_bigint(value.signed))
 }
 
+// Decides the byte policy for formatter output. The formatter emits a raw
+// byte stream (`$display("%s", 8'h80)` and `%c` deliberately produce
+// arbitrary bytes), which every destination accepts except a Windows console:
+// Rust's stdio rejects non-UTF-8 writes there with an `InvalidInput` error.
+// Degrade to lossy UTF-8 in that one case only; pipes, files, and Unix
+// terminals keep the exact raw bytes so redirected output stays byte-exact.
+fn console_safe_bytes<'a>(bytes: &'a [u8], windows_console: bool) -> Cow<'a, [u8]> {
+    if windows_console && str::from_utf8(bytes).is_err() {
+        Cow::Owned(String::from_utf8_lossy(bytes).into_owned().into_bytes())
+    } else {
+        Cow::Borrowed(bytes)
+    }
+}
+
+// Applies the output byte policy at a real write destination. `run_repl` and
+// `run_interactive` write through one of these (stdout in practice), so the
+// raw-bytes contract they document holds for pipes, files, and Unix terminals,
+// while a Windows console degrades non-UTF-8 bytes instead of erroring.
+pub struct ConsoleSafeWriter<W: Write + IsTerminal> {
+    inner: W,
+}
+
+impl<W: Write + IsTerminal> ConsoleSafeWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<W: Write + IsTerminal> Write for ConsoleSafeWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let converted = console_safe_bytes(buf, cfg!(windows) && self.inner.is_terminal());
+        self.inner.write_all(&converted)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Result<()> {
     let mut session = Session::new();
     let mut index = 0usize;
@@ -869,7 +910,7 @@ pub fn run_interactive() -> io::Result<()> {
 
         match session.eval(&line) {
             Ok(result) => {
-                let mut stdout = io::stdout();
+                let mut stdout = ConsoleSafeWriter::new(io::stdout());
                 stdout.write_all(&result.task_output)?;
                 if result.value_output.is_empty() {
                     writeln!(stdout)?;

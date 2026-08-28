@@ -9,6 +9,10 @@
   - a bare blank line (acting as both the output and the separator) for everything else: declarations, assignments, system tasks (`$finish`, `$stop`), or any `display_expression` whose input ends with `;`. Trailing `;` is the IPython-style suppression marker; see [non-standard.md](non-standard.md).
   - an error message followed by a blank separator line, on evaluation failure. The `In [n]` counter still advances.
 
+## Output encoding
+
+`$display` / `$write` output and formatted `display_expression` echoes are a raw byte stream: `%s` / `%c` may emit arbitrary bytes, and piping or redirecting the REPL preserves them exactly. The one exception is a Windows console, whose stdio rejects non-UTF-8 writes; there, non-UTF-8 bytes are degraded to lossy UTF-8 (replacement characters) so the REPL keeps working. Valid UTF-8 output — which is everything except deliberate `%s` / `%c` raw bytes — is never altered.
+
 ## Session
 
 Declarations and assignments persist across REPL turns. Assignments don't echo a value (use a follow-up expression to read the variable back):

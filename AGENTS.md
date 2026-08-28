@@ -36,4 +36,4 @@ Quick test for where a fact belongs: if it will still hold after the next featur
 - Add LRM edge-case tests as new operators land.
 - Most design rules derive from LRM. Where vcal diverges intentionally, the divergence is documented in [doc/non-standard.md](doc/non-standard.md) — consult it before reading the LRM.
 - Do not infer scope from [doc/lrm-coverage.md](doc/lrm-coverage.md) — many checked boxes are long-term targets, not current scope. Confirm with the user before expanding beyond what [doc/scope.md](doc/scope.md) lists as active.
-- Two REPL entry points: `vcal::run_interactive` (rustyline, TTY only) and `vcal::run_repl(BufRead, Write)` (piped / test). `src/main.rs` dispatches via `IsTerminal`. Keep both paths working.
+- Two REPL entry points: `vcal::run_interactive` (rustyline, TTY only) and `vcal::run_repl(BufRead, Write)` (piped / test). `src/main.rs` dispatches via `IsTerminal`. Both wrap stdout in `ConsoleSafeWriter` (see [doc/repl.md](doc/repl.md) → Output encoding) so non-UTF-8 formatter bytes degrade to lossy UTF-8 on a Windows console while every other destination keeps the raw byte stream. Keep both paths working.
