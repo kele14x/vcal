@@ -98,7 +98,7 @@ fn format_display_args(
 
     let mut output = if let Some((first, rest)) = values.split_first() {
         if let Some(format_bytes) = format_arg_string_bytes(first) {
-            format_with_controls(&format_bytes, rest, default_base)?
+            format_with_controls(&format_bytes, rest, UnformattedStyle::Base(default_base))?
         } else {
             join_default_values(&values, default_base)
         }
@@ -113,10 +113,11 @@ fn format_display_args(
 }
 
 // REPL calculator output is a unified one-or-more display-argument list.
-// A leading string in a multi-argument list uses the same control walker and
-// decimal fallback as `$display`; otherwise each argument keeps vcal's
-// canonical width / signed / base rendering, extending the traditional
-// single-expression echo to `a, b` without losing Verilog value metadata.
+// A leading string in a multi-argument list uses the same control walker as
+// `$display`, but arguments left unconsumed by controls keep vcal's canonical
+// width / signed / base rendering. Otherwise every argument is canonical too,
+// extending the traditional single-expression echo to `a, b` without losing
+// Verilog value metadata.
 // Requiring another argument preserves the established bare-string echo:
 // `"hello"` remains the canonical escaped string rather than silently becoming
 // a no-argument format string.
@@ -132,7 +133,7 @@ pub(crate) fn format_repl_echo_args(
     if !rest.is_empty()
         && let Some(format_bytes) = format_arg_string_bytes(first)
     {
-        format_with_controls(&format_bytes, rest, Base::Decimal)
+        format_with_controls(&format_bytes, rest, UnformattedStyle::Canonical)
     } else {
         Ok(join_canonical_values(&values))
     }
@@ -152,10 +153,16 @@ enum DisplayArg {
     Null,
 }
 
+#[derive(Clone, Copy)]
+enum UnformattedStyle {
+    Base(Base),
+    Canonical,
+}
+
 fn format_with_controls(
     format_bytes: &[u8],
     args: &[DisplayArg],
-    default_base: Base,
+    unformatted_style: UnformattedStyle,
 ) -> Result<Vec<u8>, String> {
     let mut output = Vec::new();
     let mut arg_index = 0usize;
@@ -224,10 +231,20 @@ fn format_with_controls(
             }
             DisplayArg::Null => {}
         }
-        output.extend(format_default_arg(value, default_base));
+        output.extend(format_unformatted_arg(value, unformatted_style));
     }
 
     Ok(output)
+}
+
+fn format_unformatted_arg(value: &DisplayArg, style: UnformattedStyle) -> Vec<u8> {
+    match style {
+        UnformattedStyle::Base(base) => format_default_arg(value, base),
+        UnformattedStyle::Canonical => match value {
+            DisplayArg::Value(value) => value.canonical().into_bytes(),
+            DisplayArg::Null => vec![b' '],
+        },
+    }
 }
 
 fn join_default_values(values: &[DisplayArg], default_base: Base) -> Vec<u8> {

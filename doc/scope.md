@@ -7,7 +7,7 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 ## What works
 
 - REPL shell with `rustyline` history
-- Unified non-empty `display_expression` echo lists (see [non-standard.md](non-standard.md)): every top-level expression input is a display-expression argument list, so `a` retains canonical calculator output, `a, b` echoes both values canonically, null comma slots emit one space each like `$display`, and a leading string-style expression such as `"a=%d", a` uses the `$display` format-control engine; trailing `;` suppresses the whole echo
+- Unified non-empty `display_expression` echo lists (see [non-standard.md](non-standard.md)): every top-level expression input is a display-expression argument list, so `a` retains canonical calculator output, `a, b` echoes both values canonically, null comma slots emit one space each like `$display`, and a leading string-style expression such as `"a=%d", a` uses the `$display` format-control engine while rendering arguments left unconsumed by format controls canonically; trailing `;` suppresses the whole echo
 - Integer and real literals, all LRM forms (LRM 3.5.2)
 - String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; the formatter shared by `$display` / `$write` and formatted `display_expression` supports basic format strings, null arguments, and raw-byte output; internal zero-width numeric display renders with one `0` digit
 - All operators between integers (see [operators.md](operators.md))
@@ -29,8 +29,6 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 Planned but not yet implemented:
 
 - **Multi-line edit.** The REPL accepts only single-line input today; the right TUI affordance for multi-line editing is still being explored.
-
-- **Canonical fallback in formatted REPL echoes.** Arguments left unconsumed by format controls currently use `$display`'s decimal fallback. A future pass should make `display_expression` render those arguments canonically while leaving the explicit display-task defaults unchanged.
 
 ## Known issues
 

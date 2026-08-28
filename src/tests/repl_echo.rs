@@ -41,6 +41,25 @@ fn leading_string_in_multi_argument_echo_uses_display_formatting() {
 }
 
 #[test]
+fn formatted_echo_renders_unconsumed_arguments_canonically() {
+    let result = evaluate_input("\"label\", 8'hff").expect("canonical leftover");
+    assert_eq!(result.output, "label 8'hff");
+
+    let result = evaluate_input("\"value=%d\", 8'hff, 4'b1010")
+        .expect("explicit control plus canonical leftover");
+    assert_eq!(result.output, "value=255 4'b1010");
+
+    let result = evaluate_input("\"label\", \"value\"").expect("canonical string leftover");
+    assert_eq!(result.output, "label \"value\"");
+}
+
+#[test]
+fn explicit_display_keeps_decimal_fallback_for_unconsumed_arguments() {
+    let result = evaluate_input("$display(\"label\", 8'hff)").expect("display fallback");
+    assert_eq!(result.task_output, b"label 255\n");
+}
+
+#[test]
 fn singleton_string_retains_escaped_canonical_echo() {
     let result = evaluate_input("\"hello\\nworld\"").expect("string echo");
     assert_eq!(result.output, "\"hello\\nworld\"");
