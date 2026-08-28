@@ -7,9 +7,9 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 ## What works
 
 - REPL shell with `rustyline` history
-- Unified REPL echo lists: every top-level expression input is a one-or-more display-argument list, so `a` retains canonical calculator output, `a, b` echoes both values canonically, and a leading string such as `"a=%d", a` uses the `$display` format-control engine; trailing `;` suppresses the whole echo
+- Unified non-empty `display_expression` echo lists (see [non-standard.md](non-standard.md)): every top-level expression input is a display-expression argument list, so `a` retains canonical calculator output, `a, b` echoes both values canonically, null comma slots emit one space each like `$display`, and a leading string-style expression such as `"a=%d", a` uses the `$display` format-control engine; trailing `;` suppresses the whole echo
 - Integer and real literals, all LRM forms (LRM 3.5.2)
-- String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; `$display` / `$write` support basic format strings, null arguments, and raw-byte system-task output; internal zero-width numeric display renders with one `0` digit
+- String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; the formatter shared by `$display` / `$write` and formatted `display_expression` supports basic format strings, null arguments, and raw-byte output; internal zero-width numeric display renders with one `0` digit
 - All operators between integers (see [operators.md](operators.md))
 - Integer `**` evaluates its exponent as a self-determined expression and uses width-bounded modular exponentiation, so nested or very large exponents wrap correctly without unbounded intermediates
 - Real arithmetic and mixed integer/real promotion (LRM 5.1.5 / 5.1.7 / Tables 5-2, 5-3)
@@ -30,9 +30,11 @@ Planned but not yet implemented:
 
 - **Multi-line edit.** The REPL accepts only single-line input today; the right TUI affordance for multi-line editing is still being explored.
 
+- **Canonical fallback in formatted REPL echoes.** Arguments left unconsumed by format controls currently use `$display`'s decimal fallback. A future pass should make `display_expression` render those arguments canonically while leaving the explicit display-task defaults unchanged.
+
 ## Known issues
 
-- On Windows console-mode stdout (for example `cargo run` in a VSCode / PowerShell terminal), `$display` / `$write` raw byte output can fail when it contains non-UTF-8 byte sequences such as `%s` on `8'h80`. Rust stdio rejects those writes with `Windows stdio in console mode does not support writing non-UTF-8 byte sequences`; redirected stdout / pipe behavior may differ. A future pass should decide the Windows-console policy for raw system-task bytes.
+- On Windows console-mode stdout (for example `cargo run` in a VSCode / PowerShell terminal), raw output from `$display` / `$write` or a formatted `display_expression` can fail when it contains non-UTF-8 byte sequences such as `%s` on `8'h80`. Rust stdio rejects those writes with `Windows stdio in console mode does not support writing non-UTF-8 byte sequences`; redirected stdout / pipe behavior may differ. A future pass should decide the Windows-console policy for raw formatter bytes.
 
 - Malformed real literals like `1._0` or `9.` surface as `invalid decimal digits: 1.0` after the underscore-strip / digit-strip step, because the lexer's `real_after_dot` lookahead requires `.` followed by a digit and otherwise falls through to the integer path. The diagnostic is correct in spirit (the literal is not a valid real) but the message is misleading. A future pass should recognize "digit-run + `.`" as a real-literal commitment and emit a real-specific error.
 
