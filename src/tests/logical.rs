@@ -1,6 +1,6 @@
-use crate::evaluate_input;
 use crate::lexer::{Token, tokenize};
 use crate::parser::{BinaryOp, Expr, UnaryOp, parse_expression};
+use crate::{Session, evaluate_input};
 
 // ---------- Logical operators (!, &&, ||) ----------
 //
@@ -86,6 +86,123 @@ fn evaluates_logical_or_truth_table() {
     assert_eq!(x_or_true.output, "1'b1");
     assert_eq!(x_or_false.output, "1'bx");
     assert_eq!(x_or_x.output, "1'bx");
+}
+
+// ---------- Mixed integer/real logical operands ----------
+//
+// LRM 5.1.9 reduces each operand to a single logical bit *before* the
+// truth table applies. When one operand is real it is tempting to convert
+// the other to real as well (LRM 3.5.3), but that conversion maps every
+// x/z bit to 0.0 and would answer 0 where the truth table says x. Each
+// operand therefore reduces in its own type: the real side via
+// `logical_value_of_real`, the integer side via `logical_value`
+// (reduction-OR, x/z preserved). Every expectation below matches Icarus
+// Verilog.
+
+#[test]
+fn mixed_real_logical_keeps_unknown_integer_state() {
+    let x_and_one = evaluate_input("1'bx && 1.0").expect("x && 1.0");
+    let x_or_zero = evaluate_input("1'bx || 0.0").expect("x || 0.0");
+    let z_and_one = evaluate_input("1'bz && 1.0").expect("z && 1.0");
+    let z_or_zero = evaluate_input("1'bz || 0.0").expect("z || 0.0");
+    let real_on_left = evaluate_input("1.0 && 1'bx").expect("1.0 && x");
+    let zero_real_on_left = evaluate_input("0.0 && 1'bx").expect("0.0 && x");
+
+    assert_eq!(x_and_one.output, "1'bx");
+    assert_eq!(x_or_zero.output, "1'bx");
+    assert_eq!(z_and_one.output, "1'bx");
+    assert_eq!(z_or_zero.output, "1'bx");
+    assert_eq!(real_on_left.output, "1'bx");
+    assert_eq!(zero_real_on_left.output, "1'b0");
+}
+
+#[test]
+fn mixed_real_logical_still_honors_dominant_definite_operand() {
+    // A definite 0 dominates `&&` and a definite 1 dominates `||` even when
+    // the other operand is unknown — the truth table's 0/1 rows beat x.
+    let x_and_zero = evaluate_input("1'bx && 0.0").expect("x && 0.0");
+    let x_or_one = evaluate_input("1'bx || 1.0").expect("x || 1.0");
+    let definite_true = evaluate_input("1'b1 && 1.0").expect("1 && 1.0");
+    let definite_false = evaluate_input("1'b0 || 1.0").expect("0 || 1.0");
+
+    assert_eq!(x_and_zero.output, "1'b0");
+    assert_eq!(x_or_one.output, "1'b1");
+    assert_eq!(definite_true.output, "1'b1");
+    assert_eq!(definite_false.output, "1'b1");
+}
+
+#[test]
+fn mixed_real_logical_reduces_multibit_integer_by_or() {
+    // The integer side reduces with OR across all its bits: any 1 bit makes
+    // it definitely true, all-zero makes it definitely false, and x/z with no
+    // 1 bit stays unknown.
+    let zeros_and_x = evaluate_input("4'b00x0 && 1.0").expect("00x0 && 1.0");
+    let zeros_and_z = evaluate_input("4'b00z0 && 1.0").expect("00z0 && 1.0");
+    let has_one_bit = evaluate_input("4'b11x1 && 1.0").expect("11x1 && 1.0");
+    let all_zero = evaluate_input("4'b0000 && 1.0").expect("0000 && 1.0");
+    let x_with_one_or = evaluate_input("4'bx000 || 1.0").expect("x000 || 1.0");
+
+    assert_eq!(zeros_and_x.output, "1'bx");
+    assert_eq!(zeros_and_z.output, "1'bx");
+    assert_eq!(has_one_bit.output, "1'b1");
+    assert_eq!(all_zero.output, "1'b0");
+    assert_eq!(x_with_one_or.output, "1'b1");
+}
+
+#[test]
+fn mixed_real_logical_with_real_and_reg_variables() {
+    let mut session = Session::new();
+    session.eval("real zero = 0.0").expect("real decl");
+    session.eval("real one = 1.5").expect("real decl");
+    session.eval("reg b").expect("scalar reg decl");
+    session.eval("reg [3:0] v").expect("vector reg decl");
+
+    // `b` and `v` are uninitialized, so both read as unknown.
+    assert_eq!(session.eval("b && zero").expect("x && 0.0").output, "1'b0");
+    assert_eq!(session.eval("b || zero").expect("x || 0.0").output, "1'bx");
+    assert_eq!(session.eval("zero && b").expect("0.0 && x").output, "1'b0");
+    assert_eq!(session.eval("b && one").expect("x && 1.5").output, "1'bx");
+    assert_eq!(
+        session.eval("v && 1.0").expect("xxxx && 1.0").output,
+        "1'bx"
+    );
+    assert_eq!(
+        session.eval("v || 1.0").expect("xxxx || 1.0").output,
+        "1'b1"
+    );
+}
+
+#[test]
+fn mixed_real_logical_result_feeds_outer_operators() {
+    let or_dominates = evaluate_input("(1'bx && 1.0) || 1'b1").expect("nested ||");
+    let and_stays_unknown = evaluate_input("(1'bx && 1.0) && 1'b1").expect("nested &&");
+    let real_subtree = evaluate_input("1'bx && (1.0 + 0.0)").expect("real subtree");
+    let in_concat = evaluate_input("{1'bx && 1.0}").expect("concat");
+    let as_conditional = evaluate_input("(1'bx && 1.0) ? 1 : 2").expect("cond");
+
+    assert_eq!(or_dominates.output, "1'b1");
+    assert_eq!(and_stays_unknown.output, "1'bx");
+    assert_eq!(real_subtree.output, "1'bx");
+    assert_eq!(in_concat.output, "1'bx");
+    assert_eq!(as_conditional.output, "32'sdx");
+}
+
+#[test]
+fn real_relational_and_equality_still_convert_unknown_to_zero() {
+    // Guard against over-correcting: only the *logical* operators reduce in
+    // the operand's own type. `==`, `!=`, and the relational operators still
+    // apply the LRM 3.5.3 real conversion, where x/z becomes 0.0 — matching
+    // Icarus Verilog, which answers 0 for `1'bx == 1.0` and 1 for
+    // `1'bx < 1.0`.
+    let equal = evaluate_input("1'bx == 1.0").expect("x == 1.0");
+    let not_equal = evaluate_input("1'bx != 1.0").expect("x != 1.0");
+    let less_than = evaluate_input("1'bx < 1.0").expect("x < 1.0");
+    let greater_equal = evaluate_input("1'bx >= 1.0").expect("x >= 1.0");
+
+    assert_eq!(equal.output, "1'b0");
+    assert_eq!(not_equal.output, "1'b1");
+    assert_eq!(less_than.output, "1'b1");
+    assert_eq!(greater_equal.output, "1'b0");
 }
 
 #[test]

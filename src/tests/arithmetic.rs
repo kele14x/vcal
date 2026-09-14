@@ -95,6 +95,122 @@ fn applies_lhs_width_rule_to_power_operator() {
 }
 
 #[test]
+fn outer_context_signedness_reaches_power_base_but_not_exponent() {
+    // LRM 5.5.1: one unsigned operand makes the whole expression unsigned,
+    // and that unsignedness propagates back into context-determined operands
+    // — including `**`'s base. Under an unsigned outer context `4'shf`
+    // zero-extends to 15 before the exponentiation, so the answer is 15 ** 2
+    // rather than (-1) ** 2. The exponent stays self-determined (LRM
+    // Table 5-22). Every expectation here matches Icarus Verilog.
+    let unsigned_outer = evaluate_input("(4'shf ** 2) + 8'h0").expect("unsigned outer");
+    let unsigned_odd_exp = evaluate_input("(4'shf ** 3) + 8'h0").expect("odd exponent");
+    let signed_outer = evaluate_input("(4'shf ** 2) + 8'sh0").expect("signed outer");
+    let self_determined = evaluate_input("4'shf ** 2").expect("self-determined");
+    let negative_exponent = evaluate_input("(4'shd3 ** 4'shf) + 8'h0").expect("negative exponent");
+
+    // 15 ** 2 == 225.
+    assert_eq!(unsigned_outer.output, "8'he1");
+    // 15 ** 3 == 3375, truncated to 8 bits. An odd exponent distinguishes
+    // zero-extension from sign-extension even where the even one coincides.
+    assert_eq!(unsigned_odd_exp.output, "8'h2f");
+    // Signed outer context: the base stays -1, so (-1) ** 2 == 1.
+    assert_eq!(signed_outer.output, "8'sh01");
+    // No outer context: the base keeps its own signedness.
+    assert_eq!(self_determined.output, "4'sh1");
+    // The exponent is self-determined, so 4'shf is -1 and a negative
+    // exponent yields 0. Widening it to the outer 8-bit unsigned context
+    // would have made it 15 and answered 8'h6b.
+    assert_eq!(negative_exponent.output, "8'h00");
+}
+
+// The same propagated signedness must decide how a *negative* exponent reads
+// the base, because `**`'s negative-exponent rules branch on whether the base
+// is 0, 1, or -1. `BinaryPower` used to re-read the base with the LHS's own
+// signedness, so the visitor's zero-extension was undone at the last step and
+// `(4'shf ** -1) + 4'h0` answered `4'hf` instead of `4'h0`. Every expectation
+// here matches Icarus Verilog.
+#[test]
+fn outer_context_signedness_also_drives_negative_exponent_base_reading() {
+    // Unsigned outer context: the base is 15, and a negative exponent of a
+    // base that is neither 0, 1, nor -1 truncates to zero.
+    assert_eq!(
+        evaluate_input("(4'shf ** -1) + 4'h0")
+            .expect("unsigned outer, -1")
+            .output,
+        "4'h0"
+    );
+    assert_eq!(
+        evaluate_input("(4'shf ** -2) + 4'h0")
+            .expect("unsigned outer, -2")
+            .output,
+        "4'h0"
+    );
+    assert_eq!(
+        evaluate_input("(4'shd2 ** -1) + 4'h0")
+            .expect("unsigned outer, base 2")
+            .output,
+        "4'h0"
+    );
+
+    // Self-determined: the base keeps its own signedness, so it is -1 and a
+    // negative exponent yields +/-1 by exponent parity.
+    assert_eq!(
+        evaluate_input("4'shf ** -1")
+            .expect("self-determined, -1")
+            .output,
+        "4'shf"
+    );
+    assert_eq!(
+        evaluate_input("4'shf ** -2")
+            .expect("self-determined, -2")
+            .output,
+        "4'sh1"
+    );
+
+    // A signed outer context leaves the base at -1, so the parity rule still
+    // applies instead of the truncation rule above.
+    assert_eq!(
+        evaluate_input("(4'shf ** -1) + 4'sh0")
+            .expect("signed outer, -1")
+            .output,
+        "4'shf"
+    );
+    assert_eq!(
+        evaluate_input("(4'shf ** -2) + 4'sh0")
+            .expect("signed outer, -2")
+            .output,
+        "4'sh1"
+    );
+    assert_eq!(
+        evaluate_input("(4'shf ** -3) + 4'sh0")
+            .expect("signed outer, -3")
+            .output,
+        "4'shf"
+    );
+
+    // The other two special bases are unaffected by the propagation, but pin
+    // them so a future change to the negative-exponent rules is caught.
+    assert_eq!(
+        evaluate_input("(4'shd1 ** -1) + 4'h0")
+            .expect("unsigned outer, base 1")
+            .output,
+        "4'h1"
+    );
+    assert_eq!(
+        evaluate_input("(4'shd1 ** -5) + 4'h0")
+            .expect("unsigned outer, base 1, odd")
+            .output,
+        "4'h1"
+    );
+    assert_eq!(
+        evaluate_input("(4'shd0 ** -1) + 4'h0")
+            .expect("unsigned outer, base 0")
+            .output,
+        "4'hx"
+    );
+}
+
+#[test]
 fn returns_all_x_for_power_unknowns_and_undefined_zero_negative_exponent() {
     let unknown = evaluate_input("4'bx ** 2").expect("unknown power should evaluate");
     let undefined = evaluate_input("0 ** -1").expect("undefined integer power should yield x");

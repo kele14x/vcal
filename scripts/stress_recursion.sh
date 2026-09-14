@@ -200,6 +200,9 @@ run_case "eval binary-rel           1<1<..<1"           "n=$EVAL_DEPTH; print('1
 run_case "eval binary-eq            1==1==..==1"        "n=$EVAL_DEPTH; print('1' + '==1'*n)"
 run_case "eval binary-and           1&&1&&..&&1"        "n=$EVAL_DEPTH; print('1' + '&&1'*n)"
 run_case "eval binary-or            1||1||..||1"        "n=$EVAL_DEPTH; print('1' + '||1'*n)"
+# Alternating real/integer `&&` operands: every other node takes the mixed
+# path, which pops one operand off `real_vals` and the other off `vals`.
+run_case "eval mixed-real-logical   1.0&&1&&1.0&&1.."   "n=$EVAL_DEPTH; print('1.0&&1&&'*n + '1')"
 run_case "eval binary-bitand        1&1&..&1"           "n=$EVAL_DEPTH; print('1' + '&1'*n)"
 run_case "eval binary-bitxor        1^1^..^1"           "n=$EVAL_DEPTH; print('1' + '^1'*n)"
 run_case "eval binary-shift         1<<1<<..<<1"        "n=$EVAL_DEPTH; print('1' + '<<1'*n)"

@@ -1753,10 +1753,12 @@ enum EvalCombiner<'b, 'a: 'b> {
     },
     /// Integer power. Pops 2 values (lhs, rhs); the RHS is scheduled through
     /// the same work stack with no propagated context, then applied with
-    /// width-bounded modular exponentiation.
+    /// width-bounded modular exponentiation. The base is interpreted under
+    /// `effective_meta`'s signedness — the same one the visitor extended it
+    /// with — and `effective_meta.base` is the LHS's display base, since
+    /// power takes both from the LHS alone.
     BinaryPower {
         effective_meta: ExprMeta,
-        lhs_meta: ExprMeta,
     },
     /// Less / Greater / LessOrEq / GreaterOrEq on integers. Pops 2 values
     /// already extended to the unified comparison context.
@@ -1920,6 +1922,16 @@ enum EvalCombiner<'b, 'a: 'b> {
     BinaryRealLogical {
         op: BinaryOp,
         ctx: Option<ExprMeta>,
+    },
+    /// `&&` / `||` where exactly one operand is real and the other is
+    /// integer. The real operand comes off `real_vals` and the integer
+    /// operand off `vals`, each reduced in its own type so the integer
+    /// side's x/z bits survive instead of being flattened to 0.0 by the
+    /// LRM 3.5.3 real conversion.
+    BinaryRealLogicalMixed {
+        op: BinaryOp,
+        ctx: Option<ExprMeta>,
+        lhs_is_real: bool,
     },
     /// Real-typed `?:` cond on an integer-result conditional. Pops 1
     /// f64 (cond) and dispatches: definite cond pushes
@@ -2541,12 +2553,40 @@ fn visit_binary_eval<'b, 'a: 'b>(
                 return Ok(());
             }
             BinaryOp::LogicalAnd | BinaryOp::LogicalOr => {
-                work.push(EvalTask::Combine(EvalCombiner::BinaryRealLogical {
+                if lhs.is_real() == rhs.is_real() {
+                    work.push(EvalTask::Combine(EvalCombiner::BinaryRealLogical {
+                        op,
+                        ctx,
+                    }));
+                    push_visit_as_real(rhs, work);
+                    push_visit_as_real(lhs, work);
+                    return Ok(());
+                }
+                // Exactly one operand is real: each side is reduced in its own
+                // type. Coercing the integer side to real first would flatten
+                // its x/z bits to 0.0 (LRM 3.5.3) and answer 0 where the LRM
+                // 5.1.9 truth table says x — `1'bx && 1.0` is x, not 0.
+                work.push(EvalTask::Combine(EvalCombiner::BinaryRealLogicalMixed {
                     op,
                     ctx,
+                    lhs_is_real: lhs.is_real(),
                 }));
-                push_visit_as_real(rhs, work);
-                push_visit_as_real(lhs, work);
+                if rhs.is_real() {
+                    push_visit_as_real(rhs, work);
+                } else {
+                    work.push(EvalTask::Visit {
+                        node: rhs,
+                        ctx: None,
+                    });
+                }
+                if lhs.is_real() {
+                    push_visit_as_real(lhs, work);
+                } else {
+                    work.push(EvalTask::Visit {
+                        node: lhs,
+                        ctx: None,
+                    });
+                }
                 return Ok(());
             }
         }
@@ -2671,14 +2711,13 @@ fn visit_binary_eval<'b, 'a: 'b>(
     let meta = combine_binary_meta(op, lhs_meta, rhs_meta);
     let effective_meta = ExprMeta {
         width: ctx.map_or(meta.width, |c| usize::max(c.width, meta.width)),
-        // Arithmetic and bitwise operands take the surrounding expression's
-        // propagated signedness. Power keeps its LHS-derived signedness; its
-        // RHS is self-determined and never contributes to the result type.
-        signed: if matches!(op, BinaryOp::Power) {
-            meta.signed
-        } else {
-            ctx.map_or(meta.signed, |c| c.signed)
-        },
+        // Arithmetic, bitwise, and power results all take the surrounding
+        // expression's propagated signedness: LRM 5.5.1 makes an unsigned
+        // operand anywhere in the expression turn the whole expression
+        // unsigned, and that unsignedness propagates back down into
+        // context-determined operands. Power's *exponent* stays
+        // self-determined — see the Power arm below.
+        signed: ctx.map_or(meta.signed, |c| c.signed),
         base: meta.base,
     };
 
@@ -2703,19 +2742,24 @@ fn visit_binary_eval<'b, 'a: 'b>(
             });
         }
         BinaryOp::Power => {
-            // lhs takes the result width but lhs's own signedness/base.
+            // lhs takes the result width and the *propagated* signedness, so an
+            // unsigned outer context zero-extends the base instead of
+            // sign-extending it: `(4'shf ** 2) + 8'h0` is 8'he1 (15 ** 2), not
+            // 8'h01 ((-1) ** 2). The same propagation decides how a negative
+            // exponent reads the base — `(4'shf ** -1) + 4'h0` is 0, because
+            // 15 ** -1 truncates to zero, whereas self-determined
+            // `4'shf ** -1` stays -1. Its display base still comes from lhs.
             // rhs (the exponent) is self-determined per LRM Table 5-3:
             // evaluated at its own width in the BinaryPower combiner via the
             // standard integer pipeline, then applied with modular
             // exponentiation so the result stays bounded by the result width.
             let lhs_inner_ctx = ExprMeta {
                 width: effective_meta.width,
-                signed: lhs_meta.signed,
-                base: lhs_meta.base,
+                signed: effective_meta.signed,
+                base: effective_meta.base,
             };
             work.push(EvalTask::Combine(EvalCombiner::BinaryPower {
                 effective_meta,
-                lhs_meta,
             }));
             work.push(EvalTask::Visit {
                 node: rhs,
@@ -2974,17 +3018,14 @@ fn combine_eval<'b, 'a: 'b>(
                 bits,
             ));
         }
-        EvalCombiner::BinaryPower {
-            effective_meta,
-            lhs_meta,
-        } => {
+        EvalCombiner::BinaryPower { effective_meta } => {
             let exponent_value = vals.pop().expect("BinaryPower: rhs missing");
             let lhs_value = vals.pop().expect("BinaryPower: lhs missing");
             if lhs_value.has_unknown_bits() {
                 vals.push(IntegerValue::all_x(
                     effective_meta.width,
-                    lhs_meta.signed,
-                    lhs_meta.base,
+                    effective_meta.signed,
+                    effective_meta.base,
                 ));
                 return Ok(());
             }
@@ -2994,20 +3035,24 @@ fn combine_eval<'b, 'a: 'b>(
             if exponent_value.has_unknown_bits() {
                 vals.push(IntegerValue::all_x(
                     effective_meta.width,
-                    lhs_meta.signed,
-                    lhs_meta.base,
+                    effective_meta.signed,
+                    effective_meta.base,
                 ));
                 return Ok(());
             }
             let exponent_value = exponent_value.as_bigint(exponent_value.signed);
-            let base_value = lhs_value.as_bigint(lhs_meta.signed);
+            // The base must be read with the same signedness the visitor
+            // extended it under. Using the LHS's own signedness instead would
+            // reinterpret an already zero-extended base as negative, so
+            // `(4'shf ** -1) + 4'h0` would answer -1 where iverilog says 0.
+            let base_value = lhs_value.as_bigint(effective_meta.signed);
             let result = match evaluate_power(base_value, exponent_value, effective_meta.width) {
                 Ok(r) => r,
                 Err(_) => {
                     vals.push(IntegerValue::all_x(
                         effective_meta.width,
-                        lhs_meta.signed,
-                        lhs_meta.base,
+                        effective_meta.signed,
+                        effective_meta.base,
                     ));
                     return Ok(());
                 }
@@ -3015,8 +3060,8 @@ fn combine_eval<'b, 'a: 'b>(
             vals.push(IntegerValue::from_bigint(
                 result,
                 effective_meta.width,
-                lhs_meta.signed,
-                lhs_meta.base,
+                effective_meta.signed,
+                effective_meta.base,
             ));
         }
         EvalCombiner::BinaryRelational { op, signed, ctx } => {
@@ -3038,19 +3083,7 @@ fn combine_eval<'b, 'a: 'b>(
             let lhs_value = vals.pop().expect("BinaryLogical: lhs missing");
             let lhs_logical = logical_value(&lhs_value);
             let rhs_logical = logical_value(&rhs_value);
-            let bit = match op {
-                BinaryOp::LogicalAnd => match (lhs_logical, rhs_logical) {
-                    (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
-                    (LogicBit::One, LogicBit::One) => LogicBit::One,
-                    _ => LogicBit::X,
-                },
-                BinaryOp::LogicalOr => match (lhs_logical, rhs_logical) {
-                    (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
-                    (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
-                    _ => LogicBit::X,
-                },
-                _ => unreachable!("BinaryLogical Combine got non-logical op"),
-            };
+            let bit = apply_logical_truth_table(op, lhs_logical, rhs_logical);
             vals.push(widen_relational_result(comparison_result_value(bit), ctx));
         }
         EvalCombiner::BinaryShift {
@@ -3421,19 +3454,38 @@ fn combine_eval<'b, 'a: 'b>(
             let lhs_val = real_vals.pop().expect("BinaryRealLogical: lhs missing");
             let lhs_logical = logical_value_of_real(lhs_val);
             let rhs_logical = logical_value_of_real(rhs_val);
-            let bit = match op {
-                BinaryOp::LogicalAnd => match (lhs_logical, rhs_logical) {
-                    (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
-                    (LogicBit::One, LogicBit::One) => LogicBit::One,
-                    _ => LogicBit::X,
-                },
-                BinaryOp::LogicalOr => match (lhs_logical, rhs_logical) {
-                    (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
-                    (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
-                    _ => LogicBit::X,
-                },
-                _ => unreachable!("non-logical op in BinaryRealLogical"),
+            let bit = apply_logical_truth_table(op, lhs_logical, rhs_logical);
+            vals.push(widen_relational_result(comparison_result_value(bit), ctx));
+        }
+        EvalCombiner::BinaryRealLogicalMixed {
+            op,
+            ctx,
+            lhs_is_real,
+        } => {
+            // Exactly one operand is real. Reducing both to real first (what
+            // the plain `BinaryRealLogical` path does) maps the integer side's
+            // x/z bits to 0.0 via LRM 3.5.3, so `1'bx && 1.0` would answer 0
+            // instead of x. Reduce each operand in its own type instead: the
+            // real side through `logical_value_of_real`, the integer side
+            // through `logical_value` (reduction-OR, x/z preserved).
+            let (lhs_logical, rhs_logical) = if lhs_is_real {
+                let lhs_val = real_vals
+                    .pop()
+                    .expect("BinaryRealLogicalMixed: lhs real missing");
+                let rhs_val = vals
+                    .pop()
+                    .expect("BinaryRealLogicalMixed: rhs integer missing");
+                (logical_value_of_real(lhs_val), logical_value(&rhs_val))
+            } else {
+                let lhs_val = vals
+                    .pop()
+                    .expect("BinaryRealLogicalMixed: lhs integer missing");
+                let rhs_val = real_vals
+                    .pop()
+                    .expect("BinaryRealLogicalMixed: rhs real missing");
+                (logical_value(&lhs_val), logical_value_of_real(rhs_val))
             };
+            let bit = apply_logical_truth_table(op, lhs_logical, rhs_logical);
             vals.push(widen_relational_result(comparison_result_value(bit), ctx));
         }
         EvalCombiner::ConditionalChooseRealCond {
@@ -3785,6 +3837,27 @@ fn logical_value(value: &IntegerValue) -> LogicBit {
         LogicBit::Zero
     } else {
         LogicBit::X
+    }
+}
+
+// LRM 5.1.9 Tables 5-14 / 5-15: the `&&` / `||` truth table over two
+// operands that have each already been reduced to a single logical bit by
+// `logical_value` (integer) or `logical_value_of_real` (real). A definite 0
+// dominates `&&` and a definite 1 dominates `||`; anything else with an
+// unknown operand stays x.
+fn apply_logical_truth_table(op: BinaryOp, lhs: LogicBit, rhs: LogicBit) -> LogicBit {
+    match op {
+        BinaryOp::LogicalAnd => match (lhs, rhs) {
+            (LogicBit::Zero, _) | (_, LogicBit::Zero) => LogicBit::Zero,
+            (LogicBit::One, LogicBit::One) => LogicBit::One,
+            _ => LogicBit::X,
+        },
+        BinaryOp::LogicalOr => match (lhs, rhs) {
+            (LogicBit::One, _) | (_, LogicBit::One) => LogicBit::One,
+            (LogicBit::Zero, LogicBit::Zero) => LogicBit::Zero,
+            _ => LogicBit::X,
+        },
+        _ => unreachable!("apply_logical_truth_table got non-logical op"),
     }
 }
 

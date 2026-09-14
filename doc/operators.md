@@ -16,10 +16,12 @@ The general evaluation model — width, signedness, leaf extension, base inherit
   - unary `+` / unary `-` = `max(L(operand), L(context))`
 - For `**`, the RHS is evaluated through the normal self-determined integer rules at its own width and signedness. Nested operations therefore wrap before their value is used as an exponent; for example, `2 ** 40` wraps to zero at 32 bits, so `2 ** (2 ** 40)` is `1`.
 - Integer power is evaluated modulo `2^result_width`. This is equivalent to truncating the mathematical result to the expression width while keeping intermediate values bounded even for very large exponents.
-- The result signedness and display base of `**` come from the LHS; the RHS does not affect either.
+- The display base of `**` comes from the LHS, and the RHS affects neither base nor signedness. The result's signedness is the LHS's own when self-determined and the propagated context's otherwise, following the resize rule below.
 - Width/context resize happens before unary `-` is evaluated, so `-4'sb0001` is not always interchangeable with the already-resized bit pattern `4'sb1111`.
 - Resizing follows the propagated context signedness, so even a signed operand may be zero-extended in an unsigned context.
   - Example: `4'sb1000 + 8'b0` -> `8'b00001000`, because the propagated context is unsigned and `4'sb1000` is extended with zeros before evaluation.
+  - Example: `(4'shf ** 2) + 8'h0` -> `8'he1`, because the unsigned context reaches the power base, which zero-extends to 15 before exponentiating; `(4'shf ** 2) + 8'sh0` -> `8'sh01` keeps it at -1. The exponent stays self-determined in both, so `(4'shd3 ** 4'shf) + 8'h0` is `8'h00` (negative exponent) rather than `8'h6b`.
+  - A negative exponent reads the base through that same propagated signedness, because its rules branch on whether the base is 0, 1, or -1: 0 gives x, 1 gives 1, -1 gives 1 or -1 by exponent parity, and anything else truncates to 0. So `(4'shf ** -1) + 4'h0` is `4'h0` (base 15), while self-determined `4'shf ** -1` is `4'shf` (base -1, odd exponent) and `(4'shf ** -1) + 4'sh0` is `4'shf` again.
 - x/z handling: vcal follows iverilog's convention rather than the strict LRM rule. See [non-standard.md](non-standard.md) → "Arithmetic operators".
 
 ## Relational operators
@@ -65,6 +67,7 @@ The general evaluation model — width, signedness, leaf extension, base inherit
   - otherwise, if there is x/z and no definite `1`, the result is `x`
 - `!`, `&&`, and `||` follow the LRM §5.1.9 truth tables.
 - Binary logical operators return a self-determined 1-bit unsigned result, which may then widen in an outer arithmetic context just like relational and equality operators.
+- With a real operand, each side still reduces in its own type before the truth table applies: the real side as `0.0` -> `0`, NaN -> `x`, anything else -> `1`; the integer side by the reduction rule above. Converting the integer side to real first would flatten its x/z bits to `0.0`, so `1'bx && 1.0` and `1'bx || 0.0` are both `1'bx`, while a definite operand still dominates (`1'bx && 0.0` is `1'b0`, `1'bx || 1.0` is `1'b1`). Relational and equality operators differ: those do convert both sides to real, so `1'bx == 1.0` is `1'b0` and `1'bx < 1.0` is `1'b1`.
 
 ## Bitwise operators
 
