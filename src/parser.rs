@@ -2043,10 +2043,21 @@ fn parse_based_decimal(
 
     let unsized_literal = width_hint.is_none();
 
+    // LRM A.3.1: a decimal based constant is either an `unsigned_number`
+    // (digits and `_`) or a *single* `x_digit` / `z_digit` / `?` followed by
+    // `{ _ }`. Underscores are already stripped, so the unknown form is
+    // exactly one character — `8'dxx`, `8'dzz`, and `8'dx_x` are syntax
+    // errors, not all-unknown constants. Binary / octal / hex place no such
+    // limit (LRM A.3.2-A.3.4) and go through `parse_based_radix` instead.
+    let single_unknown = digits
+        .chars()
+        .next()
+        .filter(|_| digits.chars().count() == 1);
+
     // All-x and all-z decimal short-circuits — used to allocate the full
     // width directly. Now stored as an empty bit prefix plus an X/Z fill;
     // materialize() expands at eval time after the validator caps width.
-    if digits.chars().all(is_x_digit) {
+    if single_unknown.is_some_and(is_x_digit) {
         let width = width_hint.unwrap_or(32);
         return Ok(LiteralSpec {
             width,
@@ -2060,7 +2071,7 @@ fn parse_based_decimal(
         });
     }
 
-    if digits.chars().all(is_z_digit) {
+    if single_unknown.is_some_and(is_z_digit) {
         let width = width_hint.unwrap_or(32);
         return Ok(LiteralSpec {
             width,

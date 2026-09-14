@@ -526,6 +526,7 @@ where
     }
     literal.push(base_ch);
 
+    let mut radix_ch = base_ch;
     if matches!(base_ch, 's' | 'S') {
         let (_, signed_base_ch) = chars
             .next()
@@ -534,14 +535,28 @@ where
             return Err("missing base after signed marker".to_string());
         }
         literal.push(signed_base_ch);
+        radix_ch = signed_base_ch;
     }
+    let decimal = matches!(radix_ch, 'd' | 'D');
 
     let mut saw_digit = false;
+    // Tracks decimal *value* characters (digits and x/z/?), so `_` does not set
+    // it. LRM A.3.1 lets a decimal based constant be either an unsigned_number
+    // or a single x_digit / z_digit / `?` followed by underscores only, so once
+    // any value character is in the run the run is complete and a following `?`
+    // is the conditional operator. Testing digits alone misses the unknown
+    // forms: `8'dx?1:1` is `8'dx ? 1 : 1`, not an invalid `x?1` constant.
+    let mut saw_decimal_value_char = false;
     while let Some((_, next_ch)) = chars.peek().copied() {
-        // `?` is a valid based-literal digit (alias for `z`, LRM 3.5), so
-        // it must not terminate the post-apostrophe digit run even though
-        // it is an expression delimiter elsewhere.
-        if next_ch != '?' && is_expression_delimiter(next_ch) {
+        // `?` is a valid based-literal digit (alias for `z`, LRM 3.5), so it
+        // does not terminate a binary / octal / hex run, which may interleave
+        // it with digits (LRM A.3.2-A.3.4). A decimal run is narrower: LRM
+        // A.3.1 allows `?` only as the run's single unknown digit, so once a
+        // decimal value character has been read a following `?` is the
+        // conditional operator — `1'd1?2:3` is `1'd1 ? 2 : 3`, not an invalid
+        // `1?2` constant.
+        let continues_run = next_ch == '?' && !(decimal && saw_decimal_value_char);
+        if !continues_run && is_expression_delimiter(next_ch) {
             break;
         }
 
@@ -559,6 +574,7 @@ where
         chars.next();
         literal.push(next_ch);
         saw_digit = true;
+        saw_decimal_value_char |= matches!(next_ch, '0'..='9' | 'x' | 'X' | 'z' | 'Z' | '?');
     }
 
     if !saw_digit {

@@ -257,3 +257,177 @@ fn accepts_underscore_separators_inside_digit_run() {
         "16'hbeef"
     );
 }
+
+// LRM A.3.1 gives a decimal based constant either an `unsigned_number` or a
+// single `x_digit` / `z_digit` / `?`, so `?` cannot follow any completed
+// decimal value — neither a digit nor an unknown one. The lexer used to treat
+// `?` as a literal digit in every base, which made `1'd1?2:3` lex as one
+// malformed `1?2` constant rather than the conditional `1'd1 ? 2 : 3`.
+// Recognising digits alone still broke the unknown forms: `8'dx?1:1` lexed as
+// an invalid `x?1` constant instead of `8'dx ? 1 : 1`. Icarus Verilog
+// evaluates every case below as the conditional.
+#[test]
+fn decimal_literal_does_not_swallow_adjacent_conditional_operator() {
+    assert_eq!(
+        evaluate_input("1'd1?2:3").expect("decimal cond").output,
+        "32'sd2"
+    );
+    assert_eq!(
+        evaluate_input("1'd0?2:3").expect("false cond").output,
+        "32'sd3"
+    );
+    assert_eq!(
+        evaluate_input("8'd12?3:4")
+            .expect("multi-digit cond")
+            .output,
+        "32'sd3"
+    );
+    // The signed marker sits between the apostrophe and the radix character,
+    // so the decimal rule has to look past it.
+    assert_eq!(
+        evaluate_input("8'sd1?2:3")
+            .expect("signed decimal cond")
+            .output,
+        "32'sd2"
+    );
+    // Spaced forms were already correct; guard against over-correcting them.
+    assert_eq!(
+        evaluate_input("1'd1 ?2:3").expect("spaced cond").output,
+        "32'sd2"
+    );
+    // Unsized decimal literals take a different lexer path and were never
+    // affected.
+    assert_eq!(
+        evaluate_input("12?3:4").expect("unsized cond").output,
+        "32'sd3"
+    );
+    // A completed `x` / `z` / `?` value closes the decimal run just as a digit
+    // does, so the following `?` opens the conditional. Both branches equal
+    // here, which is what Icarus Verilog reports for an x or z condition.
+    assert_eq!(evaluate_input("8'dx?1:1").expect("x cond").output, "32'sd1");
+    assert_eq!(evaluate_input("8'dz?1:1").expect("z cond").output, "32'sd1");
+    assert_eq!(evaluate_input("8'd??1:1").expect("? cond").output, "32'sd1");
+    assert_eq!(
+        evaluate_input("8'sdx?1:1").expect("signed x cond").output,
+        "32'sd1"
+    );
+    // Where the branches differ, the unknown condition keeps the result
+    // unknown, matching Icarus Verilog.
+    assert_eq!(
+        evaluate_input("8'dx?1'b0:1'b1")
+            .expect("x cond split")
+            .output,
+        "1'bx"
+    );
+    assert_eq!(
+        evaluate_input("8'dz?8'hff:8'h00")
+            .expect("z cond split")
+            .output,
+        "8'hxx"
+    );
+    // The unsized decimal path needs the same boundary.
+    assert_eq!(
+        evaluate_input("'dx?1:2").expect("unsized x cond").output,
+        "32'sdx"
+    );
+    // A `?` left with no operands is now the conditional operator missing its
+    // branches, not an extra literal digit.
+    assert_eq!(
+        evaluate_input("8'dx?").expect_err("dangling ?"),
+        "Syntax error: unexpected end of expression"
+    );
+}
+
+// `?` stays a legal decimal digit when it *is* the whole value: LRM A.3.1
+// allows one `x_digit` / `z_digit` / `?` followed by underscores.
+#[test]
+fn single_unknown_decimal_digit_is_still_accepted() {
+    assert_eq!(evaluate_input("8'd?").expect("bare ?").output, "8'dz");
+    assert_eq!(evaluate_input("8'dx").expect("bare x").output, "8'dx");
+    assert_eq!(evaluate_input("8'dz").expect("bare z").output, "8'dz");
+    assert_eq!(
+        evaluate_input("8'dx_").expect("trailing underscore").output,
+        "8'dx"
+    );
+    assert_eq!(
+        evaluate_input("8'd?__").expect("two underscores").output,
+        "8'dz"
+    );
+    assert_eq!(evaluate_input("8'sd?").expect("signed").output, "8'sdz");
+    assert_eq!(evaluate_input("'d?").expect("unsized").output, "32'dz");
+    // Whitespace between the base and the run is skipped before the first
+    // digit, so the `?` here still opens the run rather than starting a
+    // conditional.
+    assert_eq!(evaluate_input("8'd ?").expect("spaced ?").output, "8'dz");
+}
+
+// LRM A.3.1 permits exactly one unknown digit in a decimal based constant,
+// optionally followed by underscores. `8'dxx` used to be accepted as an
+// all-x constant; Icarus Verilog rejects every form below.
+#[test]
+fn rejects_multiple_unknown_digits_in_decimal_literal() {
+    assert_eq!(
+        evaluate_input("8'dxx").expect_err("two x"),
+        "Syntax error: invalid decimal digits: xx"
+    );
+    assert_eq!(
+        evaluate_input("8'dzz").expect_err("two z"),
+        "Syntax error: invalid decimal digits: zz"
+    );
+    // Underscores are stripped before the check, so a separator cannot smuggle
+    // in a second unknown digit.
+    assert_eq!(
+        evaluate_input("8'dx_x").expect_err("x underscore x"),
+        "Syntax error: invalid decimal digits: xx"
+    );
+    assert_eq!(
+        evaluate_input("8'dxz").expect_err("x then z"),
+        "Syntax error: invalid decimal digits: xz"
+    );
+    assert_eq!(
+        evaluate_input("8'd?x").expect_err("? then x"),
+        "Syntax error: invalid decimal digits: ?x"
+    );
+    assert_eq!(
+        evaluate_input("8'SD?X").expect_err("uppercase base"),
+        "Syntax error: invalid decimal digits: ?X"
+    );
+    assert_eq!(
+        evaluate_input("'dxx").expect_err("unsized two x"),
+        "Syntax error: invalid decimal digits: xx"
+    );
+    // Mixing an unknown digit with a value digit was already rejected; these
+    // pin the diagnostic so the new rule doesn't change it.
+    assert_eq!(
+        evaluate_input("8'd1x").expect_err("digit then x"),
+        "Syntax error: invalid decimal digits: 1x"
+    );
+    assert_eq!(
+        evaluate_input("8'dx1").expect_err("x then digit"),
+        "Syntax error: invalid decimal digits: x1"
+    );
+}
+
+// Binary, octal, and hex values may interleave `x` / `z` / `?` with digits
+// (LRM A.3.2-A.3.4), so the decimal boundary rule must not leak into them:
+// `?` stays part of the literal in those bases.
+#[test]
+fn non_decimal_bases_keep_interleaved_unknown_digits() {
+    assert_eq!(
+        evaluate_input("8'b1?1").expect("binary ?").output,
+        "8'b000001z1"
+    );
+    assert_eq!(evaluate_input("8'h1?1").expect("hex ?").output, "8'hz1");
+    assert_eq!(evaluate_input("8'hxx").expect("hex xx").output, "8'hxx");
+    assert_eq!(
+        evaluate_input("8'bzz").expect("binary zz").output,
+        "8'bzzzzzzzz"
+    );
+    assert_eq!(evaluate_input("8'o7?7").expect("octal ?").output, "8'o3z7");
+    // Greedy `?` in a hex run leaves `1:2` dangling, which is a syntax error —
+    // Icarus Verilog rejects `8'h1?2:3` the same way.
+    assert_eq!(
+        evaluate_input("8'h1?2:3").expect_err("hex swallows ?"),
+        "Syntax error: unexpected token after end of statement"
+    );
+}
