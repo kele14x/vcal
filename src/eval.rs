@@ -511,8 +511,10 @@ fn annotate_combine<'a>(
             let item_annots = pop_n(vals, item_count);
             // LRM 5.1.14: width = sum of operand widths, always unsigned,
             // base from leftmost item. Real items are rejected by the
-            // validator (concat requires definite bit widths); the meta
-            // built here is only consumed if validation passes.
+            // validator (concat requires definite bit widths), but the width
+            // published here is consumed before that runs — context
+            // propagation uses it to resize *sibling* leaves — so it has to
+            // respect the cap on its own, exactly like the replication arm.
             let mut total_width = 0usize;
             let mut leftmost_base = Base::Binary;
             for (idx, item) in item_annots.iter().enumerate() {
@@ -523,6 +525,7 @@ fn annotate_combine<'a>(
                     }
                 }
             }
+            value::ensure_bit_width(total_width, "concatenation")?;
             Ok(Annotated {
                 expr,
                 meta: Some(ExprMeta {
@@ -571,6 +574,15 @@ fn annotate_combine<'a>(
                 }
             }
             let total_width = count_value.map_or(0, |c| inner_width.saturating_mul(c));
+            // Cap the inferred width here, not only at `ReplicationFinalize`.
+            // Annotation publishes this width into `ExprMeta`, and context
+            // propagation uses it to resize *sibling* leaves — so an uncapped
+            // width allocates before this replication node is ever evaluated
+            // (`1 ? 1'b1 : {64'hffff_ffff_ffff_ffff{1'b0}}` aborts with
+            // `capacity overflow`), and a width merely above the cap silently
+            // violates it. Same invariant `infer_select_meta` enforces for
+            // part-selects.
+            value::ensure_bit_width(total_width, "replication")?;
             Ok(Annotated {
                 expr,
                 meta: Some(ExprMeta {
@@ -842,13 +854,15 @@ pub(crate) fn evaluate_assignment_rhs(
 // Self-determined evaluation of an integer-typed constant expression
 // (used by the reg-declaration range halves). Mirrors the `None` context
 // path the evaluator takes for the top-level expression in a calculator
-// line.
+// line. Errors return unprefixed; callers that are public entry points add
+// the "Semantic error: " stage prefix, while the select helpers reached
+// through `select_meta_width` rely on the validator's own prefixing.
 pub(crate) fn evaluate_constant_expr(
     expr: &Expr,
     session: &Session,
 ) -> Result<IntegerValue, String> {
-    let annotated = annotate(expr, session).map_err(|e| format!("Semantic error: {e}"))?;
-    validate_annotated(&annotated, session).map_err(|e| format!("Semantic error: {e}"))?;
+    let annotated = annotate(expr, session)?;
+    validate_annotated(&annotated, session)?;
     evaluate_annotated(&annotated, None, session)
 }
 
@@ -968,24 +982,19 @@ pub(crate) fn expression_is_real(expr: &Expr, session: &Session) -> bool {
             }
             // Bit-select / part-select on a vector reg is always
             // integer-typed (LRM 4.7). A real-array element select
-            // (`r[i]`) yields real. Selects on a scalar `real` are
-            // prohibited (LRM 4.8.1) and the validator rejects them
-            // before this function runs.
-            Expr::Select { name, kind, inner } => match session.lookup(name) {
-                Some(reg)
-                    if reg.is_real_array()
-                        && matches!(kind, SelectKind::Bit { .. })
-                        && inner.is_none() =>
-                {
+            // (`r[i]`) yields real. A select on a scalar `real` is
+            // prohibited (LRM 4.8.1), but this runs during annotation —
+            // ahead of the validator that rejects it — so report
+            // integer-typed and let `infer_select_meta` surface the
+            // diagnostic instead of aborting here.
+            Expr::Select { name, kind, inner } => {
+                let real_array_element = matches!(kind, SelectKind::Bit { .. })
+                    && inner.is_none()
+                    && session.lookup(name).is_some_and(|reg| reg.is_real_array());
+                if real_array_element {
                     return true;
                 }
-                Some(reg) if reg.is_real() => {
-                    unreachable!(
-                        "validator rejects select on scalar real `{name}` before evaluation (LRM 4.8.1)"
-                    );
-                }
-                _ => {}
-            },
+            }
             Expr::Truncated => unreachable!(
                 "Expr::Truncated is a display-only sentinel; never reaches expression_is_real"
             ),
@@ -4795,6 +4804,17 @@ fn leaf_lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, Stri
             let reg = session
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+            // Mirror `validate_select_expr_structure`'s ordering on the RHS
+            // path: validate the index / endpoint subtrees before reading any
+            // type off them. The checks below only ask `expression_is_real`,
+            // which reports a subtree's *result* type and deliberately skips
+            // structural rules, so an integer-typed but illegal index like
+            // `1.0 % 2` would pass here and hit an evaluator `unreachable!`
+            // during `distribute_bits_to_leaves`.
+            validate_select_kind_structure(kind, session)?;
+            if let Some(inner_kind) = inner {
+                validate_select_kind_structure(inner_kind, session)?;
+            }
             if reg.is_real_array() {
                 // Validate the shape exactly like `infer_select_meta`'s
                 // real-array branch: only `r[i]` is structurally legal.

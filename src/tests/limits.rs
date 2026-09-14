@@ -342,3 +342,73 @@ fn parse_input_skips_semantic_errors() {
     assert!(rendered.contains("Identifier"));
     assert!(rendered.contains("Add"));
 }
+
+// ---------------------------------------------------------------------------
+// Inferred replication / concatenation widths must respect MAX_BIT_WIDTH at
+// annotation time. `ExprMeta.width` is consumed by context propagation to
+// resize *sibling* leaves, so an oversized width used to allocate before the
+// node's own guard in `ReplicationFinalize` / the concatenation combine ever
+// ran — aborting the process with `capacity overflow` when the width was
+// huge, and silently exceeding the cap when it was merely over the limit.
+// ---------------------------------------------------------------------------
+
+const HUGE_REPLICATION: &str = "{64'hffffffffffffffff{1'b0}}";
+
+#[test]
+fn oversized_inferred_replication_width_rejected_in_every_context() {
+    let expected = "Semantic error: replication width 18446744073709551615 exceeds limit 16777216";
+    let mut session = Session::new();
+    session.eval("reg [3:0] a").expect("decl");
+
+    for input in [
+        format!("1 ? 1'b1 : {HUGE_REPLICATION}"),
+        format!("1'b1 + {HUGE_REPLICATION}"),
+        format!("1'b1 < {HUGE_REPLICATION}"),
+        format!("1'b1 & {HUGE_REPLICATION}"),
+        format!("a[1 ? 1'b0 : {HUGE_REPLICATION}]"),
+        format!("$signed(1 ? 1'b1 : {HUGE_REPLICATION})"),
+        format!("$display(1 ? 1'b1 : {HUGE_REPLICATION})"),
+        format!("a = 1 ? 1'b1 : {HUGE_REPLICATION}"),
+        // The bare form was already correct; the guard must not change it.
+        HUGE_REPLICATION.to_string(),
+    ] {
+        let err = session
+            .eval(&input)
+            .expect_err("oversized inferred width must be rejected");
+        assert_eq!(err, expected, "wrong diagnostic for {input}");
+    }
+
+    // The session survives every rejection, and nothing was written.
+    assert_eq!(session.eval("a").expect("session alive").output, "4'bxxxx");
+}
+
+#[test]
+fn replication_width_just_over_cap_rejected_in_conditional() {
+    // Below the `capacity overflow` threshold the cap used to be violated
+    // silently: the conditional published a 16,777,217-bit context and the
+    // selected branch printed a vector wider than MAX_BIT_WIDTH.
+    let err = evaluate_input("1 ? 1'b1 : {16777217{1'b0}}").unwrap_err();
+    assert_eq!(
+        err,
+        "Semantic error: replication width 16777217 exceeds limit 16777216"
+    );
+}
+
+#[test]
+fn oversized_inferred_concatenation_width_rejected_in_conditional() {
+    // Same hole through the concatenation arm: each operand fits under the
+    // cap, the sum does not, and the bare form was already rejected.
+    let err = evaluate_input("1 ? 1'b1 : {9000000'd1, 9000000'd1}").unwrap_err();
+    assert_eq!(
+        err,
+        "Semantic error: concatenation width 18000000 exceeds limit 16777216"
+    );
+}
+
+#[test]
+fn inferred_width_under_cap_still_accepted_in_conditional() {
+    // The annotation guard must not reject legal widths: the selected
+    // branch widens to the replication's 8-bit context.
+    let evaluation = evaluate_input("1 ? 1'b1 : {8{1'b0}}").expect("legal inferred width accepted");
+    assert_eq!(evaluation.output, "8'b00000001");
+}

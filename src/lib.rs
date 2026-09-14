@@ -792,10 +792,11 @@ fn evaluate_range_endpoint(expr: &Expr, session: &Session, role: &str) -> Result
     if eval::expression_is_real(expr, session) {
         return Err(format!("Semantic error: reg range {role} cannot be real"));
     }
-    // `evaluate_constant_expr` runs its own semantic_check and prefixes
-    // structural errors itself; the constant-must-not-contain-x check below
-    // is also a static-semantic rule, so it carries the same prefix.
-    let value = eval::evaluate_constant_expr(expr, session)?;
+    // Every diagnostic from this function is a static-semantic rule, so
+    // each carries the "Semantic error: " stage prefix — including the
+    // structural errors `evaluate_constant_expr` returns unprefixed.
+    let value =
+        eval::evaluate_constant_expr(expr, session).map_err(|e| format!("Semantic error: {e}"))?;
     if value.has_unknown_bits() {
         return Err(format!(
             "Semantic error: reg range {role} contains unknown bits"

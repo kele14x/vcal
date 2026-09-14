@@ -484,3 +484,84 @@ fn bare_concat_no_assign_still_parses_as_expression() {
         "2'b10"
     );
 }
+
+// ===========================================================================
+// LRM 5.2.1 / Table 5-3: an LHS index must be a legal integer expression.
+// The LHS guard only asked `expression_is_real`, which reports a subtree's
+// *result* type and deliberately skips structural rules — so an
+// integer-typed but illegal index like `1.0 % 2` slipped through and hit an
+// evaluator `unreachable!`, aborting the whole REPL process.
+// ===========================================================================
+
+#[test]
+fn lhs_index_with_illegal_subtree_is_rejected_not_fatal() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a").expect("decl a");
+    session.eval("reg [3:0] b").expect("decl b");
+    session.eval("reg [3:0] m [0:3]").expect("decl m");
+
+    let real_mod = "Semantic error: operator % not allowed on real operand";
+    for input in [
+        "a[1.0 % 2] = 1",
+        "a[1.0 % 2 + 0] = 1",
+        "a[1 + (1.0 % 2)] = 1",
+        "a[1.0 % 2 +: 2] = 1",
+        "m[1.0 % 2] = 1",
+        "m[0][1.0 % 2] = 1",
+        "{a[1.0 % 2], b} = 4'h3",
+        // An untaken conditional branch is validated too; this one used to
+        // be silently accepted and wrote garbage bits into `a`.
+        "a[0 ? (1.0 % 2) : 1] = 1",
+    ] {
+        let err = session
+            .eval(input)
+            .expect_err("illegal LHS index must be rejected");
+        assert_eq!(err, real_mod, "wrong diagnostic for {input}");
+    }
+
+    for (input, expected) in [
+        (
+            "a[~1.0] = 1",
+            "Semantic error: operator ~ not allowed on real operand",
+        ),
+        (
+            "a[&1.0] = 1",
+            "Semantic error: operator & not allowed on real operand",
+        ),
+        (
+            "a[1.0 << 1] = 1",
+            "Semantic error: operator << not allowed on real operand",
+        ),
+        (
+            "a[{1.0, 2.0}] = 1",
+            "Semantic error: concatenation operand cannot be real",
+        ),
+    ] {
+        let err = session
+            .eval(input)
+            .expect_err("illegal LHS index must be rejected");
+        assert_eq!(err, expected, "wrong diagnostic for {input}");
+    }
+
+    // Nothing was written, and the session is still usable.
+    assert_eq!(session.eval("a").expect("session alive").output, "4'bxxxx");
+    assert_eq!(session.eval("b").expect("b untouched").output, "4'bxxxx");
+}
+
+#[test]
+fn lhs_select_endpoint_errors_carry_exactly_one_stage_prefix() {
+    // `evaluate_constant_expr` used to add the "Semantic error: " prefix
+    // itself while also being called from inside the validator, which
+    // prefixes again — producing "Semantic error: Semantic error: ...".
+    let mut session = Session::new();
+    session.eval("reg [3:0] a").expect("decl a");
+    session.eval("real r = 1.5").expect("decl r");
+
+    for input in ["a[r[0]:0] = 1", "a[0 +: r[0]] = 1", "reg [r[0]:0] v"] {
+        let err = session.eval(input).expect_err("must be rejected");
+        assert_eq!(
+            err, "Semantic error: bit-select or part-select on real variable `r` is not allowed",
+            "wrong diagnostic for {input}"
+        );
+    }
+}

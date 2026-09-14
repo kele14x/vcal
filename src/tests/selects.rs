@@ -294,3 +294,60 @@ fn indexed_part_select_requires_adjacent_colon() {
         "space-separated `+ :` should not parse as indexed select"
     );
 }
+
+// ===========================================================================
+// LRM 4.8.1 nested case: a select on a scalar `real` appearing as another
+// select's index / endpoint. Annotation runs *before* the validator, so
+// `expression_is_real` has to stay total here — it used to `unreachable!`
+// on this shape, which aborted the whole REPL process rather than reporting.
+// ===========================================================================
+
+const REAL_SELECT_ERROR: &str =
+    "Semantic error: bit-select or part-select on real variable `r` is not allowed";
+
+#[test]
+fn nested_real_select_rejected_in_every_position() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a").expect("decl a");
+    session.eval("reg [3:0] m [0:3]").expect("decl m");
+    session.eval("real r = 1.5").expect("decl r");
+
+    for input in [
+        "a[r[0]]",
+        "a[r[0]] = 1",
+        "a = a[r[0]]",
+        "1 + a[r[0]]",
+        "{a[r[0]]}",
+        "a[r[0]:0]",
+        "a[r[0] +: 2]",
+        "a[0 +: r[0]]",
+        "m[r[0]]",
+        "a[a[r[0]]]",
+        "$display(a[r[0]])",
+    ] {
+        let err = session
+            .eval(input)
+            .expect_err("nested real select must be rejected");
+        assert_eq!(err, REAL_SELECT_ERROR, "wrong diagnostic for {input}");
+    }
+
+    // The property that actually regressed: the process used to abort, so
+    // no later input ran at all.
+    assert_eq!(
+        session.eval("1 + 1").expect("session alive").output,
+        "32'sd2"
+    );
+    assert_eq!(session.eval("a").expect("a untouched").output, "4'bxxxx");
+}
+
+#[test]
+fn nested_real_select_rejected_in_declaration_range() {
+    // The declaration path reaches the same inference through
+    // `evaluate_range_endpoint` -> `evaluate_constant_expr`.
+    let mut session = Session::new();
+    session.eval("real r = 1.5").expect("decl r");
+    let err = session
+        .eval("reg [r[0]:0] v")
+        .expect_err("decl range must be rejected");
+    assert_eq!(err, REAL_SELECT_ERROR);
+}
