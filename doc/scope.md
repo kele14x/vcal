@@ -18,6 +18,7 @@ For the long-term LRM-coverage target, see [lrm-coverage.md](lrm-coverage.md).
 - `reg` / `integer` / `real` declarations and blocking assignment with the full LRM A.8.5 `variable_lvalue` — bare name, bit/part/indexed-part selects, and arbitrarily nested concatenations on the LHS (see [variables.md](variables.md))
 - 1-D unpacked arrays on `reg` / `integer` / `real` (LRM 4.9 / A.2.2.1); arrays are capped at 65,536 elements, and vector-array payload is additionally capped at the same 16,777,216-bit limit as scalar vectors
 - Static-semantic validation as a top-level pre-pass over every expression entry — errors prefixed `Syntax error:` (lex/parse) or `Semantic error:` (validator)
+- Error diagnostics preserve side effects: `$display` / `$write` bytes from statements that completed earlier in the same input are emitted ahead of the diagnostic, while the failing statement and every later one do not run and no value is echoed (see [repl.md](repl.md))
 - System tasks: `$finish`, `$stop` (LRM 17.4), `$display` / `$write` and the `b`/`o`/`h` suffixed variants `$displayb` / `$displayo` / `$displayh` / `$writeb` / `$writeo` / `$writeh` (LRM 17.1 display family, basic formatting subset including `%b`/`%o`/`%d`/`%h`/`%s`/`%c`/real controls). Suffixed variants default the unformatted-integer base to binary / octal / hex respectively; explicit format controls still override. All system tasks accept null arguments (empty comma slots); `$display`/`$write` family emit one space per null for a supported format control (the control is validated first, so an unsupported one still errors), `$finish`/`$stop` discard them. LRM display controls outside this subset are intentionally unsupported for now, including `%u`, `%z`, `%t`, `%m`, strength formats, and field-width / precision modifiers.
 - System functions:
   - Sign casts (LRM 5.5): `$signed`, `$unsigned`
@@ -32,8 +33,6 @@ Planned but not yet implemented:
 - **Multi-line edit.** The REPL accepts only single-line input today; the right TUI affordance for multi-line editing is still being explored.
 
 ## Known issues
-
-- A later semantic/runtime error in one input discards output from earlier successful `$display` / `$write` statements while retaining earlier variable mutations. Reproducer: after `integer a = 0`, submit `a = 1; $display("checkpoint"); missing` — the error appears and `a` remains 1, but `checkpoint` is lost. The statement driver accumulates task output locally and drops it when propagating a later error. Preserve completed-statement output alongside the diagnostic before expanding multiline submissions.
 
 - Declarations and assignments deep-clone the entire variable map for atomic updates, including unrelated arrays. A local release-build probe of 200 scalar assignments took about 0.003 s without an array versus 0.31 s with `reg [255:0] bulk [0:65535]` (including process startup and declarations). Consider staging only affected bindings / elements while preserving statement atomicity and original-session LHS index resolution.
 

@@ -468,7 +468,7 @@ fn nested_select_depth_is_capped_rather_than_overflowing() {
         .expect_err("over the cap");
     assert_eq!(
         over_cap,
-        format!("Syntax error: select nesting exceeds {MAX_SELECT_NESTING} levels")
+        format!("Syntax error: select nesting exceeds {MAX_SELECT_NESTING} levels").as_str()
     );
     // A depth that used to abort the process is now an ordinary error, and
     // the session survives it.

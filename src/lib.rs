@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::mem;
+use std::ops::Deref;
 
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
@@ -195,6 +198,52 @@ pub struct Evaluation {
     pub should_exit: bool,
 }
 
+/// Diagnostic from a failed evaluation, carrying the output of the statements
+/// that completed before the failure.
+///
+/// A system task can only appear as a singleton top-level statement, so task
+/// output is always statement-granular: bytes in `task_output` come from
+/// statements that ran to completion, never from a half-executed one. Frontends
+/// write them ahead of `message` to keep output in chronological order. A parse
+/// failure leaves `task_output` empty, because nothing ran at all.
+///
+/// Derefs to the message so callers can keep treating it as the diagnostic
+/// string.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EvalError {
+    pub message: String,
+    pub task_output: Vec<u8>,
+}
+
+impl EvalError {
+    fn new(message: String) -> Self {
+        Self {
+            message,
+            task_output: Vec::new(),
+        }
+    }
+}
+
+impl Deref for EvalError {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for EvalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl PartialEq<&str> for EvalError {
+    fn eq(&self, other: &&str) -> bool {
+        self.message == *other
+    }
+}
+
 // Persistent REPL state: the variable map that survives across `eval` calls.
 // A fresh session has no variables; `evaluate_input` keeps the old stateless
 // shape by spinning up a throwaway session.
@@ -253,12 +302,12 @@ impl Session {
         self.lookup(name).and_then(|reg| reg.real())
     }
 
-    pub fn eval(&mut self, input: &str) -> Result<Evaluation, String> {
+    pub fn eval(&mut self, input: &str) -> Result<Evaluation, EvalError> {
         evaluate_input_with_session(self, input)
     }
 }
 
-pub fn evaluate_input(input: &str) -> Result<Evaluation, String> {
+pub fn evaluate_input(input: &str) -> Result<Evaluation, EvalError> {
     let mut session = Session::new();
     session.eval(input)
 }
@@ -307,7 +356,10 @@ pub fn parse_input_with_depth(input: &str, max_depth: usize) -> Result<String, S
     Ok(format!("{statements:#?}"))
 }
 
-fn evaluate_input_with_session(session: &mut Session, input: &str) -> Result<Evaluation, String> {
+fn evaluate_input_with_session(
+    session: &mut Session,
+    input: &str,
+) -> Result<Evaluation, EvalError> {
     let input = input.trim();
     if input.is_empty() {
         return Ok(Evaluation {
@@ -318,8 +370,8 @@ fn evaluate_input_with_session(session: &mut Session, input: &str) -> Result<Eva
         });
     }
 
-    let (statements, trailing_semicolon) =
-        parser::parse_statements(input).map_err(|e| format!("Syntax error: {e}"))?;
+    let (statements, trailing_semicolon) = parser::parse_statements(input)
+        .map_err(|e| EvalError::new(format!("Syntax error: {e}")))?;
 
     // IPython-style suppression applies only to value output: the last
     // echo-list value is visible only if the input did not end with a `;`.
@@ -328,7 +380,14 @@ fn evaluate_input_with_session(session: &mut Session, input: &str) -> Result<Eva
     let mut last_value_output = Vec::new();
     let mut last_was_echo = false;
     for stmt in &statements {
-        let (stmt_task_output, value_output, should_exit) = apply_stmt(session, stmt)?;
+        let (stmt_task_output, value_output, should_exit) =
+            apply_stmt(session, stmt).map_err(|message| EvalError {
+                message,
+                // Output from statements that already completed is a side
+                // effect that happened, so it travels with the diagnostic
+                // rather than being dropped by `?`.
+                task_output: mem::take(&mut task_output),
+            })?;
         task_output.extend(stmt_task_output);
         if should_exit {
             return Ok(Evaluation {
@@ -877,8 +936,9 @@ pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Res
                     break;
                 }
             }
-            Err(message) => {
-                writeln!(writer, "{message}")?;
+            Err(err) => {
+                writer.write_all(&err.task_output)?;
+                writeln!(writer, "{}", err.message)?;
                 writeln!(writer)?;
             }
         }
@@ -934,9 +994,11 @@ pub fn run_interactive() -> io::Result<()> {
                     break;
                 }
             }
-            Err(message) => {
-                println!("{message}");
-                println!();
+            Err(err) => {
+                let mut stdout = ConsoleSafeWriter::new(io::stdout());
+                stdout.write_all(&err.task_output)?;
+                writeln!(stdout, "{}", err.message)?;
+                writeln!(stdout)?;
             }
         }
 

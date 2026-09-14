@@ -58,6 +58,95 @@ fn repl_emits_error_lines_and_continues_to_next_prompt() {
     );
 }
 
+// A `$display` / `$write` that already ran is a side effect that happened, so
+// an error later in the same input must not swallow it. The diagnostic still
+// aborts the remaining statements and still suppresses the value echo.
+#[test]
+fn repl_preserves_completed_task_output_before_error() {
+    let mut input = Cursor::new("$display(\"one\"); $display(\"two\"); missing\n$finish\n");
+    let mut output = Vec::new();
+
+    run_repl(&mut input, &mut output).expect("REPL should run");
+
+    assert_eq!(
+        output,
+        b"In [0]: one\ntwo\nSemantic error: undeclared identifier: missing\n\
+          \n\
+          In [1]: \n"
+    );
+}
+
+#[test]
+fn repl_preserves_write_output_without_adding_newline() {
+    let mut input =
+        Cursor::new("integer a = 0;\na = 1; $write(\"checkpoint\"); missing\n$finish\n");
+    let mut output = Vec::new();
+
+    run_repl(&mut input, &mut output).expect("REPL should run");
+
+    // `$write` emits no trailing newline, so the diagnostic follows the
+    // preserved bytes directly.
+    assert_eq!(
+        output,
+        b"In [0]: \nIn [1]: checkpointSemantic error: undeclared identifier: missing\n\
+          \n\
+          In [2]: \n"
+    );
+}
+
+#[test]
+fn error_carries_completed_task_output_and_keeps_earlier_mutation() {
+    let mut session = Session::new();
+    session.eval("integer a = 0;").expect("decl");
+
+    let err = session
+        .eval("a = 1; $display(\"checkpoint\"); missing")
+        .expect_err("undeclared identifier");
+
+    assert_eq!(err.task_output, b"checkpoint\n");
+    assert!(
+        err.contains("undeclared identifier: missing"),
+        "unexpected diagnostic: {err}"
+    );
+    // The assignment from the statement before the failure still stands.
+    assert_eq!(session.eval("a").expect("session alive").output, "32'sd1");
+}
+
+#[test]
+fn error_still_suppresses_value_echo() {
+    let mut input = Cursor::new("1+1; missing\n$finish\n");
+    let mut output = Vec::new();
+
+    run_repl(&mut input, &mut output).expect("REPL should run");
+
+    // Preserving task output must not start echoing values from a failed
+    // input — no `Out[n]` line here, matching the IPython-style behaviour.
+    assert_eq!(
+        output,
+        b"In [0]: Semantic error: undeclared identifier: missing\n\
+          \n\
+          In [1]: \n"
+    );
+}
+
+#[test]
+fn error_in_first_statement_carries_no_task_output() {
+    let err = evaluate_input("missing; $display(\"never\")").expect_err("first statement fails");
+
+    // Nothing completed, and the statements after the failure never ran.
+    assert!(err.task_output.is_empty());
+}
+
+#[test]
+fn parse_error_carries_no_task_output() {
+    // Parsing happens before any statement runs, so there is nothing to
+    // preserve even though a `$display` appears earlier in the input.
+    let err = evaluate_input("$display(\"checkpoint\"); 1 +").expect_err("trailing operator");
+
+    assert!(err.task_output.is_empty());
+    assert!(err.starts_with("Syntax error:"));
+}
+
 // Stage-prefix sanity: the `Syntax error:` / `Semantic error:` prefixes
 // tell the user which phase rejected their input. Parser/lexer errors get
 // the syntax prefix; validator errors get the semantic prefix. Genuine
