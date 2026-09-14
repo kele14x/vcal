@@ -46,6 +46,47 @@ fn accepts_spaces_inside_based_integer_literals_in_expressions() {
     assert_eq!(expr.output, "32'd7");
 }
 
+// LRM 3.2 comments separate a based literal's size from its `'base` marker
+// exactly the way spaces do, so `8/*c*/'d5` is the same literal as `8 'd 5`.
+// iverilog 13.0 accepts every form below.
+
+#[test]
+fn accepts_comments_between_size_and_base_of_based_literal() {
+    let adjacent = evaluate_input("8/*c*/'d5").expect("comment-separated literal should parse");
+    let spaced = evaluate_input("8 /* c */ 'h f").expect("spaced comment literal should parse");
+    let binary = evaluate_input("4/*x*/'b1010").expect("binary literal should parse");
+    let repeated = evaluate_input("8 /*a*/ /*b*/ 'd 5").expect("repeated comments should parse");
+
+    assert_eq!(adjacent.output, "8'd5");
+    assert_eq!(spaced.output, "8'h0f");
+    assert_eq!(binary.output, "4'b1010");
+    assert_eq!(repeated.output, "8'd5");
+}
+
+#[test]
+fn comment_before_division_operator_still_lexes_as_division() {
+    // The lookahead must not mistake a division `/` for the start of a
+    // comment, nor a comment for a `'base` marker.
+    let plain = evaluate_input("8 / 2").expect("division should parse");
+    let after_comment = evaluate_input("8 /*a*/ / 2").expect("comment then division should parse");
+    let between_operands = evaluate_input("1 /*x*/ + /*y*/ 2").expect("comments in expr");
+
+    assert_eq!(plain.output, "32'sd4");
+    assert_eq!(after_comment.output, "32'sd4");
+    assert_eq!(between_operands.output, "32'sd3");
+}
+
+#[test]
+fn unterminated_block_comment_in_literal_lookahead_is_an_error() {
+    let err = evaluate_input("8 /* unterminated")
+        .expect_err("unterminated block comment should be rejected");
+    assert_eq!(err, "Syntax error: unterminated block comment");
+
+    let err = evaluate_input("8 /*a*/ /* unterminated")
+        .expect_err("unterminated block comment after a closed one should be rejected");
+    assert_eq!(err, "Syntax error: unterminated block comment");
+}
+
 #[test]
 fn rejects_spaces_inside_base_token() {
     let missing_base =

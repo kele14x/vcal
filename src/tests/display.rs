@@ -255,6 +255,46 @@ fn display_unknown_format_control_is_error() {
 }
 
 #[test]
+fn display_null_argument_does_not_bypass_format_control_validation() {
+    // A null argument renders as a space whatever the specifier asks for
+    // (LRM 17.1.1.4), but that shortcut must not run before the specifier is
+    // checked — otherwise `%q` would be silently accepted here while
+    // `$display("%q", 42)` correctly rejects it.
+    let error = evaluate_input("$display(\"%q\", )").expect_err("unknown control with null arg");
+    assert!(
+        error.contains("unsupported display format control `%q`"),
+        "got: {error}"
+    );
+
+    // Guard against over-applying the fix: a valid specifier still renders the
+    // null argument as one space, followed by `$display`'s newline.
+    let result = evaluate_input("$display(\"%d\", )").expect("valid control with null arg");
+    assert_eq!(result.task_output, b" \n");
+
+    let result = evaluate_input("$display(\"a%db\", )").expect("surrounded valid control");
+    assert_eq!(result.task_output, b"a b\n");
+
+    // `%0d` is a field-width modifier vcal does not implement. The null
+    // argument used to short-circuit before validation, emitting a space and
+    // leaving the `d` to be copied through as literal text.
+    for input in ["$display(\"%0d\", )", "$display(\"%0d\", 5)"] {
+        let error = evaluate_input(input).expect_err(input);
+        assert!(
+            error.contains("unsupported display format control `%0`"),
+            "{input}: got {error}"
+        );
+    }
+
+    // The formatted `display_expression` echo shares this formatter, so the
+    // same validation ordering applies there.
+    let error = evaluate_input("\"%q\", ").expect_err("display_expression echo path");
+    assert!(
+        error.contains("unsupported display format control `%q`"),
+        "got: {error}"
+    );
+}
+
+#[test]
 fn display_more_format_specs_than_args_is_error() {
     let error = evaluate_input("$display(\"%d %d %d\", 1, 2)").expect_err("too few args");
     assert!(

@@ -197,25 +197,30 @@ fn format_with_controls(
         };
         arg_index += 1;
 
-        if let DisplayArg::Null = value {
-            output.push(b' ');
-            continue;
-        }
-
-        let DisplayArg::Value(value) = value else {
-            unreachable!("null display argument handled above");
-        };
-
+        // This `match` is the single source of truth for which format
+        // controls vcal implements, and it runs before the null-argument
+        // shortcut inside `push_formatted`. That ordering matters: a null
+        // argument renders as a space whatever the specifier asks for, so
+        // validating afterwards would let `$display("%q", )` print a space
+        // where `$display("%q", 5)` correctly reports the bad specifier.
         match specifier {
-            'b' | 'B' => push_text(&mut output, &format_integer_base(value, Base::Binary)),
-            'o' | 'O' => push_text(&mut output, &format_integer_base(value, Base::Octal)),
-            'd' | 'D' => push_text(&mut output, &format_integer_base(value, Base::Decimal)),
-            'h' | 'H' | 'x' | 'X' => push_text(&mut output, &format_integer_base(value, Base::Hex)),
-            'c' | 'C' => output.extend(format_char_value(value)),
-            's' | 'S' => output.extend(format_string_value(value)),
-            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
-                push_text(&mut output, &format_real_value(value, specifier));
-            }
+            'b' | 'B' => push_formatted(&mut output, value, |value| {
+                format_integer_base(value, Base::Binary).into_bytes()
+            }),
+            'o' | 'O' => push_formatted(&mut output, value, |value| {
+                format_integer_base(value, Base::Octal).into_bytes()
+            }),
+            'd' | 'D' => push_formatted(&mut output, value, |value| {
+                format_integer_base(value, Base::Decimal).into_bytes()
+            }),
+            'h' | 'H' | 'x' | 'X' => push_formatted(&mut output, value, |value| {
+                format_integer_base(value, Base::Hex).into_bytes()
+            }),
+            'c' | 'C' => push_formatted(&mut output, value, format_char_value),
+            's' | 'S' => push_formatted(&mut output, value, format_string_value),
+            'f' | 'F' | 'e' | 'E' | 'g' | 'G' => push_formatted(&mut output, value, |value| {
+                format_real_value(value, specifier).into_bytes()
+            }),
             _ => return Err(format!("unsupported display format control `%{specifier}`")),
         }
     }
@@ -363,8 +368,14 @@ fn byte_from_integer_bits_zeroing_unknowns(integer: &IntegerValue, start: usize)
     byte
 }
 
-fn push_text(output: &mut Vec<u8>, text: &str) {
-    output.extend_from_slice(text.as_bytes());
+// LRM 17.1.1.4: a null argument renders as a single space whatever the
+// format specifier asks for, so only the value case reaches `render`. The
+// caller validates the specifier before getting here.
+fn push_formatted(output: &mut Vec<u8>, arg: &DisplayArg, render: impl FnOnce(&Value) -> Vec<u8>) {
+    match arg {
+        DisplayArg::Null => output.push(b' '),
+        DisplayArg::Value(value) => output.extend(render(value)),
+    }
 }
 
 fn format_integer_base(value: &Value, base: Base) -> String {

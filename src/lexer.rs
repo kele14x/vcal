@@ -94,31 +94,12 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     tokens.push(Token::Minus);
                 }
             }
-            '/' => match chars.peek() {
-                Some((_, '/')) => {
-                    // LRM 3.2: `//` runs to the next newline (or EOF).
+            '/' => match chars.peek().map(|(_, ch)| *ch) {
+                // LRM 3.2: `//` runs to the next newline (or EOF);
+                // `/* ... */` is a non-nesting block comment.
+                Some(kind @ ('/' | '*')) => {
                     chars.next();
-                    for (_, c) in chars.by_ref() {
-                        if c == '\n' {
-                            break;
-                        }
-                    }
-                }
-                Some((_, '*')) => {
-                    // LRM 3.2: `/* ... */` block comment; non-nesting.
-                    chars.next();
-                    let mut closed = false;
-                    let mut prev_star = false;
-                    for (_, c) in chars.by_ref() {
-                        if prev_star && c == '/' {
-                            closed = true;
-                            break;
-                        }
-                        prev_star = c == '*';
-                    }
-                    if !closed {
-                        return Err("unterminated block comment".to_string());
-                    }
+                    skip_comment_body(&mut chars, kind)?;
                 }
                 _ => tokens.push(Token::Slash),
             },
@@ -484,7 +465,11 @@ where
     }
 
     let mut cursor = chars.clone();
-    skip_whitespace(&mut cursor);
+    // Comments count as separators here just like spaces do, so `8/*c*/'d5`
+    // lexes as the based literal `8'd5` (iverilog agrees). An unterminated
+    // block comment in the lookahead is a real error, not a reason to fall
+    // back to treating the size as a plain integer.
+    skip_whitespace_and_comments(&mut cursor)?;
 
     if matches!(cursor.peek(), Some((_, '\''))) {
         *chars = cursor;
@@ -584,12 +569,62 @@ where
     Ok(())
 }
 
-fn skip_whitespace<I>(chars: &mut std::iter::Peekable<I>)
+// Consumes an LRM 3.2 comment body. `chars` sits just past the opening `/`
+// and `kind` is the character that selected the form: `/` for a line comment
+// running to the next newline or EOF, `*` for a non-nesting block comment
+// that must be closed.
+fn skip_comment_body<I>(chars: &mut std::iter::Peekable<I>, kind: char) -> Result<(), String>
 where
     I: Iterator<Item = (usize, char)>,
 {
-    while matches!(chars.peek(), Some((_, ch)) if ch.is_whitespace()) {
-        chars.next();
+    match kind {
+        '/' => {
+            for (_, c) in chars.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        '*' => {
+            let mut prev_star = false;
+            for (_, c) in chars.by_ref() {
+                if prev_star && c == '/' {
+                    return Ok(());
+                }
+                prev_star = c == '*';
+            }
+            Err("unterminated block comment".to_string())
+        }
+        _ => unreachable!("skip_comment_body called with non-comment kind `{kind}`"),
+    }
+}
+
+// Skips whitespace and any LRM 3.2 comments, looping because a comment can be
+// followed by more whitespace and another comment. Used by the integer-literal
+// lookahead so a `'base` marker is seen across a comment the same way it is
+// across plain spaces. A `/` that turns out not to open a comment leaves the
+// cursor where it was.
+fn skip_whitespace_and_comments<I>(chars: &mut std::iter::Peekable<I>) -> Result<(), String>
+where
+    I: Iterator<Item = (usize, char)> + Clone,
+{
+    loop {
+        while matches!(chars.peek(), Some((_, ch)) if ch.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().map(|(_, ch)| *ch) != Some('/') {
+            return Ok(());
+        }
+        let mut cursor = chars.clone();
+        cursor.next();
+        let kind = match cursor.peek().map(|(_, ch)| *ch) {
+            Some(kind @ ('/' | '*')) => kind,
+            _ => return Ok(()),
+        };
+        cursor.next();
+        skip_comment_body(&mut cursor, kind)?;
+        *chars = cursor;
     }
 }
 
