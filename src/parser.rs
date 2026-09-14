@@ -883,9 +883,24 @@ fn prefix_unary_op(token: &Token) -> Option<UnaryOp> {
     })
 }
 
+// `[` is the only opening delimiter with no `Pending` frame in
+// `parse_expr_bp`'s iterative driver, so parsing a select index re-enters
+// `parse_expression` on a fresh stack frame and deeply nested
+// `a[a[…[0]…]]` consumes real C stack. Measured abort thresholds: 550
+// levels in a debug build on the 8 MiB main stack, 136 on a 2 MiB
+// test-thread stack, 6,604 in release. Nothing in the grammar bounds that
+// nesting, so bound it here: real expressions are a handful of levels deep
+// at most, so cap well above any meaningful input and well below the
+// smallest threshold.
+pub(crate) const MAX_SELECT_NESTING: usize = 64;
+
 struct Parser<'a> {
     tokens: &'a [Token],
     index: usize,
+    /// Count of select brackets currently being parsed. Capped at
+    /// `MAX_SELECT_NESTING`; see the comment there for why an explicit
+    /// limit is needed on this path alone.
+    select_depth: usize,
 }
 
 // Continuation frame for the iterative `parse_expr_bp` state machine.
@@ -983,6 +998,7 @@ pub(crate) fn parse_expression(input: &str) -> Result<Expr, String> {
     let mut parser = Parser {
         tokens: &tokens,
         index: 0,
+        select_depth: 0,
     };
     let expression = parser.parse_expression()?;
 
@@ -1015,6 +1031,7 @@ pub(crate) fn parse_statements(input: &str) -> Result<(Vec<Stmt>, bool), String>
         let mut parser = Parser {
             tokens: segment,
             index: 0,
+            select_depth: 0,
         };
         let stmt = parser.parse_statement()?;
         if parser.peek().is_some() {
@@ -1713,7 +1730,24 @@ impl<'a> Parser<'a> {
     // array-element select like `a[i][m:l]`). A third bracket is rejected
     // up-front since vcal only supports 1-D unpacked arrays — chaining
     // further would have no LRM meaning under the current grammar.
+    //
+    // Depth-capped: `parse_select_kind` below re-enters `parse_expression`,
+    // and `[` has no `Pending` frame in the iterative driver, so each
+    // nesting level of `a[a[…[0]…]]` costs a real stack frame. See
+    // `MAX_SELECT_NESTING`.
     fn parse_select_after_bracket(&mut self, name: String) -> Result<Expr, String> {
+        if self.select_depth >= MAX_SELECT_NESTING {
+            return Err(format!(
+                "select nesting exceeds {MAX_SELECT_NESTING} levels"
+            ));
+        }
+        self.select_depth += 1;
+        let parsed = self.parse_select_brackets(name);
+        self.select_depth -= 1;
+        parsed
+    }
+
+    fn parse_select_brackets(&mut self, name: String) -> Result<Expr, String> {
         let kind = self.parse_select_kind()?;
         let inner = if matches!(self.peek(), Some(Token::LBracket)) {
             self.index += 1;

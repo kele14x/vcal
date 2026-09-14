@@ -1,4 +1,6 @@
-use crate::parser::{BinaryOp, Expr, SystemArg, UnaryOp, parse_expression, parse_integer};
+use crate::parser::{
+    BinaryOp, Expr, MAX_SELECT_NESTING, SystemArg, UnaryOp, parse_expression, parse_integer,
+};
 use crate::{Session, evaluate_input};
 
 #[test]
@@ -441,6 +443,42 @@ fn deep_select_index_chain_evaluates() {
         .expect("deep select index evaluates");
     // Index out of range → 1'bx (LRM 4.2.1).
     assert_eq!(outcome.output, "1'bx");
+}
+
+#[test]
+fn nested_select_depth_is_capped_rather_than_overflowing() {
+    // Contrast with the flat chain above: `a[a[…[0]…]]` re-enters
+    // `parse_expression` once per nesting level, because `[` is the only
+    // opening delimiter with no `Pending` frame in the iterative driver.
+    // A debug build used to abort at ~550 levels (136 on a 2 MiB
+    // test-thread stack), so this path is capped instead.
+    let mut session = Session::new();
+    session.eval("reg [0:0] a = 0").expect("decl");
+    let nested = |n: usize| format!("{}0{}", "a[".repeat(n), "]".repeat(n));
+
+    assert_eq!(
+        session
+            .eval(&nested(MAX_SELECT_NESTING))
+            .expect("at the cap")
+            .output,
+        "1'd0"
+    );
+    let over_cap = session
+        .eval(&nested(MAX_SELECT_NESTING + 1))
+        .expect_err("over the cap");
+    assert_eq!(
+        over_cap,
+        format!("Syntax error: select nesting exceeds {MAX_SELECT_NESTING} levels")
+    );
+    // A depth that used to abort the process is now an ordinary error, and
+    // the session survives it.
+    assert_eq!(
+        session
+            .eval(&nested(DEEP_CHAIN_DEPTH))
+            .expect_err("far over the cap"),
+        over_cap
+    );
+    assert_eq!(session.eval("a").expect("session alive").output, "1'd0");
 }
 
 // Direct-build deep-concat regression suite. The parser uses a recursive
