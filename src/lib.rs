@@ -590,9 +590,11 @@ where
 // Evaluates an optional init expression to a `Vec<LogicBit>` of the
 // given (width, signed, base) context. With no init, returns x bits at
 // the target width (LRM 4.8 default for reg / integer). With an init,
-// runs through `evaluate_assignment_rhs` so the same width / sign /
-// base context and real→integer §3.5.3 conversion semantics apply that
-// `name = expr` would use after the decl.
+// runs through `evaluate_assignment_rhs` so the same width / base
+// context and real→integer §3.5.3 conversion semantics apply that
+// `name = expr` would use after the decl. Signedness does not cross
+// (LRM 5.5.1) — `signed` here only shapes the no-init x-fill, a real
+// RHS's conversion, and the re-stamp on the stored value.
 fn eval_init_value(
     init: Option<&Expr>,
     width: usize,
@@ -638,8 +640,9 @@ fn eval_init_value(
 
 // LRM A.6.2 blocking assignment. For an integer LHS (vector reg,
 // integer reg, array element, bit/part-select, concatenation) the
-// existing `evaluate_lvalue_assignment` path is exact — width /
-// signed / base context is read off the LHS, RHS evaluates through
+// existing `evaluate_lvalue_assignment` path is exact — width and base
+// context are read off the LHS while the RHS keeps its own signedness
+// (LRM 5.5.1), RHS evaluates through
 // `evaluate_assignment_rhs` (real → integer per §3.5.3, x bits on
 // NaN/±∞), and the staged map swaps in atomically. A bare-name LHS
 // that resolves to a `real` reg routes through `apply_real_assign`

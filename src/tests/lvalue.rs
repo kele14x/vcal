@@ -433,6 +433,53 @@ fn lhs_rhs_zero_extends_to_concat_width() {
 }
 
 #[test]
+fn concat_lhs_does_not_force_unsigned_extension_on_rhs() {
+    // LRM 5.5.1: a concat lvalue is unsigned, but that unsignedness does not
+    // cross into the RHS. A signed RHS sign-extends to the 8-bit LHS width,
+    // so `{a, b} = 4'shf` fills every bit while `{a, b} = 4'hf` zero-extends.
+    let mut session = Session::new();
+    session.eval("reg [3:0] a = 4'b0000").expect("decl a");
+    session.eval("reg [3:0] b = 4'b0000").expect("decl b");
+    assert_eq!(
+        session
+            .eval("{a, b} = 4'shf; {a, b}")
+            .expect("signed rhs")
+            .output,
+        "8'b11111111"
+    );
+    assert_eq!(
+        session
+            .eval("{a, b} = 4'hf; {a, b}")
+            .expect("unsigned rhs")
+            .output,
+        "8'b00001111"
+    );
+}
+
+#[test]
+fn part_select_lhs_does_not_force_unsigned_extension_on_rhs() {
+    // The part-select itself is unsigned (LRM 4.7), but the RHS keeps its own
+    // signedness; either way only the sliced 4 bits are written, so both
+    // forms land on 8'h0f and the untouched high nibble stays 0.
+    let mut session = Session::new();
+    session.eval("reg [7:0] v = 8'h00").expect("decl v");
+    assert_eq!(
+        session
+            .eval("v[3:0] = 4'shf; v")
+            .expect("signed rhs")
+            .output,
+        "8'h0f"
+    );
+    assert_eq!(
+        session
+            .eval("v[3:0] = 4'hf; v")
+            .expect("unsigned rhs")
+            .output,
+        "8'h0f"
+    );
+}
+
+#[test]
 fn echo_for_bare_name_lhs_uses_reg_metadata() {
     // The first whole-reg assignment learns the RHS decimal display base.
     // Signedness still comes from the declaration.

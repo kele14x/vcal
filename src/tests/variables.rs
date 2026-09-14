@@ -211,6 +211,118 @@ fn assignment_preserves_x_and_z_bits() {
     );
 }
 
+// LRM 5.5.1: only the destination's *width* propagates into an assignment
+// RHS — its signedness does not. The RHS keeps the signedness its own
+// operands give it, and that is what drives leaf extension. This is the
+// opposite of the intuitive "the LHS sets the context" reading, so each
+// expectation below is pinned against iverilog 13.0.
+
+#[test]
+fn assignment_rhs_keeps_unsigned_operands_inside_signed_reg() {
+    let mut session = Session::new();
+    session.eval("reg signed [7:0] sa").expect("decl");
+    // Both operands unsigned, so the division is unsigned: 15 / 2 = 7.
+    // Propagating the reg's signedness would instead widen 4'd15 to 8'sh0f
+    // and 4'd2 to 8'sd2, giving -1 / 2 = 0. These are the reg's first
+    // assignments, so the weak display base resolves from the leftmost RHS
+    // operand — decimal here.
+    assert_eq!(
+        session
+            .eval("sa = 4'd15 / 4'd2; sa")
+            .expect("assign")
+            .output,
+        "8'sd7"
+    );
+    // `>>>` on an unsigned RHS is a logical shift, so 15 >>> 1 = 7, not the
+    // arithmetic -1 >>> 1 = -1 the signed reading would give.
+    assert_eq!(
+        session.eval("sa = 4'd15 >>> 1; sa").expect("assign").output,
+        "8'sd7"
+    );
+    assert_eq!(
+        session
+            .eval("sa = 4'd15 + 4'd2; sa")
+            .expect("assign")
+            .output,
+        "8'sd17"
+    );
+}
+
+#[test]
+fn assignment_rhs_keeps_signed_operands_inside_unsigned_reg() {
+    let mut session = Session::new();
+    session.eval("reg [7:0] ua").expect("decl");
+    // The RHS is signed, so 4'shf sign-extends to 8 bits before the reg
+    // stores it: 255. Zero-extending it as the reg's own unsignedness would
+    // give 15. The first assignment resolves the weak display base to hex.
+    assert_eq!(
+        session.eval("ua = 4'shf; ua").expect("assign").output,
+        "8'hff"
+    );
+    // -1 * -1 = 1 in the RHS's own signed arithmetic.
+    assert_eq!(
+        session
+            .eval("ua = 4'shf * 4'shf; ua")
+            .expect("assign")
+            .output,
+        "8'h01"
+    );
+}
+
+#[test]
+fn assignment_rhs_signed_division_still_truncates_toward_zero() {
+    let mut session = Session::new();
+    session.eval("reg signed [7:0] sa").expect("decl");
+    // Both operands signed here, so -1 / 2 truncates toward zero to 0.
+    assert_eq!(
+        session
+            .eval("sa = 4'shf / 4'sd2; sa")
+            .expect("assign")
+            .output,
+        "8'sh00"
+    );
+}
+
+#[test]
+fn reg_decl_init_follows_the_same_width_only_context_rule() {
+    let mut session = Session::new();
+    assert_eq!(
+        session
+            .eval("reg signed [7:0] sa = 4'd15 / 4'd2; sa")
+            .expect("decl")
+            .output,
+        "8'sd7"
+    );
+    assert_eq!(
+        session
+            .eval("reg [7:0] ua = 4'shf; ua")
+            .expect("decl")
+            .output,
+        "8'hff"
+    );
+    assert_eq!(
+        session
+            .eval("reg signed [7:0] sb = 4'shf / 4'sd2; sb")
+            .expect("decl")
+            .output,
+        "8'sh00"
+    );
+}
+
+#[test]
+fn integer_decl_init_follows_the_same_width_only_context_rule() {
+    let mut session = Session::new();
+    // `integer` is signed 32-bit, but the unsigned RHS still divides as
+    // unsigned.
+    assert_eq!(
+        session
+            .eval("integer i = 4'd15 / 4'd2; i")
+            .expect("decl")
+            .output,
+        "32'sd7"
+    );
+}
+
 #[test]
 fn reg_assignment_resolves_weak_display_base_once() {
     let mut session = Session::new();

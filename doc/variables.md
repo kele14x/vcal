@@ -76,13 +76,23 @@ A `real` decl is an IEEE 754 binary64 slot (LRM 4.8 / 3.5.2):
 
 Blocking assignment `name = expression` is a top-level statement, not an
 expression (LRM A.6.2), so it does not nest inside larger expressions.
-The LHS reg's width, signedness, and current display base flow into the
-RHS via the standard §5.6 context rules, then the resulting bits replace
-the reg's bits. If the LHS is a whole `reg` whose display base is still
-weak, an integer RHS resolves it; later whole-reg assignments preserve
-the resolved base. Real-typed RHS expressions do not resolve a weak
-display base. Bit-select, part-select, array-element, and concat-lvalue
-writes update bits without resolving the whole reg's display base.
+The LHS reg's width and current display base flow into the RHS via the
+standard §5.6 context rules, then the resulting bits replace the reg's
+bits. If the LHS is a whole `reg` whose display base is still weak, an
+integer RHS resolves it; later whole-reg assignments preserve the
+resolved base. Real-typed RHS expressions do not resolve a weak display
+base. Bit-select, part-select, array-element, and concat-lvalue writes
+update bits without resolving the whole reg's display base.
+
+The LHS's *signedness* does not cross the assignment (LRM 5.5.1): the RHS
+keeps the signedness its own operands give it, and that is what drives
+leaf extension. So `reg signed [7:0] sa; sa = 4'd15 / 4'd2` is `8'sd7`
+(both operands stay unsigned, 15 / 2 = 7), not `8'sd0`; and
+`reg [7:0] ua; ua = 4'shf` is 255 (rendered `8'hff`, since that first
+assignment also resolves the weak display base to the RHS's hex) because
+the signed RHS sign-extends before truncation. The stored value still
+carries the LHS's declared signedness — only the extension decision
+belongs to the RHS.
 
 A real-typed RHS goes through an implicit real→integer conversion per
 LRM §3.5.3 (round to nearest, ties away from zero — the same rule
@@ -128,8 +138,12 @@ blocking assignment, per LRM A.8.5 `variable_lvalue`:
 Concatenations may nest arbitrarily (`{x, {y, z[1:0]}}`), and the leaves
 are flattened left-to-right with the leftmost leaf taking the most
 significant slice of the RHS. The RHS is evaluated in the
-total-LHS-width context (sum of leaf widths, unsigned, leftmost leaf's
-base), so the usual width / sign / base propagation rules apply.
+total-LHS-width context (sum of leaf widths, leftmost leaf's base), so
+the usual width and base propagation rules apply. Signedness comes from
+the RHS's own operands, not from the concat — a concat lvalue is
+unsigned, but that unsignedness does not cross into the RHS (LRM 5.5.1).
+So with `reg [3:0] a, b`, `{a,b} = 4'shf` is `8'b11111111` (the signed
+RHS sign-extends) while `{a,b} = 4'hf` is `8'b00001111`.
 
 A few semantic rules worth pinning down:
 
@@ -294,13 +308,18 @@ Element-select reads (RHS):
 Element-select writes (LHS):
 
 - `a[i] = expr` writes the whole element in element-shape context
-  (width / signed from the packed range; reg-array elements currently use
-  the same binary fallback display base as a fresh scalar `reg`).
+  (width from the packed range, base from the element; reg-array elements
+  currently use the same binary fallback display base as a fresh scalar
+  `reg`). Signedness comes from the RHS's own operands, not from the
+  element (LRM 5.5.1), so on `reg [7:0] arr [0:3]` the write
+  `arr[0] = 4'shf` sign-extends to `8'b11111111` while `arr[1] = 4'hf`
+  zero-extends to `8'b00001111`.
 - `a[i][n] = expr`, `a[i][m:l] = expr`, and the indexed forms write
   only the named positions of the chosen element; other positions are
   preserved. The RHS evaluates in the *inner select's* shape (width
-  set by the form, unsigned per LRM 4.7, base inherited from the
-  element).
+  set by the form, base inherited from the element). The select itself is
+  unsigned per LRM 4.7, but that unsignedness stays on the select and
+  does not cross into the RHS, whose own signedness drives extension.
 - An x/z or OOB outer index drops the entire write — no element is
   mutated — but the echo still prints the RHS in the lvalue's shape so
   the calculator output is consistent with the vector-reg

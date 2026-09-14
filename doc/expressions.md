@@ -33,7 +33,7 @@ The general rules for how vcal evaluates expressions. Per-operator details live 
   - unary `+`, unary `-`, and unary `~`: `L(expr) = L(operand)`
   - shifts: `L(expr) = L(lhs)`; the RHS stays self-determined and does not contribute to result width
   - conditional `?:`: `L(expr) = max(L(then), L(else))`
-- Example: `<` always returns a 1-bit unsigned result, so `a < b` is self-determined. By contrast, the RHS of an assignment is context-determined by both itself and the LHS width.
+- Example: `<` always returns a 1-bit unsigned result, so `a < b` is self-determined. By contrast, the RHS of an assignment is context-determined by both itself and the LHS width. Only the width crosses, though: per LRM 5.5.1 the LHS's signedness does not propagate into the RHS, so the RHS keeps the signedness its own operands give it and that is what drives leaf extension. See [variables.md](variables.md) → Blocking assignment for worked examples.
 - vcal evaluates expressions in two passes:
   - first pass: bottom-up inference of self-determined width and signedness for each AST node
   - second pass: top-down context-determined evaluation so parent expressions can widen child arithmetic before truncation

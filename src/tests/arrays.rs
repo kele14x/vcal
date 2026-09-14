@@ -597,6 +597,51 @@ fn array_element_write_signed_element_sign_extends_narrow_signed_rhs() {
 }
 
 #[test]
+fn array_element_write_rhs_keeps_its_own_signedness() {
+    // LRM 5.5.1: the element's signedness does not cross into the RHS. A
+    // signed RHS sign-extends into an unsigned element, and an all-unsigned
+    // RHS stays unsigned inside a signed element. Reg-array elements keep the
+    // binary fallback base, so the signed renders as `8'sb...`.
+    let mut session = Session::new();
+    session.eval("reg [7:0] ua [0:3]").expect("decl unsigned");
+    assert_eq!(
+        session
+            .eval("ua[0] = 4'shf; ua[0]")
+            .expect("signed rhs")
+            .output,
+        "8'b11111111"
+    );
+    assert_eq!(
+        session
+            .eval("ua[1] = 4'hf; ua[1]")
+            .expect("unsigned rhs")
+            .output,
+        "8'b00001111"
+    );
+
+    let mut session = Session::new();
+    session
+        .eval("reg signed [7:0] sa [0:3]")
+        .expect("decl signed");
+    // 15 / 2 with both operands unsigned is 7; propagating the element's
+    // signedness would instead give -1 / 2 = 0.
+    assert_eq!(
+        session
+            .eval("sa[0] = 4'd15 / 4'd2; sa[0]")
+            .expect("unsigned rhs")
+            .output,
+        "8'sb00000111"
+    );
+    assert_eq!(
+        session
+            .eval("sa[1] = 4'shf / 4'sd2; sa[1]")
+            .expect("signed rhs")
+            .output,
+        "8'sb00000000"
+    );
+}
+
+#[test]
 fn array_element_write_with_oob_index_does_not_modify_any_element() {
     // OOB index → no assignment performed, but the displayed echo still
     // shows the RHS in element shape (LRM 4.2.1).

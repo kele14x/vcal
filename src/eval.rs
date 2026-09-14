@@ -815,18 +815,26 @@ pub(crate) fn evaluate_expr(expr: &Expr, session: &Session) -> Result<Value, Str
 }
 
 // Entrypoint for the blocking-assignment driver in lib.rs. Builds the
-// LRM 5.6 context-determined operand context from the reg's declared
-// (width, signed, base) and runs the RHS through the standard integer
-// pipeline, so a wider/narrower RHS extends or truncates exactly the way
-// a literal does in an arithmetic context. The reg's base flows in for
-// the leftmost-base inference rule; the caller still re-stamps the
-// reg's stored base on the result.
+// assignment context from the destination's declared width and base, then
+// runs the RHS through the standard integer pipeline, so a wider/narrower
+// RHS extends or truncates exactly the way a literal does in an arithmetic
+// context. The destination's base flows in for the leftmost-base inference
+// rule; the caller still re-stamps the reg's stored base on the result.
+//
+// LRM 5.5.1 propagates only the destination's *width* into the RHS — its
+// signedness does not cross the assignment. The RHS keeps the signedness its
+// own operands give it, and that is what drives leaf extension, so
+// `sa = 4'd15 / 4'd2` on a `reg signed [7:0] sa` is 7 (both operands stay
+// unsigned) rather than 0 (-1 / 2), and `ua = 4'shf` on a `reg [7:0] ua` is
+// 255 because the signed RHS sign-extends. Both callers re-stamp the
+// destination's signedness on the stored value afterwards.
 //
 // A real RHS is implicitly converted per LRM §3.5.3: round to nearest
 // with ties away from zero (distinct from `$rtoi`'s truncate-toward-zero
-// rule). NaN / ±∞ have no integer image, so the lvalue is filled with x
-// bits at its declared width — matching how `$rtoi` surfaces "no defined
-// integer" rather than silently mapping to zero.
+// rule). A real has no signedness of its own, so that branch sizes and signs
+// the converted integer by the destination. NaN / ±∞ have no integer image,
+// so the lvalue is filled with x bits at its declared width — matching how
+// `$rtoi` surfaces "no defined integer" rather than silently mapping to zero.
 pub(crate) fn evaluate_assignment_rhs(
     rhs: &Expr,
     width: usize,
@@ -845,7 +853,7 @@ pub(crate) fn evaluate_assignment_rhs(
     }
     let context = ExprMeta {
         width,
-        signed,
+        signed: annotated.meta().signed,
         base,
     };
     evaluate_annotated(&annotated, Some(context), session)
