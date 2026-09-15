@@ -334,6 +334,29 @@ fn display_format_controls_are_case_insensitive() {
 }
 
 #[test]
+fn every_supported_format_control_renders() {
+    // The static check consults `is_supported_format_control`; the renderer
+    // dispatches on its own `match`. The two lists have to agree in both
+    // directions, and each direction fails differently:
+    //
+    // - a control the predicate accepts but the renderer has no arm for slips
+    //   past validation and resurfaces as an *unprefixed* error from the
+    //   renderer — exactly the defect the static check exists to prevent;
+    // - a control the predicate rejects but the renderer does handle is a
+    //   working feature silently turned off.
+    //
+    // Walking every supported spelling through a real `$display` pins both at
+    // once: anything missing from either list fails here.
+    for specifier in [
+        'b', 'B', 'o', 'O', 'd', 'D', 'h', 'H', 'x', 'X', 'c', 'C', 's', 'S', 'f', 'F', 'e', 'E',
+        'g', 'G',
+    ] {
+        let input = format!("$display(\"%{specifier}\", 5)");
+        evaluate_input(&input).unwrap_or_else(|err| panic!("{input}: rejected: {err}"));
+    }
+}
+
+#[test]
 fn display_char_control_emits_raw_bytes() {
     let result = evaluate_input("$display(\"%c\", 8'd65)").expect("ASCII 65");
     assert_eq!(result.task_output, b"A\n");

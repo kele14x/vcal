@@ -94,16 +94,15 @@ fn format_display_args(
     append_newline: bool,
     default_base: Base,
 ) -> Result<Vec<u8>, String> {
-    let values = evaluate_display_args(args, session)?;
+    let prepared = prepare_display_args(args, session, false)?;
 
-    let mut output = if let Some((first, rest)) = values.split_first() {
-        if let Some(format_bytes) = format_arg_string_bytes(first) {
-            format_with_controls(&format_bytes, rest, UnformattedStyle::Base(default_base))?
-        } else {
-            join_default_values(&values, default_base)
-        }
-    } else {
-        Vec::new()
+    let mut output = match &prepared.format_bytes {
+        Some(format_bytes) => format_with_controls(
+            format_bytes,
+            prepared.consumable_args(),
+            UnformattedStyle::Base(default_base),
+        )?,
+        None => join_default_values(&prepared.values, default_base),
     };
 
     if append_newline {
@@ -125,18 +124,16 @@ pub(crate) fn format_repl_echo_args(
     args: &[SystemArg],
     session: &Session,
 ) -> Result<Vec<u8>, String> {
-    let values = evaluate_display_args(args, session)?;
-    let Some((first, rest)) = values.split_first() else {
-        return Ok(Vec::new());
-    };
+    let prepared = prepare_display_args(args, session, true)?;
 
-    if !rest.is_empty()
-        && let Some(format_bytes) = format_arg_string_bytes(first)
-    {
-        format_with_controls(&format_bytes, rest, UnformattedStyle::Canonical)
-    } else {
-        Ok(join_canonical_values(&values))
-    }
+    Ok(match &prepared.format_bytes {
+        Some(format_bytes) => format_with_controls(
+            format_bytes,
+            prepared.consumable_args(),
+            UnformattedStyle::Canonical,
+        )?,
+        None => join_canonical_values(&prepared.values),
+    })
 }
 
 fn evaluate_display_args(args: &[SystemArg], session: &Session) -> Result<Vec<DisplayArg>, String> {
@@ -146,6 +143,147 @@ fn evaluate_display_args(args: &[SystemArg], session: &Session) -> Result<Vec<Di
             SystemArg::Null => Ok(DisplayArg::Null),
         })
         .collect()
+}
+
+// An evaluated display-argument list, plus the format string its first
+// argument folded to when the list runs in format mode at all.
+struct PreparedDisplay {
+    values: Vec<DisplayArg>,
+    format_bytes: Option<Vec<u8>>,
+}
+
+impl PreparedDisplay {
+    // The arguments format controls may consume: everything after the format
+    // string. Empty for a zero-argument call, where `format_bytes` is `None`.
+    fn consumable_args(&self) -> &[DisplayArg] {
+        self.values.split_first().map_or(&[], |(_, rest)| rest)
+    }
+}
+
+// Static-semantics check for one display-argument list, shaped like
+// `eval::semantic_check`: evaluate every argument in source order — so an
+// identifier or type error still wins over anything about the format string,
+// exactly as it did when this check lived in the renderer — then validate the
+// controls against the number of arguments available to consume them. The
+// evaluated arguments come back out, so nothing is computed twice.
+//
+// A format string is always literal-derived, which makes this a static
+// property of the input rather than a runtime condition: `DisplayStyle::String`
+// originates only at `Expr::StringLiteral` and survives only all-string
+// concatenation / replication, while a packed `reg` stays an ordinary numeric
+// vector even when assigned a string literal (doc/non-standard.md → "Top-level
+// input"). iverilog agrees — `$display(s, x)` on `reg [63:0] s = "v=%d"`
+// prints two numbers, never a formatted string.
+//
+// Format rejections pick up the "Semantic error: " stage prefix here rather
+// than in the message text, so the prefix stays injected at a stage boundary
+// the way `parse_statements`'s and `semantic_check`'s call sites do it.
+// Argument errors arrive already prefixed from `eval::evaluate_expr`.
+fn prepare_display_args(
+    args: &[SystemArg],
+    session: &Session,
+    require_extra_arg: bool,
+) -> Result<PreparedDisplay, String> {
+    let values = evaluate_display_args(args, session)?;
+    let format_bytes = format_mode_bytes(&values, require_extra_arg);
+
+    if let Some(format_bytes) = &format_bytes {
+        // `format_bytes` is `Some` only when `split_first` succeeded, so there
+        // is at least one value and the count cannot underflow.
+        let available = values.len() - 1;
+        check_format_controls(format_bytes, available)
+            .map_err(|e| format!("Semantic error: {e}"))?;
+    }
+
+    Ok(PreparedDisplay {
+        values,
+        format_bytes,
+    })
+}
+
+// Decides format mode and folds the format string in one step, so the
+// validation pass and the renderer cannot disagree about which mode an
+// argument list is in. `require_extra_arg` is the echo-list gate: a lone
+// `"hello"` stays a canonical string echo instead of becoming a zero-argument
+// format string, whereas `$display("value: %")` has no such gate and still
+// reports its trailing `%`.
+fn format_mode_bytes(values: &[DisplayArg], require_extra_arg: bool) -> Option<Vec<u8>> {
+    let (first, rest) = values.split_first()?;
+    if require_extra_arg && rest.is_empty() {
+        return None;
+    }
+    format_arg_string_bytes(first)
+}
+
+// Pure scan of a format string's controls against the number of arguments
+// available to consume them. Precedence matches the renderer's historical
+// order — arity before specifier support — so `$display("%z")` still reports
+// the missing argument instead of naming an unsupported `%z`. Message text is
+// pinned by src/tests/display.rs.
+fn check_format_controls(format_bytes: &[u8], available: usize) -> Result<(), String> {
+    let mut index = 0usize;
+    let mut consumed = 0usize;
+
+    while index < format_bytes.len() {
+        if format_bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+
+        index += 1;
+        if index == format_bytes.len() {
+            return Err("display format control `%` is missing a specifier".to_string());
+        }
+
+        let specifier = format_bytes[index] as char;
+        index += 1;
+
+        if specifier == '%' {
+            continue;
+        }
+
+        if consumed == available {
+            return Err(format!(
+                "display format %{specifier} expects an argument, got {available}"
+            ));
+        }
+        consumed += 1;
+
+        if !is_supported_format_control(specifier) {
+            return Err(format!("unsupported display format control `%{specifier}`"));
+        }
+    }
+
+    Ok(())
+}
+
+// The set of format controls vcal implements, as a predicate so the static
+// check above cannot drift from the renderer's `match`. The renderer keeps the
+// authoritative spelling because it also has to choose a rendering per control;
+// its fallthrough arm asserts the two agree.
+fn is_supported_format_control(specifier: char) -> bool {
+    matches!(
+        specifier,
+        'b' | 'B'
+            | 'o'
+            | 'O'
+            | 'd'
+            | 'D'
+            | 'h'
+            | 'H'
+            | 'x'
+            | 'X'
+            | 'c'
+            | 'C'
+            | 's'
+            | 'S'
+            | 'f'
+            | 'F'
+            | 'e'
+            | 'E'
+            | 'g'
+            | 'G'
+    )
 }
 
 enum DisplayArg {
@@ -159,6 +297,13 @@ enum UnformattedStyle {
     Canonical,
 }
 
+// Renders an already-validated format string. `prepare_display_args` runs
+// `check_format_controls` over the same bytes before getting here — the same
+// "callers validate first" contract `eval::replication_count_value` documents —
+// so the three `Err` arms below are a defensive backstop rather than a
+// user-visible path, and rejections reach the user as `Semantic error:` from
+// the validation pass. They stay `Err` rather than `unreachable!` so the
+// renderer remains total if that contract is ever broken.
 fn format_with_controls(
     format_bytes: &[u8],
     args: &[DisplayArg],
@@ -221,7 +366,13 @@ fn format_with_controls(
             'f' | 'F' | 'e' | 'E' | 'g' | 'G' => push_formatted(&mut output, value, |value| {
                 format_real_value(value, specifier).into_bytes()
             }),
-            _ => return Err(format!("unsupported display format control `%{specifier}`")),
+            _ => {
+                debug_assert!(
+                    !is_supported_format_control(specifier),
+                    "`is_supported_format_control` and the render match disagree on `{specifier}`"
+                );
+                return Err(format!("unsupported display format control `%{specifier}`"));
+            }
         }
     }
 

@@ -166,7 +166,7 @@ The general evaluation model — width, signedness, leaf extension, base inherit
   - `{4'd1 + 4'd1, 4'd2}` -> OK
   - `{1 == 2, 4'd2}` -> OK
 - Replication count rules:
-  - must be a constant expression, which is always true in vcal today
+  - the LRM requires a `constant_expression`, but vcal has no separate elaboration stage, so the count is an ordinary integer expression resolved against the current session — the same relaxation select operands get (see [non-standard.md](non-standard.md) → "Bit-select and part-select operands"). `reg [3:0] n = 2; reg [7:0] a = 8'hAB; {n{a}}` therefore yields `16'habab` here, while iverilog rejects it during elaboration with "A reference to a net or variable (`n') is not allowed in a constant expression"
   - must be non-negative and contain no x/z
   - is interpreted as a mathematical integer using its declared signedness, so `-1` is rejected as negative even if its bit pattern could be read as a large unsigned value
   - zero is allowed only when the replication appears inside a concatenation that has at least one other positive-size operand

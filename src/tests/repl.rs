@@ -149,10 +149,17 @@ fn parse_error_carries_no_task_output() {
 
 // Stage-prefix sanity: the `Syntax error:` / `Semantic error:` prefixes
 // tell the user which phase rejected their input. Parser/lexer errors get
-// the syntax prefix; validator errors get the semantic prefix. Genuine
-// runtime conditions (division by zero, out-of-range bit-select, etc.)
-// are absorbed into x bits per LRM and never surface as Err, so there is
-// no third "no-prefix" case worth pinning down with a test.
+// the syntax prefix; static-semantics errors get the semantic prefix.
+// Genuine runtime conditions (division by zero, out-of-range bit-select,
+// etc.) are absorbed into x bits per LRM and never surface as Err, so every
+// `Err` a user can reach carries one of the two prefixes.
+//
+// Display format controls nearly broke that invariant. They are a static
+// property of the input — a format string can only be literal-derived, since
+// `DisplayStyle::String` survives no packed `reg` — but the check used to sit
+// in the renderer, so its three rejections surfaced with no prefix at all.
+// They are validated while the display argument list is prepared instead;
+// `format_prefix_covers_display_format_rejections` below pins the result.
 #[test]
 fn syntax_error_prefix_distinguishes_stage() {
     let err = evaluate_input("1 +").expect_err("trailing operator");
@@ -171,6 +178,46 @@ fn semantic_error_prefix_distinguishes_stage() {
         err.starts_with("Semantic error:"),
         "validator errors should carry the Semantic error prefix, got: {err}"
     );
+}
+
+#[test]
+fn format_prefix_covers_display_format_rejections() {
+    // Format-string rejections are static-semantic checks, so they carry the
+    // same prefix as any other validator rejection. These compare the whole
+    // message rather than using `contains`: the failure modes being guarded
+    // are a *missing* prefix and a *doubled* one, and a substring assertion
+    // is blind to both — which is how the unprefixed form went unnoticed.
+    let err = evaluate_input("$display(\"%h\")").expect_err("control with no argument");
+    assert_eq!(
+        err,
+        "Semantic error: display format %h expects an argument, got 0"
+    );
+
+    let err = evaluate_input("$display(\"%z\", 42)").expect_err("unsupported control");
+    assert_eq!(
+        err,
+        "Semantic error: unsupported display format control `%z`"
+    );
+
+    let err = evaluate_input("$display(\"value: %\")").expect_err("trailing percent");
+    assert_eq!(
+        err,
+        "Semantic error: display format control `%` is missing a specifier"
+    );
+
+    // The formatted `display_expression` echo shares the same validation, so
+    // it picks up the same prefix.
+    let err = evaluate_input("\"a=%z\", 1").expect_err("echo path");
+    assert_eq!(
+        err,
+        "Semantic error: unsupported display format control `%z`"
+    );
+
+    // Guard against over-applying the check: a *lone* string stays a canonical
+    // echo rather than becoming a zero-argument format string, so its trailing
+    // `%` is ordinary text and not a rejected control.
+    let result = evaluate_input("\"tail %\"").expect("lone string is still an echo");
+    assert_eq!(result.output, "\"tail %\"");
 }
 
 #[test]
