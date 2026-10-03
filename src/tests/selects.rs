@@ -351,3 +351,93 @@ fn nested_real_select_rejected_in_declaration_range() {
         .expect_err("decl range must be rejected");
     assert_eq!(err, REAL_SELECT_ERROR);
 }
+
+#[test]
+fn select_cached_values_refresh_between_statements_and_inputs() {
+    let mut session = Session::new();
+    session.eval("reg [0:0] r = 1'b1").expect("decl");
+    let input = "r[0 +: r[0 +: 1]]";
+    assert_eq!(session.eval(input).expect("width one").output, "1'b1");
+    let err = session
+        .eval(&format!("r = 1'b0; {input}"))
+        .expect_err("fresh width is zero");
+    assert_eq!(
+        err,
+        "Semantic error: indexed part-select width must be positive"
+    );
+    assert_eq!(
+        session
+            .eval(&format!("r = 1'b1; {input}"))
+            .expect("fresh width one")
+            .output,
+        "1'b1"
+    );
+
+    session
+        .eval("reg [7:0] v = 8'h55; integer bound = 3")
+        .expect("decls");
+    assert_eq!(
+        session.eval("v[bound:0]").expect("four bits").output,
+        "4'h5"
+    );
+    assert_eq!(
+        session
+            .eval("bound = 0; v[bound:0]")
+            .expect("one bit")
+            .output,
+        "1'h1"
+    );
+}
+
+#[test]
+fn select_bound_cache_keeps_self_determined_width_under_outer_context() {
+    let mut session = Session::new();
+    session
+        .eval("reg [7:0] r = 8'h55; reg [15:0] dst")
+        .expect("decls");
+    assert_eq!(
+        session
+            .eval("r[0 +: r[3:0]] + 16'h0")
+            .expect("wide context")
+            .output,
+        "16'h0015"
+    );
+    assert_eq!(
+        session
+            .eval("dst = r[0 +: r[3:0]]; dst")
+            .expect("assignment context")
+            .output,
+        "16'h0015"
+    );
+}
+
+#[test]
+fn select_heap_frames_preserve_unary_ternary_and_chained_precedence() {
+    let mut session = Session::new();
+    session
+        .eval("reg [3:0] r = 4'b1010; reg [3:0] a [0:1]; a[1] = r")
+        .expect("decls");
+    assert_eq!(
+        session
+            .eval("~r[1 ? 1 : 0] + 4'b0")
+            .expect("prefix after select")
+            .output,
+        "4'b1110"
+    );
+    assert_eq!(
+        session
+            .eval("a[1 ? 1 : 0][1 +: 1 ? 2 : 1]")
+            .expect("chained ternaries")
+            .output,
+        "2'b01"
+    );
+    for input in ["r[0", "r[1:0", "r[0 +: 1", "a[0][1:0][0]"] {
+        assert!(
+            session
+                .eval(input)
+                .expect_err("malformed select")
+                .starts_with("Syntax error:")
+        );
+    }
+    assert_eq!(session.eval("r[1]").expect("session usable").output, "1'b1");
+}

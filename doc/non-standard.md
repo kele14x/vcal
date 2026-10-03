@@ -41,7 +41,7 @@ LRM 1364-2005 has an internal inconsistency about operand extension: §5.1.10 sa
 
 The Verilog LRM requires constant-expression operands for `r[m:l]` and for the `width` half of `r[b +: w]` / `r[b -: w]`, because simulators and synthesizers resolve those shapes during elaboration. vcal has no separate elaboration stage: the REPL evaluates each input directly against the current `Session`. So vcal deliberately relaxes those forms to ordinary integer expressions evaluated at runtime. The resulting values still must be usable as a select shape: part-select endpoints and indexed widths must resolve to definite integers, and indexed widths must be positive.
 
-That relaxation has one deliberate counterweight: a nesting cap. `[` is the only opening delimiter vcal's iterative parser driver has no heap frame for, so parsing a select index re-enters expression parsing on a real stack frame, and `a[a[…[0]…]]` — legal at any depth — consumes C stack proportional to its nesting. vcal therefore stops at 64 levels, far above any meaningful expression and far below the depth that would overflow, reporting `Syntax error: select nesting exceeds 64 levels` instead of aborting.
+Select nesting has no fixed depth limit. Select brackets use heap frames in the parser, and their operands use the iterative annotation, validation, evaluation, and drop paths. Parse-only AST output still uses its separate display-depth truncation limit (see [repl.md](repl.md)).
 
 ## Real numbers
 

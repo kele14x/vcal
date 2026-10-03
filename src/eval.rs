@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 use num_bigint::{BigInt, BigUint, Sign};
@@ -41,10 +42,10 @@ struct ExprMeta {
 // expressions to the real pipeline, so a panic here is a real bug.
 //
 // `expr` keeps a back-reference to the original `Expr` so leaves (`Literal`,
-// `Identifier`, `Select`, …) and primitive operator data (`UnaryOp`,
+// `Identifier`, …) and primitive operator data (`UnaryOp`,
 // `BinaryOp`, `MathFunctionKind`, …) can be read directly from `expr` rather
 // than duplicated into `kind`. `kind` only mirrors the structural children
-// the evaluators need to recurse into.
+// the evaluators need to visit.
 #[derive(Debug)]
 pub(crate) struct Annotated<'a> {
     expr: &'a Expr,
@@ -54,9 +55,10 @@ pub(crate) struct Annotated<'a> {
 
 #[derive(Debug)]
 enum AnnotatedKind<'a> {
-    // `Literal`, `RealLiteral`, `Identifier`, `Select`. The evaluator
+    // `Literal`, `RealLiteral`, `Identifier`. The evaluator
     // reads sub-data from `Annotated::expr` directly.
     Leaf,
+    Select(Box<AnnotatedSelect<'a>>),
     Grouped(Box<Annotated<'a>>),
     Unary(Box<Annotated<'a>>),
     Binary {
@@ -101,6 +103,52 @@ enum AnnotatedKind<'a> {
     SystemTask,
 }
 
+// Select operands are self-determined. Bounds needed for width inference
+// are resolved once during annotation; indices/bases are scheduled on the
+// evaluator's work stack. Memoize only the natural select result, before
+// any outer context is applied, for enclosing select bounds to reuse.
+#[derive(Debug)]
+struct AnnotatedSelect<'a> {
+    operands: Vec<Annotated<'a>>,
+    kind: ResolvedSelectKind,
+    inner: Option<ResolvedSelectKind>,
+    value: OnceCell<Value>,
+}
+
+#[derive(Debug)]
+enum ResolvedSelectKind {
+    Bit {
+        index: usize,
+    },
+    PartConst {
+        msb: BigInt,
+        lsb: BigInt,
+        width: usize,
+    },
+    PartIndexed {
+        base: usize,
+        width: usize,
+        is_up: bool,
+    },
+}
+
+impl ResolvedSelectKind {
+    fn dynamic_operand(&self) -> Option<usize> {
+        match self {
+            Self::Bit { index } => Some(*index),
+            Self::PartIndexed { base, .. } => Some(*base),
+            Self::PartConst { .. } => None,
+        }
+    }
+
+    fn width(&self) -> usize {
+        match self {
+            Self::Bit { .. } => 1,
+            Self::PartConst { width, .. } | Self::PartIndexed { width, .. } => *width,
+        }
+    }
+}
+
 impl<'a> Annotated<'a> {
     pub(crate) fn is_real(&self) -> bool {
         self.meta.is_none()
@@ -139,6 +187,7 @@ fn steal_annotated_children<'a>(annot: &mut Annotated<'a>, out: &mut Vec<Annotat
     };
     match &mut annot.kind {
         AnnotatedKind::Leaf | AnnotatedKind::SystemTask => {}
+        AnnotatedKind::Select(select) => out.append(&mut select.operands),
         AnnotatedKind::Grouped(inner) | AnnotatedKind::Unary(inner) => {
             out.push(std::mem::replace(inner.as_mut(), placeholder()));
         }
@@ -179,16 +228,15 @@ fn steal_annotated_children<'a>(annot: &mut Annotated<'a>, out: &mut Vec<Annotat
 //
 // Real-result branches store `meta = None`; integer branches store
 // `Some(meta)` computed from the children's metas using the same combination
-// rules the meta walkers previously re-derived from the tree. The Select arm
-// stays a leaf in the annotated tree — its index / range sub-expressions are
-// short, self-determined, and outside the chain spine, so re-walking them in
-// the legacy helpers is a non-issue for the O(N²) regression.
+// rules the meta walkers previously re-derived from the tree. Select
+// operands also join this bottom-up walk, rather than restarting it through
+// the raw-Expr select helpers.
 // Iterative CES (control-environment-store) driver: each `Visit` task
 // inspects an `Expr` node and, for parent shapes, schedules a `Combine` task
 // followed by `Visit` tasks for the children (pushed in reverse so they pop
 // in source order). Each `Combine` pops its child annotations off `vals` and
 // assembles the parent `Annotated`. Leaves (Literal, RealLiteral, SystemTask,
-// Identifier, Select, Truncated-via-unreachable) push their annotation
+// Identifier, Truncated-via-unreachable) push their annotation
 // directly with no Combine. This keeps Rust stack depth O(1) regardless of
 // input nesting depth — paired with `impl Drop for Annotated` above so the
 // resulting deep `Box<Annotated>` chain doesn't crash at end-of-scope.
@@ -198,6 +246,10 @@ enum AnnotateTask<'a> {
 }
 
 enum AnnotateCombiner<'a> {
+    Select {
+        expr: &'a Expr,
+        operand_count: usize,
+    },
     Grouped {
         expr: &'a Expr,
     },
@@ -372,27 +424,21 @@ pub(crate) fn annotate<'a>(root: &'a Expr, session: &Session) -> Result<Annotate
                     });
                 }
                 Expr::Select { name, kind, inner } => {
-                    // Inner index / range sub-expressions stay un-annotated —
-                    // they're self-determined, short, and not in the chain
-                    // spine; the legacy helpers still handle them. Real-typed
-                    // selects (real-array element via `r[i]`, no inner
-                    // select) carry `meta = None` to route through the f64
-                    // pipeline; the validator surfaces the structural
-                    // diagnostic for illegal forms before any meta consumer
-                    // runs.
-                    let is_real_select = matches!(session.lookup(name), Some(reg) if reg.is_real_array())
-                        && matches!(kind, SelectKind::Bit { .. })
-                        && inner.is_none();
-                    let meta = if is_real_select {
-                        None
-                    } else {
-                        Some(infer_select_meta(name, kind, inner.as_deref(), session)?)
-                    };
-                    vals.push(Annotated {
+                    // Preserve undeclared-name precedence before walking operands.
+                    session
+                        .lookup(name)
+                        .ok_or_else(|| format!("undeclared identifier: {name}"))?;
+                    let mut operands = select_operand_exprs(kind);
+                    if let Some(inner) = inner {
+                        operands.extend(select_operand_exprs(inner));
+                    }
+                    work.push(AnnotateTask::Combine(AnnotateCombiner::Select {
                         expr,
-                        meta,
-                        kind: AnnotatedKind::Leaf,
-                    });
+                        operand_count: operands.len(),
+                    }));
+                    for operand in operands.into_iter().rev() {
+                        work.push(AnnotateTask::Visit(operand));
+                    }
                 }
                 Expr::Truncated => unreachable!(
                     "Expr::Truncated is a display-only sentinel; never reaches annotate"
@@ -430,6 +476,13 @@ fn annotate_combine<'a>(
     }
 
     match combiner {
+        AnnotateCombiner::Select {
+            expr,
+            operand_count,
+        } => {
+            let operands = pop_n(vals, operand_count);
+            annotate_select(expr, operands, session)
+        }
         AnnotateCombiner::Grouped { expr } => {
             let inner = vals.pop().expect("Grouped: inner missing");
             Ok(Annotated {
@@ -580,7 +633,7 @@ fn annotate_combine<'a>(
             // width allocates before this replication node is ever evaluated
             // (`1 ? 1'b1 : {64'hffff_ffff_ffff_ffff{1'b0}}` aborts with
             // `capacity overflow`), and a width merely above the cap silently
-            // violates it. Same invariant `infer_select_meta` enforces for
+            // violates it. Same invariant `annotate_select` enforces for
             // part-selects.
             value::ensure_bit_width(total_width, "replication")?;
             Ok(Annotated {
@@ -874,14 +927,9 @@ pub(crate) fn evaluate_constant_expr(
     evaluate_annotated(&annotated, None, session)
 }
 
-// Self-determined integer evaluation that goes through the iterative
-// `annotate` + `evaluate_annotated` pipeline. Used wherever a leaf-side
-// helper would otherwise call the recursive `evaluate_expr_in_context`
-// on a user-supplied sub-expression: bit-select index, indexed-base, and
-// part-select range halves. The enclosing expression has already been
-// validated (either by `validate_annotated` at the top of
-// `evaluate_expr`/`evaluate_assignment_rhs`, or by per-form structural checks
-// like `validate_select_kind_structure`), so we skip `validate_annotated` here.
+// Self-determined integer evaluation for pre-validated raw-Expr operands
+// in the lvalue index/base helpers. Nested selects join the iterative
+// annotated pipeline, rather than calling back into a raw-Expr evaluator.
 fn evaluate_subexpr_as_integer(expr: &Expr, session: &Session) -> Result<IntegerValue, String> {
     let annotated = annotate(expr, session)?;
     evaluate_annotated(&annotated, None, session)
@@ -993,7 +1041,7 @@ pub(crate) fn expression_is_real(expr: &Expr, session: &Session) -> bool {
             // (`r[i]`) yields real. A select on a scalar `real` is
             // prohibited (LRM 4.8.1), but this runs during annotation —
             // ahead of the validator that rejects it — so report
-            // integer-typed and let `infer_select_meta` surface the
+            // integer-typed and let `annotate_select` surface the
             // diagnostic instead of aborting here.
             Expr::Select { name, kind, inner } => {
                 let real_array_element = matches!(kind, SelectKind::Bit { .. })
@@ -1181,32 +1229,12 @@ fn validate_select_kind_structure(kind: &SelectKind, session: &Session) -> Resul
     }
 }
 
-fn validate_select_expr_structure(
-    name: &str,
-    kind: &SelectKind,
-    inner: Option<&SelectKind>,
-    session: &Session,
-) -> Result<(), String> {
-    validate_select_kind_structure(kind, session)?;
-    if let Some(inner_kind) = inner {
-        validate_select_kind_structure(inner_kind, session)?;
-    }
-    // `infer_select_meta` routes through `select_meta_width`, which is the
-    // shared select-validator used by both the RHS pre-pass and the LHS
-    // `lvalue_meta` path. Position-type rules (real-typed bit-select index,
-    // real-typed indexed-base, part-select direction match, etc.) live there
-    // so the LHS doesn't need its own copy.
-    let _ = infer_select_meta(name, kind, inner, session)?;
-    Ok(())
-}
-
 // Static-semantic validator over the annotated tree. Reads `is_real()` and
 // `meta()` from precomputed annotations instead of re-walking every Binary
 // node's lhs/rhs to ask the same questions, dropping the old O(N²) helper-walk
-// pattern to O(N) on long chains. `SelectKind` index / range sub-expressions
-// hang off `Leaf` nodes and re-enter this same pipeline through
-// `validate_subexpr_structure` — they're short and self-determined, outside
-// the chain spine that drove the regression.
+// pattern to O(N) on long chains. Select operands belong to the annotated
+// tree and are validated once by their select combiner, before width
+// inference evaluates bounds. Their Select arm here is already checked.
 // Iterative implementation. Each parent's node-local checks (real-operand
 // rejection, $bitstoreal width, $clog2 real-arg, replication count_check,
 // concatenation bit-collection) run eagerly at Visit time, then child
@@ -1345,11 +1373,12 @@ fn visit_annotated<'b, 'a: 'b>(
                     let _ = reg.require_vector(name)?;
                 }
             }
-            Expr::Select { name, kind, inner } => {
-                validate_select_expr_structure(name, kind, inner.as_deref(), session)?;
-            }
             _ => unreachable!("AnnotatedKind::Leaf only wraps leaf-shaped Expr variants"),
         },
+        // The select combiner already validated every operand before
+        // resolving its bounds. Revisiting descendants here would repeat
+        // that work once per enclosing select.
+        AnnotatedKind::Select(_) => {}
         AnnotatedKind::SystemTask => {
             // `$finish` / `$stop` in expression position. The lib driver
             // (`apply_stmt`) catches the top-level case before evaluation
@@ -1675,25 +1704,8 @@ fn evaluate_leaf_expr_in_context(
                 None => value.clone(),
             })
         }
-        // Bit- / part-select on a declared reg: the slice is computed
-        // self-determined (its width and unsigned-ness are fixed by the
-        // select form), then widens to the outer context the same way an
-        // Identifier does. Per LRM 4.7, the result is always unsigned, so
-        // a wider signed outer context zero-extends rather than
-        // sign-extends — `resized_to_context(width, context.signed)`
-        // already implements that because the value itself is unsigned.
-        //
-        // Chained selects (`a[i][m:l]`) flow through the same outer-context
-        // pipeline: `evaluate_select` resolves both selects and yields the
-        // inner result, which is then widened to the propagated context.
-        Expr::Select { name, kind, inner } => {
-            let value = evaluate_select(name, kind, inner.as_deref(), session)?;
-            Ok(match context {
-                Some(context) => value.resized_to_context(context.width, context.signed),
-                None => value,
-            })
-        }
-        Expr::Grouped(_)
+        Expr::Select { .. }
+        | Expr::Grouped(_)
         | Expr::Unary { .. }
         | Expr::Binary { .. }
         | Expr::Conditional { .. }
@@ -1747,6 +1759,10 @@ enum EvalTask<'b, 'a: 'b> {
 }
 
 enum EvalCombiner<'b, 'a: 'b> {
+    Select {
+        node: &'b Annotated<'a>,
+        ctx: Option<ExprMeta>,
+    },
     /// Add / Subtract / Multiply / Divide / Modulus on integer operands.
     /// Pops 2 values (lhs, rhs).
     BinaryArith {
@@ -2072,6 +2088,13 @@ fn visit_real_eval<'b, 'a: 'b>(
         "visit_real_eval invoked on integer-typed node — caller should have used push_visit_as_real"
     );
     match &node.kind {
+        AnnotatedKind::Select(select) => {
+            if let Some(Value::Real(value)) = select.value.get() {
+                real_vals.push(*value);
+            } else {
+                push_select_eval(node, select, None, work);
+            }
+        }
         AnnotatedKind::Grouped(inner) => {
             // Grouped is transparent. Inner of a real-typed Grouped is
             // itself real-typed.
@@ -2214,23 +2237,10 @@ fn visit_real_eval<'b, 'a: 'b>(
                     .ok_or_else(|| format!("unknown real variable `{name}`"))?;
                 real_vals.push(v);
             }
-            Expr::Select { name, kind, inner } => {
-                debug_assert!(
-                    inner.is_none(),
-                    "validator drops chained selects on real array"
-                );
-                let index = match kind {
-                    SelectKind::Bit { index } => index,
-                    _ => unreachable!("validator rejects part-select on real array"),
-                };
-                real_vals.push(evaluate_real_array_element_select(name, index, session)?);
-            }
             Expr::Literal(_) | Expr::StringLiteral(_) => {
                 unreachable!("integer literal Leaf isn't real-typed; would be coerced earlier");
             }
-            _ => unreachable!(
-                "Leaf annotated kind only wraps Literal / RealLiteral / Identifier / Select"
-            ),
+            _ => unreachable!("Leaf annotated kind only wraps Literal / RealLiteral / Identifier"),
         },
     }
     Ok(())
@@ -2352,7 +2362,17 @@ fn visit_eval<'b, 'a: 'b>(
     session: &Session,
 ) -> Result<(), String> {
     match &node.kind {
-        // Grouped is transparent in semantics — recurse into the inner
+        AnnotatedKind::Select(select) => {
+            if let Some(Value::Integer(value)) = select.value.get() {
+                vals.push(match ctx {
+                    Some(ctx) => value.resized_to_context(ctx.width, ctx.signed),
+                    None => value.clone(),
+                });
+            } else {
+                push_select_eval(node, select, ctx, work);
+            }
+        }
+        // Grouped is transparent in semantics — visit the inner
         // annotation with the same context.
         AnnotatedKind::Grouped(inner) => work.push(EvalTask::Visit { node: inner, ctx }),
         AnnotatedKind::Binary { lhs, rhs } => {
@@ -2948,9 +2968,32 @@ fn combine_eval<'b, 'a: 'b>(
     work: &mut Vec<EvalTask<'b, 'a>>,
     vals: &mut Vec<IntegerValue>,
     real_vals: &mut Vec<f64>,
-    _session: &Session,
+    session: &Session,
 ) -> Result<(), String> {
     match combiner {
+        EvalCombiner::Select { node, ctx } => {
+            let AnnotatedKind::Select(select) = &node.kind else {
+                unreachable!("select combiner requires a select annotation");
+            };
+            let count = usize::from(select.kind.dynamic_operand().is_some())
+                + usize::from(
+                    select
+                        .inner
+                        .as_ref()
+                        .and_then(ResolvedSelectKind::dynamic_operand)
+                        .is_some(),
+                );
+            let operands = vals.split_off(vals.len() - count);
+            let value = evaluate_resolved_select(node.expr, select, &operands, session)?;
+            let _ = select.value.set(value.clone());
+            match value {
+                Value::Integer(value) => vals.push(match ctx {
+                    Some(ctx) => value.resized_to_context(ctx.width, ctx.signed),
+                    None => value,
+                }),
+                Value::Real(value) => real_vals.push(value),
+            }
+        }
         EvalCombiner::BinaryArith {
             op,
             effective_meta,
@@ -3637,108 +3680,264 @@ fn compute_equality_from_values(
     widen_relational_result(comparison_result_value(bit), context)
 }
 
-fn infer_select_meta(
-    name: &str,
-    kind: &SelectKind,
-    inner: Option<&SelectKind>,
+fn select_operand_exprs(kind: &SelectKind) -> Vec<&Expr> {
+    match kind {
+        SelectKind::Bit { index } => vec![index],
+        SelectKind::PartConst { msb, lsb } => vec![msb, lsb],
+        SelectKind::PartIndexedUp { base, width } | SelectKind::PartIndexedDown { base, width } => {
+            vec![base, width]
+        }
+    }
+}
+
+fn annotate_select<'a>(
+    expr: &'a Expr,
+    operands: Vec<Annotated<'a>>,
     session: &Session,
-) -> Result<ExprMeta, String> {
-    let reg = session
-        .lookup(name)
-        .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-    if reg.is_real_array() {
-        // Real-array element select: only `r[i]` is legal — part-selects
-        // and chained inner selects have no LRM meaning on a real
-        // element (no bits to slice). The validator runs through here
-        // for structural checks; the actual value path goes through
-        // `evaluate_expr_as_real`'s `Expr::Select` arm. The returned
-        // meta is a placeholder (width 0) that never reaches a width
-        // / sign / base consumer because real-typed selects don't
-        // participate in integer context propagation.
-        match kind {
-            SelectKind::Bit { index } => {
-                if expression_is_real(index, session) {
-                    return Err("array element index cannot be real".to_string());
-                }
-            }
-            SelectKind::PartConst { .. }
-            | SelectKind::PartIndexedUp { .. }
-            | SelectKind::PartIndexedDown { .. } => {
+) -> Result<Annotated<'a>, String> {
+    let Expr::Select { name, kind, inner } = expr else {
+        unreachable!("select combiner requires a select expression");
+    };
+    // Nested selects have already validated their own operands during
+    // this bottom-up walk; their validator arm does not visit them again.
+    for operand in &operands {
+        validate_annotated(operand, session)?;
+    }
+    let reg = session.lookup(name).expect("select name checked at Visit");
+    let (resolved, resolved_inner, meta) = if reg.is_real_array() || reg.is_array() {
+        if !matches!(kind, SelectKind::Bit { .. }) {
+            return Err(format!(
+                "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
+            ));
+        }
+        if operands[0].is_real() {
+            return Err("array element index cannot be real".to_string());
+        }
+        let resolved = ResolvedSelectKind::Bit { index: 0 };
+        if reg.is_real_array() {
+            if inner.is_some() {
                 return Err(format!(
-                    "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
+                    "bit-select or part-select on real-array element `{name}` is illegal"
                 ));
             }
+            (resolved, None, None)
+        } else {
+            let (_, elements) = reg.array().expect("vector array");
+            let template = &elements[0];
+            if let Some(inner) = inner {
+                let range = reg.range.as_ref().ok_or_else(|| {
+                    format!("bit-select or part-select on scalar array element `{name}` is illegal")
+                })?;
+                let inner = resolve_annotated_select_kind(inner, 1, &operands, range, session)?;
+                let meta = ExprMeta {
+                    width: inner.width(),
+                    signed: false,
+                    base: template.base,
+                };
+                (resolved, Some(inner), Some(meta))
+            } else {
+                let meta = ExprMeta {
+                    width: template.width,
+                    signed: template.signed,
+                    base: template.base,
+                };
+                (resolved, None, Some(meta))
+            }
+        }
+    } else {
+        if reg.is_real() {
+            return Err(format!(
+                "bit-select or part-select on real variable `{name}` is not allowed"
+            ));
         }
         if inner.is_some() {
             return Err(format!(
-                "bit-select or part-select on real-array element `{name}` is illegal"
+                "chained select on `{name}` is illegal: `{name}` is not an array"
             ));
         }
-        return Ok(ExprMeta {
-            width: 0,
+        let value = reg.require_vector(name)?;
+        let range = reg.range.as_ref().ok_or_else(|| {
+            format!("bit-select or part-select on scalar reg `{name}` is illegal")
+        })?;
+        let kind = resolve_annotated_select_kind(kind, 0, &operands, range, session)?;
+        let meta = ExprMeta {
+            width: kind.width(),
             signed: false,
-            base: crate::Base::Binary,
-        });
-    }
-    if reg.is_array() {
-        let index = match kind {
-            SelectKind::Bit { index } => index,
-            SelectKind::PartConst { .. }
-            | SelectKind::PartIndexedUp { .. }
-            | SelectKind::PartIndexedDown { .. } => {
-                return Err(format!(
-                    "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
-                ));
-            }
+            base: value.base,
         };
-        if expression_is_real(index, session) {
-            return Err("array element index cannot be real".to_string());
+        (kind, None, Some(meta))
+    };
+    Ok(Annotated {
+        expr,
+        meta,
+        kind: AnnotatedKind::Select(Box::new(AnnotatedSelect {
+            operands,
+            kind: resolved,
+            inner: resolved_inner,
+            value: OnceCell::new(),
+        })),
+    })
+}
+
+fn resolve_annotated_select_kind(
+    kind: &SelectKind,
+    offset: usize,
+    operands: &[Annotated<'_>],
+    range: &RegRange,
+    session: &Session,
+) -> Result<ResolvedSelectKind, String> {
+    match kind {
+        SelectKind::Bit { .. } => {
+            if operands[offset].is_real() {
+                return Err("bit-select index cannot be real".to_string());
+            }
+            Ok(ResolvedSelectKind::Bit { index: offset })
         }
-        let (_, elements) = reg.array().expect("is_array() => array() returns Some");
-        debug_assert!(!elements.is_empty());
-        let template = &elements[0];
-        if let Some(inner_kind) = inner {
-            let element_range = reg.range.as_ref().ok_or_else(|| {
-                format!("bit-select or part-select on scalar array element `{name}` is illegal")
-            })?;
-            let width = select_meta_width(inner_kind, element_range, session)?;
-            return Ok(ExprMeta {
+        SelectKind::PartConst { .. } => {
+            let msb = annotated_range_endpoint(&operands[offset], session, "msb")?;
+            let lsb = annotated_range_endpoint(&operands[offset + 1], session, "lsb")?;
+            check_part_select_direction(range, &msb, &lsb)?;
+            let width = compute_select_width(&msb, &lsb)?;
+            Ok(ResolvedSelectKind::PartConst { msb, lsb, width })
+        }
+        SelectKind::PartIndexedUp { .. } | SelectKind::PartIndexedDown { .. } => {
+            if operands[offset].is_real() {
+                return Err("indexed part-select base cannot be real".to_string());
+            }
+            let width_operand = &operands[offset + 1];
+            if width_operand.is_real() {
+                return Err("indexed part-select width cannot be real".to_string());
+            }
+            let value = evaluate_annotated(width_operand, None, session)?;
+            let width = indexed_select_width_value(&value)?;
+            Ok(ResolvedSelectKind::PartIndexed {
+                base: offset,
                 width,
-                signed: false,
-                base: template.base,
-            });
+                is_up: matches!(kind, SelectKind::PartIndexedUp { .. }),
+            })
         }
-        return Ok(ExprMeta {
-            width: template.width,
-            signed: template.signed,
-            base: template.base,
+    }
+}
+
+fn annotated_range_endpoint(
+    operand: &Annotated<'_>,
+    session: &Session,
+    role: &str,
+) -> Result<BigInt, String> {
+    if operand.is_real() {
+        return Err(format!("part-select {role} cannot be real"));
+    }
+    let value = evaluate_annotated(operand, None, session)?;
+    if value.has_unknown_bits() {
+        return Err(format!("part-select {role} contains unknown bits"));
+    }
+    Ok(value.as_bigint(value.signed))
+}
+
+fn push_select_eval<'b, 'a: 'b>(
+    node: &'b Annotated<'a>,
+    select: &'b AnnotatedSelect<'a>,
+    ctx: Option<ExprMeta>,
+    work: &mut Vec<EvalTask<'b, 'a>>,
+) {
+    work.push(EvalTask::Combine(EvalCombiner::Select { node, ctx }));
+    if let Some(index) = select
+        .inner
+        .as_ref()
+        .and_then(ResolvedSelectKind::dynamic_operand)
+    {
+        work.push(EvalTask::Visit {
+            node: &select.operands[index],
+            ctx: None,
         });
     }
-    if reg.is_real() {
-        // LRM 4.8.1: "Bit-select or part-select references of variables
-        // declared as real … is prohibited." The scalar `real` has no
-        // packed bits, so no select kind is meaningful — reject outright
-        // regardless of the select shape.
-        return Err(format!(
-            "bit-select or part-select on real variable `{name}` is not allowed"
-        ));
+    if let Some(index) = select.kind.dynamic_operand() {
+        work.push(EvalTask::Visit {
+            node: &select.operands[index],
+            ctx: None,
+        });
     }
-    if inner.is_some() {
-        return Err(format!(
-            "chained select on `{name}` is illegal: `{name}` is not an array"
-        ));
+}
+
+fn evaluate_resolved_select(
+    expr: &Expr,
+    select: &AnnotatedSelect<'_>,
+    operands: &[IntegerValue],
+    session: &Session,
+) -> Result<Value, String> {
+    let Expr::Select { name, .. } = expr else {
+        unreachable!("select expression")
+    };
+    let reg = session.lookup(name).expect("select name validated");
+    if let Some((dim, elements)) = reg.real_array() {
+        let index = resolved_array_index(dim, &operands[0]);
+        return Ok(Value::Real(index.map_or(0.0, |index| elements[index])));
     }
-    let value = reg.require_vector(name)?;
-    let range = reg
-        .range
-        .as_ref()
-        .ok_or_else(|| format!("bit-select or part-select on scalar reg `{name}` is illegal"))?;
-    let width = select_meta_width(kind, range, session)?;
-    Ok(ExprMeta {
-        width,
-        signed: false,
-        base: value.base,
-    })
+    let selected = if let Some((dim, elements)) = reg.array() {
+        let template = &elements[0];
+        let index = resolved_array_index(dim, &operands[0]);
+        let element = index.map_or_else(
+            || IntegerValue::all_x(template.width, template.signed, template.base),
+            |index| elements[index].clone(),
+        );
+        if let Some(inner) = &select.inner {
+            let range = reg.range.as_ref().expect("packed array range validated");
+            apply_resolved_select(&element, range, inner, operands.get(1))?
+        } else {
+            element
+        }
+    } else {
+        let value = reg.require_vector(name)?;
+        let range = reg.range.as_ref().expect("vector range validated");
+        apply_resolved_select(value, range, &select.kind, operands.first())?
+    };
+    Ok(Value::Integer(selected))
+}
+
+fn resolved_array_index(dim: &RegRange, index: &IntegerValue) -> Option<usize> {
+    if index.has_unknown_bits() {
+        None
+    } else {
+        resolve_reg_index(dim, &index.as_bigint(index.signed))
+    }
+}
+
+fn apply_resolved_select(
+    value: &IntegerValue,
+    range: &RegRange,
+    kind: &ResolvedSelectKind,
+    dynamic: Option<&IntegerValue>,
+) -> Result<IntegerValue, String> {
+    match kind {
+        ResolvedSelectKind::Bit { .. } => {
+            let index = dynamic.expect("bit index evaluated");
+            let bit =
+                resolved_array_index(range, index).map_or(LogicBit::X, |index| value.bits[index]);
+            Ok(IntegerValue::computed(1, false, value.base, vec![bit]))
+        }
+        ResolvedSelectKind::PartConst { msb, lsb, width } => {
+            materialize_part_select(value, range, msb, lsb, *width, value.base)
+        }
+        ResolvedSelectKind::PartIndexed { width, is_up, .. } => {
+            let base = dynamic.expect("indexed base evaluated");
+            if base.has_unknown_bits() {
+                return Ok(IntegerValue::all_x(*width, false, value.base));
+            }
+            let base = base.as_bigint(base.signed);
+            let span = BigInt::from(width - 1);
+            let (lo, hi) = if *is_up {
+                (base.clone(), base + span)
+            } else {
+                (base.clone() - span, base)
+            };
+            let (msb, lsb) = if range.msb >= range.lsb {
+                (hi, lo)
+            } else {
+                (lo, hi)
+            };
+            materialize_part_select(value, range, &msb, &lsb, *width, value.base)
+        }
+    }
 }
 
 fn combine_binary_meta(op: BinaryOp, lhs_meta: ExprMeta, rhs_meta: ExprMeta) -> ExprMeta {
@@ -4174,140 +4373,8 @@ fn reduce_bits(op: UnaryOp, bits: &[LogicBit]) -> LogicBit {
     }
 }
 
-// LRM 4.2.1 / 5.2.1 / 5.2.2 bit-/part-select dispatch. The reg lookup
-// happens once here so each kind helper receives `&RegValue` directly
-// rather than re-resolving the name. Every helper produces an unsigned
-// self-determined IntegerValue; outer-context widening is applied by
-// the `Expr::Select` arm of `evaluate_leaf_expr_in_context`.
-//
-// `inner` carries the second select in `a[i][...]`. It is only meaningful
-// when `reg` is an array (the outer `kind` must then be a `Bit` element
-// pick); on a vector reg `inner.is_some()` is rejected because a vector
-// select already produces a self-determined integer value with no further
-// sub-structure to address.
-fn evaluate_select(
-    name: &str,
-    kind: &SelectKind,
-    inner: Option<&SelectKind>,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let reg = session
-        .lookup(name)
-        .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-    // LRM 4.9: an array reference is `name[expr]` — exactly one element
-    // index that yields the whole packed-vector element. Part-select and
-    // indexed-part-select forms apply to the packed range, not to the
-    // unpacked dimension, so they have no meaning on the array's outer
-    // bracket and are rejected here. Selecting *inside* a chosen element
-    // (e.g. `a[i][m:l]`) routes through `evaluate_array_chained_select`
-    // when `inner` is present.
-    if reg.is_array() {
-        return match inner {
-            None => evaluate_array_element_select(name, reg, kind, session),
-            Some(inner_kind) => evaluate_array_chained_select(name, reg, kind, inner_kind, session),
-        };
-    }
-    if reg.is_real_array() {
-        // A real-array element select is real-typed (handled by
-        // `evaluate_expr_as_real`); reaching here means the surrounding
-        // expression expected an integer but got the real result. The
-        // validator catches invalid select shapes (part-select, chained
-        // inner) before this point, so the only legal-shape case is a
-        // bare `r[i]` flowing into an integer-only consumer.
-        return Err(format!(
-            "real-array element `{name}[..]` cannot be used as an integer value"
-        ));
-    }
-    if reg.is_real() {
-        // The validator (`infer_select_meta`) rejects any select on a
-        // scalar `real` per LRM 4.8.1 before evaluation runs.
-        unreachable!("validator rejects select on scalar real `{name}` before evaluation");
-    }
-    if inner.is_some() {
-        return Err(format!(
-            "chained select on `{name}` is illegal: `{name}` is not an array"
-        ));
-    }
-    let value = reg.require_vector(name)?;
-    // LRM 5.2.1: "A bit-select or part-select of a scalar ... shall be
-    // illegal." A reg declared without a range is a scalar even when
-    // its width happens to be 1, distinct from the 1-bit vector
-    // `reg [0:0] a` which does accept selects.
-    let range = reg
-        .range
-        .as_ref()
-        .ok_or_else(|| format!("bit-select or part-select on scalar reg `{name}` is illegal"))?;
-    let base = value.base;
-    apply_select_kind(value, range, kind, base, session)
-}
-
-// Dispatch a `SelectKind` against an already-resolved (value, range)
-// pair. Factored out of `evaluate_select` so the chained array-element
-// path can reuse the exact same per-kind logic against the chosen
-// element's value/range, keeping vector and array inner-selects
-// bit-identical to a plain vector-reg select.
-fn apply_select_kind(
-    value: &IntegerValue,
-    range: &RegRange,
-    kind: &SelectKind,
-    result_base: Base,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    match kind {
-        SelectKind::Bit { index } => evaluate_bit_select(value, range, index, result_base, session),
-        SelectKind::PartConst { msb, lsb } => {
-            evaluate_part_const_select(value, range, msb, lsb, result_base, session)
-        }
-        SelectKind::PartIndexedUp {
-            base: base_expr,
-            width,
-        } => {
-            evaluate_part_indexed_select(value, range, base_expr, width, result_base, session, true)
-        }
-        SelectKind::PartIndexedDown {
-            base: base_expr,
-            width,
-        } => evaluate_part_indexed_select(
-            value,
-            range,
-            base_expr,
-            width,
-            result_base,
-            session,
-            false,
-        ),
-    }
-}
-
-// Real-array element select — sibling of `evaluate_array_element_select`
-// for the f64-element form (`real r [0:3]`). The validator rejects
-// non-Bit kinds and chained inner selects before this point, so the
-// only legal shape is `r[i]`. x/z in the index or an OOB index falls
-// back to 0.0 — LRM 4.2.1 says OOB array reads return x for vector
-// elements, but a real has no x state, and `0.0` is the LRM 4.8 init
-// value for an unwritten real slot, so it is the closest analog.
-fn evaluate_real_array_element_select(
-    name: &str,
-    index: &Expr,
-    session: &Session,
-) -> Result<f64, String> {
-    let reg = session
-        .lookup(name)
-        .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-    let (_, elements) = reg
-        .real_array()
-        .expect("evaluate_real_array_element_select called on a non-real-array reg");
-    Ok(
-        match resolve_real_array_element_index(name, index, session)? {
-            Some(internal) => elements[internal],
-            None => 0.0,
-        },
-    )
-}
-
 // Resolves the unpacked-dim index for a real-array element access. Shared
-// by the RHS read path (`evaluate_real_array_element_select`) and the
-// LHS write path (`lib::apply_real_array_element_assign`). Returns
+// by the LHS write path (`lib::apply_real_array_element_assign`). Returns
 // `Some(internal_index)` for an in-range integer index, `None` for x/z
 // in the index or an OOB index — both cases the caller treats as
 // "no slot": reads fall back to 0.0; writes drop silently per LRM 4.2.1.
@@ -4331,224 +4398,6 @@ pub(crate) fn resolve_real_array_element_index(
     }
     let src_index = index_value.as_bigint(index_value.signed);
     Ok(resolve_reg_index(dim, &src_index))
-}
-
-// LRM 4.9 unpacked-array element select. `a[i]` resolves `i` against
-// the declared unpacked dimension (`a [msb:lsb]`) and returns the
-// whole packed-vector element at that position. The element's
-// (width, signed, base) is the packed vector's shape, identical to a
-// freshly-declared vector reg of the same packed range.
-//
-// Out-of-range index / x or z in the index both surface as an all-x
-// value of the element's width — mirroring LRM 4.2.1's bit-select OOB
-// rule and §4.2.1's "x/z in index → x" rule. The element's signedness
-// and base flow through unchanged so an arithmetic context on top of
-// `a[i]` lines up with the same context on a vector reg of the same
-// packed range.
-//
-// Only `SelectKind::Bit` is legal on the outer bracket — part-selects
-// and indexed-part-selects on the unpacked dimension have no LRM
-// meaning (the packed and unpacked dimensions form distinct namespaces
-// per §4.9), so we reject them with a dedicated diagnostic instead of
-// quietly reinterpreting them.
-fn evaluate_array_element_select(
-    name: &str,
-    reg: &RegValue,
-    kind: &SelectKind,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let (dim, elements) = reg
-        .array()
-        .expect("evaluate_array_element_select called on a non-array reg");
-    let index = match kind {
-        SelectKind::Bit { index } => index,
-        SelectKind::PartConst { .. }
-        | SelectKind::PartIndexedUp { .. }
-        | SelectKind::PartIndexedDown { .. } => {
-            return Err(format!(
-                "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
-            ));
-        }
-    };
-    // The validator (`infer_select_meta` for RHS, `lvalue_meta` for LHS)
-    // rejects a real array-element index before evaluation.
-    if expression_is_real(index, session) {
-        unreachable!("validator rejects real array-element index before evaluation");
-    }
-    // Every element shares the packed-range shape, so the OOB / x-z
-    // fallback can read its width/signed/base off any one of them. The
-    // dim's width is always >= 1 (RegRange::width enforces that at
-    // decl time), so `elements[0]` always exists.
-    debug_assert!(!elements.is_empty());
-    let template = &elements[0];
-    let index_value = evaluate_subexpr_as_integer(index, session)?;
-    if index_value.has_unknown_bits() {
-        return Ok(IntegerValue::all_x(
-            template.width,
-            template.signed,
-            template.base,
-        ));
-    }
-    let src_index = index_value.as_bigint(index_value.signed);
-    let element = match resolve_reg_index(dim, &src_index) {
-        Some(internal) => elements[internal].clone(),
-        None => IntegerValue::all_x(template.width, template.signed, template.base),
-    };
-    Ok(element)
-}
-
-// LRM 4.9 + 5.2.1/5.2.2: `a[i][...]` — pick an unpacked element, then
-// run a bit-/part-select against the chosen element's packed range.
-// Element selection (outer `kind`) shares all rules with
-// `evaluate_array_element_select`: only `SelectKind::Bit` is legal on
-// the outer bracket; real indices, x/z indices, and OOB indices all
-// fall back to an all-x element of the packed shape. The inner select
-// (`inner_kind`) then runs against either the chosen element or the
-// all-x fallback, producing a self-determined unsigned value with the
-// element's display base — bit-identical to the same select on a plain
-// vector reg of the same packed range. Scalar array elements (regs
-// declared without a packed range, e.g. `reg a [0:7]`) have no bits to
-// address, so the inner select is rejected with the same diagnostic
-// shape the vector-reg path uses for scalars.
-fn evaluate_array_chained_select(
-    name: &str,
-    reg: &RegValue,
-    kind: &SelectKind,
-    inner_kind: &SelectKind,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let (dim, elements) = reg
-        .array()
-        .expect("evaluate_array_chained_select called on a non-array reg");
-    let index = match kind {
-        SelectKind::Bit { index } => index,
-        SelectKind::PartConst { .. }
-        | SelectKind::PartIndexedUp { .. }
-        | SelectKind::PartIndexedDown { .. } => {
-            return Err(format!(
-                "part-select on array `{name}` is illegal; use `{name}[i]` to select an element"
-            ));
-        }
-    };
-    // The validator (`infer_select_meta` for RHS, `lvalue_meta` for LHS)
-    // rejects a real array-element index before evaluation.
-    if expression_is_real(index, session) {
-        unreachable!("validator rejects real array-element index before evaluation");
-    }
-    // A bit-/part-select on the chosen element requires the element to
-    // have a packed range — scalar array elements have no bits to
-    // address (LRM 5.2.1 scalar-reg rule).
-    let range = reg.range.as_ref().ok_or_else(|| {
-        format!("bit-select or part-select on scalar array element `{name}` is illegal")
-    })?;
-    debug_assert!(!elements.is_empty());
-    let template = &elements[0];
-    let element = {
-        let index_value = evaluate_subexpr_as_integer(index, session)?;
-        if index_value.has_unknown_bits() {
-            IntegerValue::all_x(template.width, template.signed, template.base)
-        } else {
-            let src_index = index_value.as_bigint(index_value.signed);
-            match resolve_reg_index(dim, &src_index) {
-                Some(internal) => elements[internal].clone(),
-                None => IntegerValue::all_x(template.width, template.signed, template.base),
-            }
-        }
-    };
-    apply_select_kind(&element, range, inner_kind, element.base, session)
-}
-
-// LRM 4.2.1: a bit-select with an x/z anywhere in the index yields x;
-// an out-of-range index also yields x. The index is self-determined and
-// interpreted under its own signedness so negative-endpoint regs
-// (e.g. `reg [-1:2]`) and signed-indexed selects line up.
-fn evaluate_bit_select(
-    value: &IntegerValue,
-    range: &RegRange,
-    index: &Expr,
-    result_base: Base,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    // The validator (`select_meta_width` via
-    // `validate_select_expr_structure`) rejects a real bit-select index
-    // before evaluation.
-    if expression_is_real(index, session) {
-        unreachable!("validator rejects real bit-select index before evaluation");
-    }
-    let index_value = evaluate_subexpr_as_integer(index, session)?;
-    if index_value.has_unknown_bits() {
-        return Ok(IntegerValue::all_x(1, false, result_base));
-    }
-    let src_index = index_value.as_bigint(index_value.signed);
-    let bit = match resolve_reg_index(range, &src_index) {
-        Some(internal) => value.bits[internal],
-        None => LogicBit::X,
-    };
-    Ok(IntegerValue::computed(1, false, result_base, vec![bit]))
-}
-
-// LRM 5.2.1 `[msb:lsb]` part-select. The endpoints are runtime
-// expressions in vcal (the LRM requires constants, but the REPL has no
-// separate elaboration stage), and their direction must match the
-// declared reg.
-fn evaluate_part_const_select(
-    value: &IntegerValue,
-    range: &RegRange,
-    msb_expr: &Expr,
-    lsb_expr: &Expr,
-    result_base: Base,
-    session: &Session,
-) -> Result<IntegerValue, String> {
-    let msb_sel = evaluate_constant_range_endpoint(msb_expr, session, "msb")?;
-    let lsb_sel = evaluate_constant_range_endpoint(lsb_expr, session, "lsb")?;
-    check_part_select_direction(range, &msb_sel, &lsb_sel)?;
-    let width = compute_select_width(&msb_sel, &lsb_sel)?;
-    materialize_part_select(value, range, &msb_sel, &lsb_sel, width, result_base)
-}
-
-// LRM 5.2.2 indexed part-select. `width` is a positive constant; `base`
-// is a self-determined integer expression. The source range is always
-// numerically [base, base+w-1] for `+:` and [base-w+1, base] for `-:`,
-// independent of the declared reg direction; which end of that source
-// range is the result's MSB depends on the reg's declared direction.
-fn evaluate_part_indexed_select(
-    value: &IntegerValue,
-    range: &RegRange,
-    base_expr: &Expr,
-    width_expr: &Expr,
-    result_base: Base,
-    session: &Session,
-    is_up: bool,
-) -> Result<IntegerValue, String> {
-    let width = evaluate_indexed_select_width(width_expr, session)?;
-    // The validator (`select_meta_width` via
-    // `validate_select_expr_structure`) rejects a real indexed-base
-    // before evaluation.
-    if expression_is_real(base_expr, session) {
-        unreachable!("validator rejects real indexed part-select base before evaluation");
-    }
-    let base_value = evaluate_subexpr_as_integer(base_expr, session)?;
-    if base_value.has_unknown_bits() {
-        return Ok(IntegerValue::all_x(width, false, result_base));
-    }
-    let base_int = base_value.as_bigint(base_value.signed);
-    let span = BigInt::from(width - 1);
-    let (src_lo, src_hi) = if is_up {
-        let hi = &base_int + &span;
-        (base_int, hi)
-    } else {
-        let lo = &base_int - &span;
-        (lo, base_int)
-    };
-    // Forward decl (msb_decl >= lsb_decl): larger source index is more
-    // significant. Reversed decl: smaller source index is more
-    // significant.
-    let (msb_sel, lsb_sel) = if range.msb < range.lsb {
-        (src_lo, src_hi)
-    } else {
-        (src_hi, src_lo)
-    };
-    materialize_part_select(value, range, &msb_sel, &lsb_sel, width, result_base)
 }
 
 // Copies the bits of a part-select into the result, LSB-first. LRM
@@ -4584,7 +4433,7 @@ fn materialize_part_select(
 // Source-index → internal-bits-index mapping. The formula
 // `internal = |src - lsb_decl|` works uniformly for forward decls
 // (`[7:0]`), reversed decls (`[0:7]`), and negative-endpoint decls
-// (`[-1:2]`). Scalar regs are rejected upstream in `evaluate_select`
+// (`[-1:2]`). Scalar regs are rejected upstream in `annotate_select`
 // per LRM 5.2.1, so a `range` is always available here.
 fn resolve_reg_index(range: &RegRange, src: &BigInt) -> Option<usize> {
     let (lo, hi) = if range.msb >= range.lsb {
@@ -4625,6 +4474,10 @@ fn evaluate_indexed_select_width(expr: &Expr, session: &Session) -> Result<usize
         return Err("indexed part-select width cannot be real".to_string());
     }
     let value = evaluate_constant_expr(expr, session)?;
+    indexed_select_width_value(&value)
+}
+
+fn indexed_select_width_value(value: &IntegerValue) -> Result<usize, String> {
     if value.has_unknown_bits() {
         return Err("indexed part-select width contains unknown bits".to_string());
     }
@@ -4885,7 +4738,7 @@ fn leaf_lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, Stri
             let reg = session
                 .lookup(name)
                 .ok_or_else(|| format!("undeclared identifier: {name}"))?;
-            // Mirror `validate_select_expr_structure`'s ordering on the RHS
+            // Mirror `annotate_select`'s ordering on the RHS
             // path: validate the index / endpoint subtrees before reading any
             // type off them. The checks below only ask `expression_is_real`,
             // which reports a subtree's *result* type and deliberately skips
@@ -4897,7 +4750,7 @@ fn leaf_lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, Stri
                 validate_select_kind_structure(inner_kind, session)?;
             }
             if reg.is_real_array() {
-                // Validate the shape exactly like `infer_select_meta`'s
+                // Validate the shape exactly like `annotate_select`'s
                 // real-array branch: only `r[i]` is structurally legal.
                 // The legal `r[i] = expr` case is intercepted in
                 // `lib::apply_assign` and routed to the real pipeline
@@ -4931,7 +4784,7 @@ fn leaf_lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, Stri
             }
             if reg.is_array() {
                 // LRM 4.9: only `Bit` is legal as the outer select on an
-                // array name. `evaluate_array_element_select` enforces
+                // array name. `annotate_select` enforces
                 // the same rejection on the RHS path; surfacing it here
                 // keeps the LHS structural error class consistent.
                 let index = match kind {
@@ -4957,7 +4810,7 @@ fn leaf_lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, Stri
                 let template = &elements[0];
                 if let Some(inner_kind) = inner {
                     // `a[i][...]` — inner select runs against the
-                    // chosen element. Mirrors `evaluate_array_chained_select`'s
+                    // chosen element. Mirrors `annotate_select`'s
                     // scalar-element rejection so the structural error
                     // matches the RHS-path diagnostic.
                     let element_range = reg.range.as_ref().ok_or_else(|| {
@@ -4982,7 +4835,7 @@ fn leaf_lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, Stri
             } else {
                 if reg.is_real() {
                     // LRM 4.8.1: select on a scalar real is prohibited,
-                    // mirroring the `infer_select_meta` rejection on the
+                    // mirroring the `annotate_select` rejection on the
                     // RHS path.
                     return Err(format!(
                         "bit-select or part-select on real variable `{name}` is not allowed"
@@ -4990,13 +4843,13 @@ fn leaf_lvalue_meta(lvalue: &LValue, session: &Session) -> Result<ExprMeta, Stri
                 }
                 if inner.is_some() {
                     // Same diagnostic as the RHS chained-select-on-vector
-                    // rejection (`evaluate_select`).
+                    // rejection (`annotate_select`).
                     return Err(format!(
                         "chained select on `{name}` is illegal: `{name}` is not an array"
                     ));
                 }
                 let value = reg.require_vector(name)?;
-                // LRM 5.2.1 scalar-reg rejection. Mirrors `evaluate_select`.
+                // LRM 5.2.1 scalar-reg rejection. Mirrors `annotate_select`.
                 let range = reg.range.as_ref().ok_or_else(|| {
                     format!("bit-select or part-select on scalar reg `{name}` is illegal")
                 })?;
@@ -5160,7 +5013,7 @@ fn select_positions(
                 let lo = &base_int - &span;
                 (lo, base_int)
             };
-            // Same direction logic as `evaluate_part_indexed_select`:
+            // Same direction logic as `apply_resolved_select`:
             // for a forward decl, the larger source index is the MSB
             // side; for a reversed decl, the smaller is.
             let (msb_sel, lsb_sel) = if range.msb < range.lsb {

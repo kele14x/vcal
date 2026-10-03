@@ -1,5 +1,5 @@
 use crate::parser::{
-    BinaryOp, Expr, MAX_SELECT_NESTING, SystemArg, UnaryOp, parse_expression, parse_integer,
+    BinaryOp, Expr, SelectKind, SystemArg, UnaryOp, parse_expression, parse_integer,
 };
 use crate::{Session, evaluate_input};
 
@@ -446,49 +446,174 @@ fn deep_select_index_chain_evaluates() {
 }
 
 #[test]
-fn nested_select_depth_is_capped_rather_than_overflowing() {
-    // Contrast with the flat chain above: `a[a[…[0]…]]` re-enters
-    // `parse_expression` once per nesting level, because `[` is the only
-    // opening delimiter with no `Pending` frame in the iterative driver.
-    // A debug build used to abort at ~550 levels (136 on a 2 MiB
-    // test-thread stack), so this path is capped instead.
+fn deeply_nested_bit_selects_parse_evaluate_and_recover_after_errors() {
     let mut session = Session::new();
     session.eval("reg [0:0] a = 0").expect("decl");
     let nested = |n: usize| format!("{}0{}", "a[".repeat(n), "]".repeat(n));
-
-    assert_eq!(
+    for n in [64, 65, 20_000] {
+        assert_eq!(
+            session.eval(&nested(n)).expect("nested selects").output,
+            "1'd0"
+        );
+    }
+    let malformed = format!("{}0{}", "a[".repeat(20_000), "]".repeat(19_999));
+    assert!(
         session
-            .eval(&nested(MAX_SELECT_NESTING))
-            .expect("at the cap")
-            .output,
-        "1'd0"
-    );
-    let over_cap = session
-        .eval(&nested(MAX_SELECT_NESTING + 1))
-        .expect_err("over the cap");
-    assert_eq!(
-        over_cap,
-        format!("Syntax error: select nesting exceeds {MAX_SELECT_NESTING} levels").as_str()
-    );
-    // A depth that used to abort the process is now an ordinary error, and
-    // the session survives it.
-    assert_eq!(
-        session
-            .eval(&nested(DEEP_CHAIN_DEPTH))
-            .expect_err("far over the cap"),
-        over_cap
+            .eval(&malformed)
+            .expect_err("unclosed select")
+            .starts_with("Syntax error:")
     );
     assert_eq!(session.eval("a").expect("session alive").output, "1'd0");
 }
 
-// Direct-build deep-concat regression suite. The parser uses a recursive
-// `parse_expression` for each concat item, so an end-to-end `{{{…}}}` at
-// 10^5 levels overflows in the parser before reaching the evaluator. To
-// exercise the eval pipeline at full depth, these tests construct the
-// `Expr` tree in memory and feed it directly to `annotate` /
-// `semantic_check` / `evaluate_annotated` — the same convention the
-// `*_does_not_overflow` suite earlier in this file uses for Grouped and
-// Binary chains.
+#[test]
+fn deeply_nested_part_select_bounds_do_not_repeat_the_pipeline() {
+    // These one-bit expressions previously exceeded 3 seconds at depth
+    // 12. Deep input must finish using heap frames and cached bounds.
+    let n = 20_000;
+    let mut session = Session::new();
+    session.eval("reg [0:0] r = 1'b0").expect("decl");
+    for input in [
+        format!("{}0{}", "r[0:".repeat(n), "]".repeat(n)),
+        format!("{}0{}", "r[".repeat(n), ":0]".repeat(n)),
+    ] {
+        assert_eq!(session.eval(&input).expect("nested bounds").output, "1'b0");
+        session
+            .eval(&format!("r = {input}"))
+            .expect("assignment RHS");
+    }
+    let bounds = format!("{}0{}", "r[0:".repeat(n - 1), "]".repeat(n - 1));
+    session
+        .eval(&format!("r[0:{bounds}] = 1'b1"))
+        .expect("assignment LHS");
+    assert_eq!(session.eval("r").expect("assigned").output, "1'b1");
+}
+
+#[test]
+fn deeply_nested_indexed_select_widths_do_not_repeat_the_pipeline() {
+    let n = 20_000;
+    let mut session = Session::new();
+    session.eval("reg [0:0] r = 1'b1").expect("decl");
+    for prefix in ["r[0 +:", "r[0 -:"] {
+        let input = format!("{}1{}", prefix.repeat(n), "]".repeat(n));
+        assert_eq!(session.eval(&input).expect("nested widths").output, "1'b1");
+        session
+            .eval(&format!("r = {input}"))
+            .expect("assignment RHS");
+        let width = format!("{}1{}", prefix.repeat(n - 1), "]".repeat(n - 1));
+        session
+            .eval(&format!("r[0 +: {width}] = 1'b1"))
+            .expect("assignment LHS");
+    }
+}
+
+#[test]
+fn deeply_nested_array_element_part_select_bounds_evaluate() {
+    let n = 20_000;
+    let mut session = Session::new();
+    session
+        .eval("reg [0:0] a [0:0]; a[0] = 1'b0")
+        .expect("array");
+    let input = format!("{}0{}", "a[0][0:".repeat(n), "]".repeat(n));
+    assert_eq!(
+        session.eval(&input).expect("nested array bounds").output,
+        "1'b0"
+    );
+}
+
+#[test]
+fn direct_deep_select_trees_annotate_evaluate_and_drop_without_recursion() {
+    // Isolate the walkers and destructor on the default test-thread stack,
+    // independently of the end-to-end parser regressions above.
+    for mode in 0..3 {
+        let mut session = Session::new();
+        let bit = if mode == 1 { "1'b1" } else { "1'b0" };
+        session.eval(&format!("reg [0:0] r = {bit}")).expect("decl");
+        let mut expr = Expr::Literal(parse_integer(bit).expect("seed"));
+        for _ in 0..20_000 {
+            let zero = Expr::Literal(parse_integer("0").expect("zero"));
+            let kind = match mode {
+                0 => SelectKind::PartConst {
+                    msb: Box::new(zero),
+                    lsb: Box::new(expr),
+                },
+                1 => SelectKind::PartIndexedDown {
+                    base: Box::new(zero),
+                    width: Box::new(expr),
+                },
+                _ => SelectKind::Bit {
+                    index: Box::new(expr),
+                },
+            };
+            expr = Expr::Select {
+                name: "r".to_string(),
+                kind,
+                inner: None,
+            };
+        }
+        assert_eq!(
+            crate::eval::evaluate_expr(&expr, &session)
+                .expect("deep select")
+                .canonical(),
+            bit
+        );
+    }
+}
+
+#[test]
+fn direct_deep_real_array_indices_use_the_shared_evaluator_stack() {
+    let mut session = Session::new();
+    session.eval("real a [0:0]").expect("real array");
+    let mut expr = Expr::Literal(parse_integer("0").expect("seed"));
+    for _ in 0..20_000 {
+        expr = Expr::SystemCall {
+            name: "$rtoi".to_string(),
+            args: vec![SystemArg::Expr(Expr::Select {
+                name: "a".to_string(),
+                kind: SelectKind::Bit {
+                    index: Box::new(expr),
+                },
+                inner: None,
+            })],
+        };
+    }
+    assert_eq!(
+        crate::eval::evaluate_expr(&expr, &session)
+            .expect("deep real indices")
+            .canonical(),
+        "32'sd0"
+    );
+}
+
+#[test]
+fn deeply_nested_real_array_indices_parse_and_evaluate() {
+    let mut session = Session::new();
+    session.eval("real a [0:0]").expect("real array");
+    let n = 20_000;
+    let input = format!("{}0{}", "$rtoi(a[".repeat(n), "])".repeat(n));
+    assert_eq!(
+        session.eval(&input).expect("nested real indices").output,
+        "32'sd0"
+    );
+}
+
+#[test]
+fn deeply_nested_selects_in_declaration_ranges_and_parse_output_work() {
+    let mut session = Session::new();
+    session.eval("reg [0:0] r = 0").expect("decl");
+    let n = 20_000;
+    let bound = format!("{}0{}", "r[0:".repeat(n), "]".repeat(n));
+    session
+        .eval(&format!("reg [{bound}:0] dst = 1'b1"))
+        .expect("deep declaration bound");
+    assert_eq!(session.eval("dst").expect("new binding").output, "1'b1");
+    let ast = crate::parse_input(&bound).expect("parse-only rendering");
+    assert!(ast.contains("Select"));
+    assert!(ast.contains("Truncated"));
+}
+
+// Direct-build deep-concat regression suite. Constructing the trees
+// directly isolates the annotate / validate / evaluate / drop paths.
 //
 // Pre-fix: `evaluate_annotated`'s CES driver fell through to the
 // recursive `evaluate_expr_in_context` for `AnnotatedKind::Concatenation`,

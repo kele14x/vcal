@@ -883,24 +883,9 @@ fn prefix_unary_op(token: &Token) -> Option<UnaryOp> {
     })
 }
 
-// `[` is the only opening delimiter with no `Pending` frame in
-// `parse_expr_bp`'s iterative driver, so parsing a select index re-enters
-// `parse_expression` on a fresh stack frame and deeply nested
-// `a[a[…[0]…]]` consumes real C stack. Measured abort thresholds: 550
-// levels in a debug build on the 8 MiB main stack, 136 on a 2 MiB
-// test-thread stack, 6,604 in release. Nothing in the grammar bounds that
-// nesting, so bound it here: real expressions are a handful of levels deep
-// at most, so cap well above any meaningful input and well below the
-// smallest threshold.
-pub(crate) const MAX_SELECT_NESTING: usize = 64;
-
 struct Parser<'a> {
     tokens: &'a [Token],
     index: usize,
-    /// Count of select brackets currently being parsed. Capped at
-    /// `MAX_SELECT_NESTING`; see the comment there for why an explicit
-    /// limit is needed on this path alone.
-    select_depth: usize,
 }
 
 // Continuation frame for the iterative `parse_expr_bp` state machine.
@@ -956,6 +941,15 @@ enum Pending {
         unary_wrap: Vec<UnaryOp>,
         saved_min_bp: u8,
     },
+    /// An identifier's `[` consumed. Both operands and an optional
+    /// chained array-element select are collected on the heap.
+    Select {
+        name: String,
+        outer: Option<SelectKind>,
+        first: Option<(Expr, SelectSeparator)>,
+        unary_wrap: Vec<UnaryOp>,
+        saved_min_bp: u8,
+    },
     /// `$name(` consumed; collecting comma-separated args. Closes with
     /// `)`. No name dispatch happens here — every `$name(args)` builds
     /// `Expr::SystemCall { name, args }`. Name validation, arity, and
@@ -967,6 +961,13 @@ enum Pending {
         unary_wrap: Vec<UnaryOp>,
         saved_min_bp: u8,
     },
+}
+
+#[derive(Clone, Copy)]
+enum SelectSeparator {
+    Range,
+    IndexedUp,
+    IndexedDown,
 }
 
 // Wrap an `Expr` with a chain of prefix unary operators in source
@@ -998,7 +999,6 @@ pub(crate) fn parse_expression(input: &str) -> Result<Expr, String> {
     let mut parser = Parser {
         tokens: &tokens,
         index: 0,
-        select_depth: 0,
     };
     let expression = parser.parse_expression()?;
 
@@ -1031,7 +1031,6 @@ pub(crate) fn parse_statements(input: &str) -> Result<(Vec<Stmt>, bool), String>
         let mut parser = Parser {
             tokens: segment,
             index: 0,
-            select_depth: 0,
         };
         let stmt = parser.parse_statement()?;
         if parser.peek().is_some() {
@@ -1187,11 +1186,26 @@ impl<'a> Parser<'a> {
                     continue;
                 }
 
-                // Non-paren / non-brace / non-system primary.
+                if let Some(Token::Identifier(name)) = self.peek()
+                    && matches!(self.tokens.get(self.index + 1), Some(Token::LBracket))
+                {
+                    let name = name.clone();
+                    self.index += 2;
+                    stack.push(Pending::Select {
+                        name,
+                        outer: None,
+                        first: None,
+                        unary_wrap: prefix_ops,
+                        saved_min_bp: min_bp,
+                    });
+                    min_bp = 0;
+                    continue;
+                }
+
+                // Literal or bare identifier primary.
                 // parse_primary's LParen / LBrace / SystemIdentifier
                 // branches are unreachable from here because we just
-                // handled them; everything else (literals, identifiers,
-                // identifier-with-`[...]`) flows through.
+                // handled them; selects also have their own frame above.
                 let primary = self.parse_primary()?;
                 value = Some(apply_prefix_unary_ops(primary, prefix_ops));
                 continue;
@@ -1409,6 +1423,96 @@ impl<'a> Parser<'a> {
                     } else {
                         return Err("missing closing brace in concatenation".to_string());
                     }
+                }
+                Some(Pending::Select { .. }) => {
+                    let frame = stack.pop().expect("just inspected via last()");
+                    let Pending::Select {
+                        name,
+                        outer,
+                        first,
+                        unary_wrap,
+                        saved_min_bp,
+                    } = frame
+                    else {
+                        unreachable!("matched Select above");
+                    };
+                    let operand = value.take().expect("select operand has reduced");
+                    let kind = if let Some((first, separator)) = first {
+                        if !matches!(self.next(), Some(Token::RBracket)) {
+                            return Err(match separator {
+                                SelectSeparator::Range => "expected `]` after part-select range",
+                                _ => "expected `]` after indexed part-select width",
+                            }
+                            .to_string());
+                        }
+                        match separator {
+                            SelectSeparator::Range => SelectKind::PartConst {
+                                msb: Box::new(first),
+                                lsb: Box::new(operand),
+                            },
+                            SelectSeparator::IndexedUp => SelectKind::PartIndexedUp {
+                                base: Box::new(first),
+                                width: Box::new(operand),
+                            },
+                            SelectSeparator::IndexedDown => SelectKind::PartIndexedDown {
+                                base: Box::new(first),
+                                width: Box::new(operand),
+                            },
+                        }
+                    } else {
+                        let separator = match self.next() {
+                            Some(Token::RBracket) => None,
+                            Some(Token::Colon) => Some(SelectSeparator::Range),
+                            Some(Token::PlusColon) => Some(SelectSeparator::IndexedUp),
+                            Some(Token::MinusColon) => Some(SelectSeparator::IndexedDown),
+                            _ => {
+                                return Err(
+                                    "expected `]`, `:`, `+:`, or `-:` in select".to_string()
+                                );
+                            }
+                        };
+                        if let Some(separator) = separator {
+                            stack.push(Pending::Select {
+                                name,
+                                outer,
+                                first: Some((operand, separator)),
+                                unary_wrap,
+                                saved_min_bp,
+                            });
+                            min_bp = 0;
+                            continue;
+                        }
+                        SelectKind::Bit {
+                            index: Box::new(operand),
+                        }
+                    };
+                    if matches!(self.peek(), Some(Token::LBracket)) {
+                        if outer.is_some() {
+                            return Err(
+                                "chained selects beyond one inner bracket are not supported"
+                                    .to_string(),
+                            );
+                        }
+                        self.index += 1;
+                        stack.push(Pending::Select {
+                            name,
+                            outer: Some(kind),
+                            first: None,
+                            unary_wrap,
+                            saved_min_bp,
+                        });
+                        min_bp = 0;
+                        continue;
+                    }
+                    let (kind, inner) = match outer {
+                        Some(outer) => (outer, Some(Box::new(kind))),
+                        None => (kind, None),
+                    };
+                    value = Some(apply_prefix_unary_ops(
+                        Expr::Select { name, kind, inner },
+                        unary_wrap,
+                    ));
+                    min_bp = saved_min_bp;
                 }
                 Some(Pending::SystemCallArgs { name, .. }) => {
                     if matches!(self.peek(), Some(Token::Comma)) {
@@ -1686,16 +1790,7 @@ impl<'a> Parser<'a> {
             Some(Token::RealLiteral(text)) => parse_real(text).map(Expr::RealLiteral),
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
-                // Bit-select / part-select picked up here, not at
-                // statement level — so `r[0]` in expression position works
-                // while `4'b1111[0]` (literal primary) still parse-errors
-                // because we never reach this branch.
-                if matches!(self.peek(), Some(Token::LBracket)) {
-                    self.index += 1;
-                    self.parse_select_after_bracket(name)
-                } else {
-                    Ok(Expr::Identifier(name))
-                }
+                Ok(Expr::Identifier(name))
             }
             // `(`, `{`, and `$name` are all consumed by `parse_expr_bp`'s
             // iterative driver before it calls `parse_primary` — the
@@ -1717,106 +1812,6 @@ impl<'a> Parser<'a> {
             Some(_) => Err("expected expression operand".to_string()),
             None => Err("unexpected end of expression".to_string()),
         }
-    }
-
-    // Caller has consumed the `[` after an identifier; dispatch on the
-    // separator after the first sub-expression to pick the select form.
-    // Whitespace-around-`+`/`-` in the indexed-select forms doesn't pass
-    // through here because the lexer rejects it: `+:`/`-:` are
-    // adjacency-only tokens.
-    //
-    // After the first bracket pair is consumed we peek for a second `[`.
-    // If present, we parse another `SelectKind` (LRM 4.9 chained
-    // array-element select like `a[i][m:l]`). A third bracket is rejected
-    // up-front since vcal only supports 1-D unpacked arrays — chaining
-    // further would have no LRM meaning under the current grammar.
-    //
-    // Depth-capped: `parse_select_kind` below re-enters `parse_expression`,
-    // and `[` has no `Pending` frame in the iterative driver, so each
-    // nesting level of `a[a[…[0]…]]` costs a real stack frame. See
-    // `MAX_SELECT_NESTING`.
-    fn parse_select_after_bracket(&mut self, name: String) -> Result<Expr, String> {
-        if self.select_depth >= MAX_SELECT_NESTING {
-            return Err(format!(
-                "select nesting exceeds {MAX_SELECT_NESTING} levels"
-            ));
-        }
-        self.select_depth += 1;
-        let parsed = self.parse_select_brackets(name);
-        self.select_depth -= 1;
-        parsed
-    }
-
-    fn parse_select_brackets(&mut self, name: String) -> Result<Expr, String> {
-        let kind = self.parse_select_kind()?;
-        let inner = if matches!(self.peek(), Some(Token::LBracket)) {
-            self.index += 1;
-            let inner_kind = self.parse_select_kind()?;
-            if matches!(self.peek(), Some(Token::LBracket)) {
-                return Err(
-                    "chained selects beyond one inner bracket are not supported".to_string()
-                );
-            }
-            Some(Box::new(inner_kind))
-        } else {
-            None
-        };
-        Ok(Expr::Select { name, kind, inner })
-    }
-
-    // Parse one `SelectKind` from inside a `[...]` group. The opening `[`
-    // has already been consumed by the caller; this method consumes the
-    // closing `]` for the matched form. Shared by the outer-bracket parse
-    // path and the chained inner-bracket path so both grammars stay in
-    // lockstep — adding a new select form here lights up both surfaces.
-    fn parse_select_kind(&mut self) -> Result<SelectKind, String> {
-        let first = self.parse_expression()?;
-        let kind = match self.peek() {
-            Some(Token::RBracket) => {
-                self.index += 1;
-                SelectKind::Bit {
-                    index: Box::new(first),
-                }
-            }
-            Some(Token::Colon) => {
-                self.index += 1;
-                let lsb = self.parse_expression()?;
-                match self.next() {
-                    Some(Token::RBracket) => {}
-                    _ => return Err("expected `]` after part-select range".to_string()),
-                }
-                SelectKind::PartConst {
-                    msb: Box::new(first),
-                    lsb: Box::new(lsb),
-                }
-            }
-            Some(Token::PlusColon) => {
-                self.index += 1;
-                let width = self.parse_expression()?;
-                match self.next() {
-                    Some(Token::RBracket) => {}
-                    _ => return Err("expected `]` after indexed part-select width".to_string()),
-                }
-                SelectKind::PartIndexedUp {
-                    base: Box::new(first),
-                    width: Box::new(width),
-                }
-            }
-            Some(Token::MinusColon) => {
-                self.index += 1;
-                let width = self.parse_expression()?;
-                match self.next() {
-                    Some(Token::RBracket) => {}
-                    _ => return Err("expected `]` after indexed part-select width".to_string()),
-                }
-                SelectKind::PartIndexedDown {
-                    base: Box::new(first),
-                    width: Box::new(width),
-                }
-            }
-            _ => return Err("expected `]`, `:`, `+:`, or `-:` in select".to_string()),
-        };
-        Ok(kind)
     }
 
     fn peek(&self) -> Option<&Token> {

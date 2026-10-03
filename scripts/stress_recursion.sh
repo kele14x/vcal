@@ -153,10 +153,7 @@ run_case "concat-of-deep-add        {1+1+..+1}"         "n=$DEPTH; print('{1' + 
 run_case "rep-count-deep-add        {(1+1+..){1'b1}}"   "n=$DEPTH; print('{(1' + '+1'*n + '){1\\'b1}}')" --parse-only
 run_case "select-index-deep         a[1+1+..+1]"        "n=$DEPTH; print('a[1' + '+1'*n + ']')" --parse-only
 run_case "select-range-deep         a[1+1+..:0]"        "n=$DEPTH; print('a[1' + '+1'*n + ':0]')" --parse-only
-# Nested selects are the one deep shape the iterative driver can't reach: `[`
-# has no `Pending` frame, so each index re-enters `parse_expression` on a fresh
-# stack frame. `MAX_SELECT_NESTING` caps it and this case must exit with a
-# clean "select nesting exceeds" diagnostic rather than overflow.
+# Selects use Pending frames too, including at the full parser depth.
 run_case "select-nested             a[a[..0..]]"        "n=$DEPTH; print('a['*n + '0' + ']'*n)" --parse-only
 run_case "mixed-paren-concat        ({{(((..))}})"      "n=$DEPTH; m=n//4; print('({' + '({'*m + '1' + '})'*m + '})')" --parse-only
 run_case "mixed-signed-concat       \$signed({\$signed({..})})"  "n=$DEPTH; m=n//2; print('\$signed({'*m + '1' + '})'*m)" --parse-only
@@ -223,14 +220,17 @@ run_case "eval signed-of-concat     \$signed({1+1+..+1})"      "n=$EVAL_DEPTH; p
 run_case "eval mixed-binary-ops     1+1*1-1&1|1^1.."   "n=$EVAL_DEPTH; ops=['+','*','-','&','|','^']; print('1' + ''.join(ops[i%len(ops)]+'1' for i in range(n)))"
 
 # ============================================================
-# Nested selects: the only shape whose depth the iterative parser
-# driver can't absorb, so it is bounded by `MAX_SELECT_NESTING`.
-# The at-cap case runs the full annotate / validate / evaluate
-# pipeline on a genuinely nested select; the far-over case must
-# reject cleanly instead of overflowing the parser stack.
+# Nested selects use heap frames in parsing and evaluation. Exercise
+# indices, bounds and widths at the full evaluation depth; these one-bit
+# expressions used to recurse or take exponential time.
 # ============================================================
-run_case "eval select-nested-at-cap  a[a[..0..]] n=64"  "print('reg [0:0] a = 0;'); print('a['*64 + '0' + ']'*64 + ';')"
-run_case "eval select-nested-over    a[a[..0..]]"       "n=$EVAL_DEPTH; print('reg [0:0] a = 0;'); print('a['*n + '0' + ']'*n + ';')"
+run_case "eval select-nested-index   a[a[..0..]]"   "n=$EVAL_DEPTH; print('reg [0:0] a = 0;'); print('a['*n + '0' + ']'*n + ';')"
+run_case "eval select-nested-lsb     a[0:a[..]]"    "n=$EVAL_DEPTH; print('reg [0:0] a = 0;'); print('a[0:'*n + '0' + ']'*n + ';')"
+run_case "eval select-nested-msb     a[a[..]:0]"    "n=$EVAL_DEPTH; print('reg [0:0] a = 0;'); print('a['*n + '0' + ':0]'*n + ';')"
+run_case "eval select-nested-width-up"             "n=$EVAL_DEPTH; print('reg [0:0] a = 1;'); print('a[0 +:'*n + '1' + ']'*n + ';')"
+run_case "eval select-nested-width-down"           "n=$EVAL_DEPTH; print('reg [0:0] a = 1;'); print('a[0 -:'*n + '1' + ']'*n + ';')"
+run_case "eval select-nested-array-inner"          "n=$EVAL_DEPTH; print('reg [0:0] a [0:0]; a[0]=0;'); print('a[0][0:'*n + '0' + ']'*n + ';')"
+run_case "eval select-nested-real-index"           "n=$EVAL_DEPTH; print('real a [0:0];'); print('\$rtoi(a['*n + '0' + '])'*n + ';')"
 
 # ============================================================
 # LValue concat: `{{{..a}}} = 1` exercises `expression_to_lvalue`
