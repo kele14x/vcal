@@ -3,11 +3,25 @@
 ## Prompt
 
 - Prompt format is `In [n]:` / `Out[n]:` (plus a trailing space), where `n` is the index of the n-th user input, starting from 0.
-- `In [n]:` accepts a single line of Verilog. Multi-line input is a backlog item; see [scope.md](scope.md).
+- In interactive mode, `In [n]:` accepts an editable buffer containing one or more lines of Verilog. Each submitted buffer is one input. Piped input remains line-oriented: each physical line is one input.
 - Each input gets exactly one output slot, followed by a blank line so consecutive turns are visually separated. Following the IPython convention, the REPL prints:
   - `Out[n]: <values>` when the last statement is a non-empty `display_expression` (see [non-standard.md](non-standard.md) → "Top-level input") and the input does not end with `;`. Every top-level expression is a `display_expression`: `a` has one argument, while `a, b` has two. Without a leading format string, every value renders in canonical Verilog form `<width>'<base><digits>` (see [expressions.md](expressions.md) → "Base rules") and values are space-separated. In a multi-argument list, a string-style first argument activates the `$display` format-control engine, so `"a=%d", a` prints `a=10`; arguments left unconsumed by format controls retain canonical rendering, so `"label", 8'hff` prints `label 8'hff`. String style is preserved by string literals and string-only concatenation / replication, but is not inferred from the bits stored in a packed `reg`. The output is followed by a blank separator line before the next `In [n+1]:` prompt.
   - a bare blank line (acting as both the output and the separator) for everything else: declarations, assignments, system tasks (`$finish`, `$stop`), or any `display_expression` whose input ends with `;`. Trailing `;` is the IPython-style suppression marker; see [non-standard.md](non-standard.md).
   - any `$display` / `$write` output from statements that completed earlier in the same input, then an error message, then a blank separator line, on evaluation failure. Those side effects already happened, so they are preserved in chronological order ahead of the diagnostic. The failing statement and every statement after it do not run, and no `Out[n]` value is echoed for the failed input. The `In [n]` counter still advances.
+
+## Interactive editing
+
+The normal and `--parse-only` interactive modes share the same editor:
+
+- **Enter** submits the entire buffer, even when the cursor is on an earlier line. Incomplete syntax produces the usual syntax error; the editor does not infer continuation.
+- **Ctrl-J** inserts a newline at the cursor without evaluating or advancing the input counter. It provides a shortcut without an Alt / Option terminal setting.
+- **Option-Enter on macOS / Alt-Enter elsewhere** inserts a newline at the cursor. The terminal must deliver the Alt modifier rather than intercepting the shortcut; on macOS this is commonly called Option as Meta.
+- **Shift-Enter on Windows** inserts a newline. Linux/macOS have no built-in Shift-Enter shortcut; use Ctrl-J or Option/Alt-Enter to insert a newline there.
+- **Ctrl-M** retains its existing submit behavior. Backslash followed by Enter has no special continuation behavior.
+- **Left / Right** move through the buffer, including across line breaks. **Up / Down** move between lines; at the first / last line they navigate history. A submitted multi-line buffer is recalled as one history entry.
+- **Bracketed paste** inserts the pasted text, including its line breaks, for editing before Enter submits it. This requires a terminal that supports bracketed paste; plain unmarked keystream paste cannot be distinguished from typing Enter.
+
+Line breaks are whitespace, not statement separators: separate declarations and assignments with `;` as usual. A final `;` suppresses the echo for the entire submitted buffer. String literals retain their existing rule that a literal cannot contain a raw line break.
 
 ## Output encoding
 

@@ -9,6 +9,7 @@ use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
 
 mod color;
+mod editor;
 mod eval;
 mod highlight;
 mod lexer;
@@ -950,14 +951,10 @@ pub fn run_repl<R: BufRead, W: Write>(reader: &mut R, writer: &mut W) -> io::Res
 }
 
 pub fn run_interactive() -> io::Result<()> {
-    use rustyline::Editor;
     use rustyline::error::ReadlineError;
-    use rustyline::history::DefaultHistory;
 
     let use_color = color::should_color();
-    let mut editor: Editor<color::PromptHelper, DefaultHistory> =
-        Editor::new().map_err(io::Error::other)?;
-    editor.set_helper(Some(color::PromptHelper { enabled: use_color }));
+    let mut editor = editor::interactive_editor(use_color)?;
     let mut session = Session::new();
     let mut index = 0usize;
 
@@ -1054,14 +1051,10 @@ pub fn run_parse_repl<R: BufRead, W: Write>(
 
 // Parse-only TTY REPL — rustyline-backed counterpart to run_parse_repl.
 pub fn run_parse_interactive(max_depth: usize) -> io::Result<()> {
-    use rustyline::Editor;
     use rustyline::error::ReadlineError;
-    use rustyline::history::DefaultHistory;
 
     let use_color = color::should_color();
-    let mut editor: Editor<color::PromptHelper, DefaultHistory> =
-        Editor::new().map_err(io::Error::other)?;
-    editor.set_helper(Some(color::PromptHelper { enabled: use_color }));
+    let mut editor = editor::interactive_editor(use_color)?;
     let mut index = 0usize;
 
     loop {

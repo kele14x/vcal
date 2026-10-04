@@ -11,6 +11,7 @@
 - `src/system_call.rs` — `SystemCallKind` / `SystemFunction` classification (`classify_system_call`), task execution (`execute_task` for `$finish` / `$stop` / `$display` / `$write`), the shared `$display` / `$write` format-control walker, and `format_repl_echo_args` for canonical unformatted lists plus leading-string format mode.
 - `src/highlight.rs` — lenient span-aware tokenizer (`highlight_spans`, `TokenClass`) feeding the rustyline line highlighter; mirrors the lexer's boundary rules but never errors so partial input doesn't flash red mid-keystroke.
 - `src/color.rs` — ANSI color helpers and the rustyline `PromptHelper` (prompt coloring, token coloring, `NO_COLOR` / terminal gating).
+- `src/editor.rs` — shared interactive editor setup (Enter submits; Ctrl-J and Option/Alt-Enter insert a newline, with Shift-Enter also bound on Windows; bracketed paste and rustyline arrow / history navigation). Supported shortcuts and terminal requirements are documented in [repl.md](repl.md).
 - `src/tests/` — unit tests, declared via `#[cfg(test)] mod tests;` in `lib.rs`. `mod.rs` lists the submodules; each `tests/<area>.rs` (literals, strings, parser_ast, arithmetic, system_tasks, display, repl, repl_echo, relational, logical, bitwise, shift, conditional, concat, casts, real, real_functions, variables, selects, lvalue, arrays, integer_real_decls, deep_nesting, limits) is self-contained with its own `use` imports, grouped by operator / feature area.
 
 ## REPL entry points
@@ -23,6 +24,10 @@ There are four REPL entry points, all kept in working order — a normal pair an
 - `vcal::run_parse_repl(BufRead, Write, depth)` — piped / test `--parse-only` REPL.
 
 `src/main.rs` dispatches between them via `IsTerminal` (TTY vs piped) and the `--parse-only` flag.
+
+Both interactive entry points use `editor::interactive_editor` and submit the entire edited buffer in one call to the existing evaluator or parser. Each buffer advances the prompt index once and occupies one history entry. Piped entry points continue to read one physical line per input. Multi-line editing adds no parser grammar or completeness inference; newlines retain their lexical meaning as whitespace.
+
+After `cargo build`, run `python3 scripts/test_multiline.py` for the interactive regression checks. This Unix-only harness uses Python's standard-library PTY support to drive actual terminal input in both interactive modes; it also exercises history, paste, and colored redraws on a narrow terminal. `--binary path/to/vcal` selects a different build.
 
 ## Expression parsing
 
