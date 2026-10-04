@@ -345,7 +345,7 @@ enum UnformattedStyle {
 
 // Renders an already-validated format string. `prepare_display_args` runs
 // `check_format_controls` over the same bytes before getting here — the same
-// "callers validate first" contract `eval::replication_count_value` documents —
+// "callers validate first" contract `eval::machine::replication_count_value` documents —
 // so the three `Err` arms below are a defensive backstop rather than a
 // user-visible path, and rejections reach the user as `Semantic error:` from
 // the validation pass. They stay `Err` rather than `unreachable!` so the
