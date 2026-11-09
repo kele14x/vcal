@@ -79,10 +79,10 @@ impl Highlighter for PromptHelper {
         }
     }
 
-    // Token-based line highlight. Re-runs on every keystroke (gated by
-    // `highlight_char` returning true). Uses the lenient `highlight_spans`
-    // tokenizer so partial input doesn't flash red while the user is
-    // typing — only truly unrecognized chars get the Error colour.
+    // Token-based line highlight. Rustyline calls this on every full repaint;
+    // `highlight_char` decides which edits force one. Uses the lenient
+    // `highlight_spans` tokenizer so partial input doesn't flash red while
+    // the user is typing — only truly unrecognized chars get the Error colour.
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
         if !self.enabled {
             return Cow::Borrowed(line);
@@ -118,8 +118,13 @@ impl Highlighter for PromptHelper {
         Cow::Owned(out)
     }
 
-    fn highlight_char(&self, _line: &str, _pos: usize, _kind: CmdKind) -> bool {
-        self.enabled
+    // Edits must force a full repaint: inserting a char can recolour text
+    // before it (`4` -> `4'`), and rustyline's no-repaint fast path would
+    // print the new char uncoloured. Cursor moves need none, since colours
+    // never depend on the cursor position; rustyline still does one repaint
+    // on the first move after a `true` and plain cursor moves after that.
+    fn highlight_char(&self, _line: &str, _pos: usize, kind: CmdKind) -> bool {
+        self.enabled && kind != CmdKind::MoveCursor
     }
 }
 
