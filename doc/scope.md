@@ -9,6 +9,7 @@ Priority key: **P0** critical or blocking; **P1** important; **P2** non-blocking
 ## What works
 
 - REPL shell with history and explicit multi-line editing in both interactive modes: Enter submits; Ctrl-J and Option/Alt-Enter insert newlines, with Shift-Enter also bound on Windows; arrows and bracketed paste support editing (see [repl.md](repl.md) for terminal requirements)
+- Token syntax highlighting (a based literal's `'[s]<base>` marker is coloured apart from its size and value digits)
 - Output byte policy: `$display` / `$write` and formatted `display_expression` output is a raw byte stream everywhere (pipes, files, Unix terminals stay byte-exact); a Windows console degrades non-UTF-8 bytes to lossy UTF-8 instead of erroring (see [repl.md](repl.md))
 - Unified non-empty `display_expression` echo lists (see [non-standard.md](non-standard.md)): every top-level expression input is a display-expression argument list, so `a` retains canonical calculator output, `a, b` echoes both values canonically, null comma slots emit one space each like `$display`, and a leading string-style expression such as `"a=%d", a` uses the `$display` format-control engine while rendering arguments left unconsumed by format controls canonically; trailing `;` suppresses the whole echo
 - Integer and real literals, all LRM forms (LRM 3.5.2)

@@ -11,6 +11,10 @@ use std::str::CharIndices;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TokenClass {
     Number,
+    // The `'[s]<base>` marker of a based literal (`'h`, `'sb`, ...). Split
+    // from the surrounding size / value `Number` spans so the base reads as
+    // distinct from the digits it qualifies.
+    BaseMarker,
     Identifier,
     SystemIdent,
     String,
@@ -88,10 +92,7 @@ pub(crate) fn highlight_spans(input: &str) -> Vec<Span> {
                     class: TokenClass::Operator,
                 });
             }
-            '\'' => {
-                let (end, class) = read_bare_based_literal(&mut chars);
-                out.push(Span { start, end, class });
-            }
+            '\'' => read_bare_based_literal(&mut chars, &mut out),
             '"' => {
                 let (end, class) = read_string_literal(&mut chars, input.len());
                 out.push(Span { start, end, class });
@@ -108,14 +109,7 @@ pub(crate) fn highlight_spans(input: &str) -> Vec<Span> {
                     class: TokenClass::Identifier,
                 });
             }
-            c if c.is_ascii_digit() => {
-                let end = read_number(&mut chars);
-                out.push(Span {
-                    start,
-                    end,
-                    class: TokenClass::Number,
-                });
-            }
+            c if c.is_ascii_digit() => read_number(&mut chars, &mut out),
             _ => {
                 chars.next();
                 out.push(Span {
@@ -239,24 +233,30 @@ fn read_system_identifier(chars: &mut Peekable<CharIndices<'_>>) -> (usize, Toke
 // Bare based-literal form: `'b1010`, `'sh1F`, etc. A solitary `'` with no
 // recognisable base char following is flagged Error so the user sees the
 // mistake instead of a silent skip.
-fn read_bare_based_literal(chars: &mut Peekable<CharIndices<'_>>) -> (usize, TokenClass) {
+fn read_bare_based_literal(chars: &mut Peekable<CharIndices<'_>>, out: &mut Vec<Span>) {
     let (start, _) = chars.next().expect("apostrophe available");
-    let mut end = start + 1;
     if !matches!(chars.peek(), Some(&(_, c)) if c.is_ascii_alphabetic()) {
-        return (end, TokenClass::Error);
+        out.push(Span {
+            start,
+            end: start + 1,
+            class: TokenClass::Error,
+        });
+        return;
     }
-    end = consume_base_marker_and_digits(chars, end);
-    (end, TokenClass::Number)
+    push_base_marker_and_digits(chars, start, out);
 }
 
 // Picks up the post-apostrophe tail: optional `s`/`S`, the base char, then
 // the digit run (decimal/hex/octal/binary digits plus the `x`, `z`, `?`
-// metalogic placeholders).
-fn consume_base_marker_and_digits(
+// metalogic placeholders). The caller has already consumed the apostrophe at
+// `apostrophe`. Emits a `BaseMarker` span for `'[s]<base>` and, when any
+// digits follow, a separate `Number` span for the value.
+fn push_base_marker_and_digits(
     chars: &mut Peekable<CharIndices<'_>>,
-    start_end: usize,
-) -> usize {
-    let mut end = start_end;
+    apostrophe: usize,
+    out: &mut Vec<Span>,
+) {
+    let mut end = apostrophe + 1;
     if matches!(chars.peek(), Some(&(_, 's' | 'S'))) {
         let (p, c) = chars.next().expect("`s`/`S` present");
         end = p + c.len_utf8();
@@ -265,6 +265,13 @@ fn consume_base_marker_and_digits(
         let (p, c) = chars.next().expect("base char present");
         end = p + c.len_utf8();
     }
+    out.push(Span {
+        start: apostrophe,
+        end,
+        class: TokenClass::BaseMarker,
+    });
+
+    let mut value: Option<(usize, usize)> = None;
     while let Some(&(pos, c)) = chars.peek() {
         if c.is_ascii_hexdigit()
             || c == '_'
@@ -275,19 +282,28 @@ fn consume_base_marker_and_digits(
             || c == '?'
         {
             chars.next();
-            end = pos + c.len_utf8();
+            let value_start = value.map_or(pos, |(s, _)| s);
+            value = Some((value_start, pos + c.len_utf8()));
         } else {
             break;
         }
     }
-    end
+    if let Some((start, end)) = value {
+        out.push(Span {
+            start,
+            end,
+            class: TokenClass::Number,
+        });
+    }
 }
 
 // Decimal-leading numeric: digit run, optional `.digit_run`, optional
 // `e[+-]?digit_run`, optional based-literal continuation after intervening
 // whitespace (LRM 3.5.1 allows `8 'd6`). Lenient: a dangling `.` or `e` with
 // no following digits still parses, since the user is probably mid-typing.
-fn read_number(chars: &mut Peekable<CharIndices<'_>>) -> usize {
+// A based literal is emitted as up to three spans — size `Number`, base
+// `BaseMarker`, value `Number` — with any whitespace left between them.
+fn read_number(chars: &mut Peekable<CharIndices<'_>>, out: &mut Vec<Span>) {
     let (start, first) = chars.next().expect("digit available");
     let mut end = start + first.len_utf8();
     end = consume_digit_run(chars, end);
@@ -314,6 +330,12 @@ fn read_number(chars: &mut Peekable<CharIndices<'_>>) -> usize {
         end = consume_digit_run(chars, end);
     }
 
+    out.push(Span {
+        start,
+        end,
+        class: TokenClass::Number,
+    });
+
     // Based-literal continuation: a (possibly ws-separated) `'<base><digits>`
     // run binds to the preceding size. Only commit the whitespace skip on
     // success so trailing spaces after a bare integer don't disappear.
@@ -324,11 +346,8 @@ fn read_number(chars: &mut Peekable<CharIndices<'_>>) -> usize {
     if matches!(probe.peek(), Some(&(_, '\''))) {
         *chars = probe;
         let (ap_pos, _) = chars.next().expect("apostrophe present");
-        end = ap_pos + 1;
-        end = consume_base_marker_and_digits(chars, end);
+        push_base_marker_and_digits(chars, ap_pos, out);
     }
-
-    end
 }
 
 fn consume_digit_run(chars: &mut Peekable<CharIndices<'_>>, start_end: usize) -> usize {
@@ -368,10 +387,56 @@ mod tests {
                 ("]", TokenClass::Punct),
                 ("a", TokenClass::Identifier),
                 ("=", TokenClass::Operator),
-                ("4'b1010", TokenClass::Number),
+                ("4", TokenClass::Number),
+                ("'b", TokenClass::BaseMarker),
+                ("1010", TokenClass::Number),
                 (";", TokenClass::Punct),
             ]
         );
+    }
+
+    #[test]
+    fn based_literal_splits_size_base_and_value() {
+        assert_eq!(
+            classes("4'h4"),
+            vec![
+                ("4", TokenClass::Number),
+                ("'h", TokenClass::BaseMarker),
+                ("4", TokenClass::Number),
+            ]
+        );
+        assert_eq!(
+            classes("'sh1F"),
+            vec![("'sh", TokenClass::BaseMarker), ("1F", TokenClass::Number)]
+        );
+        assert_eq!(
+            classes("8 'Sd1_0"),
+            vec![
+                ("8", TokenClass::Number),
+                ("'Sd", TokenClass::BaseMarker),
+                ("1_0", TokenClass::Number),
+            ]
+        );
+        assert_eq!(
+            classes("'bx?z"),
+            vec![("'b", TokenClass::BaseMarker), ("x?z", TokenClass::Number)]
+        );
+    }
+
+    #[test]
+    fn partial_based_literal_keeps_marker_class() {
+        // Mid-typing states: the size and marker keep their classes and no
+        // empty value span is emitted. Only a bare `'` with no size and no
+        // base char is an Error.
+        assert_eq!(
+            classes("4'"),
+            vec![("4", TokenClass::Number), ("'", TokenClass::BaseMarker)]
+        );
+        assert_eq!(
+            classes("4'h"),
+            vec![("4", TokenClass::Number), ("'h", TokenClass::BaseMarker)]
+        );
+        assert_eq!(classes("'"), vec![("'", TokenClass::Error)]);
     }
 
     #[test]

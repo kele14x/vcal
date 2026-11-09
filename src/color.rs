@@ -41,6 +41,12 @@ pub(crate) fn dim(s: &str) -> String {
     format!("\x1b[2m{s}\x1b[0m")
 }
 
+// Faint yellow: same hue as numeric digits so a based literal's `'h` marker
+// still reads as part of the number, but visibly set apart from the value.
+pub(crate) fn dim_yellow(s: &str) -> String {
+    format!("\x1b[2;33m{s}\x1b[0m")
+}
+
 // Minimal rustyline `Helper` whose only job is to wrap the main prompt
 // in green via `highlight_prompt`. Going through the Highlighter
 // pipeline (instead of embedding ANSI in the string passed to
@@ -95,6 +101,7 @@ impl Highlighter for PromptHelper {
             let s = &line[span.start..span.end];
             match span.class {
                 TokenClass::Number => out.push_str(&yellow(s)),
+                TokenClass::BaseMarker => out.push_str(&dim_yellow(s)),
                 TokenClass::SystemIdent => out.push_str(&magenta(s)),
                 TokenClass::String => out.push_str(&cyan(s)),
                 TokenClass::Comment => out.push_str(&dim(s)),
