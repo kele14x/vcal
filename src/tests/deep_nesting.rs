@@ -1001,3 +1001,206 @@ fn assign_with_wide_lvalue_concat_does_not_overflow() {
         .eval(&input)
         .expect("wide lvalue concat assignment evaluates without overflow");
 }
+
+#[test]
+fn deeply_nested_concat_result_select_sources_parse_evaluate_and_render() {
+    let n = 20_000;
+    let input = "{".repeat(n) + "1'b1" + &"}[0]".repeat(n);
+    let expr = parse_expression(&input).expect("deep concat-select sources parse");
+    assert!(matches!(&expr, Expr::ConcatSelect { .. }));
+    assert_eq!(
+        evaluate_input(&input)
+            .expect("deep concat-select sources")
+            .output,
+        "1'b1"
+    );
+    let rendered = crate::parse_input(&input).expect("deep source rendering");
+    assert!(rendered.contains("ConcatSelect"));
+    assert!(rendered.contains("Truncated"));
+}
+
+#[test]
+fn deeply_nested_concat_result_select_indices_stay_self_determined() {
+    for n in [64, 65, 20_000] {
+        for (source, expected) in [("1'b0", "1'b0"), ("2'b11", "1'b1")] {
+            let input = format!("{}0{}", format!("{{{source}}}[").repeat(n), "]".repeat(n));
+            assert_eq!(
+                evaluate_input(&input)
+                    .expect("deep concat-select indices")
+                    .output,
+                expected
+            );
+        }
+    }
+    let input = "{1'b0}[".repeat(20_000) + "0" + &"]".repeat(20_000);
+    let rendered = crate::parse_input(&input).expect("deep index rendering");
+    assert!(rendered.contains("ConcatSelect"));
+    assert!(rendered.contains("Truncated"));
+}
+
+#[test]
+fn deeply_nested_concat_result_part_select_bounds_are_cached_iteratively() {
+    let n = 20_000;
+    let mut session = Session::new();
+    session.eval("reg [0:0] r = 1'b0").expect("decl");
+    for (prefix, suffix) in [("{1'b0}[0:", "]"), ("{1'b0}[", ":0]")] {
+        let input = prefix.repeat(n) + "0" + &suffix.repeat(n);
+        assert_eq!(
+            session.eval(&input).expect("deep concat bounds").output,
+            "1'b0"
+        );
+        session
+            .eval(&format!("r = {input}"))
+            .expect("deep assignment rhs");
+        session
+            .eval(&format!("r[0:{input}] = 1'b1"))
+            .expect("deep assignment lhs bound");
+        assert_eq!(session.eval("r").expect("assigned").output, "1'b1");
+        session
+            .eval(&format!("reg [{input}:0] dst = 1'b1"))
+            .expect("deep declaration bound");
+        assert_eq!(session.eval("dst").expect("declared").output, "1'b1");
+    }
+}
+
+#[test]
+fn deeply_nested_concat_result_indexed_select_widths_are_cached_iteratively() {
+    let n = 20_000;
+    let mut session = Session::new();
+    session.eval("reg [0:0] r = 1'b0").expect("decl");
+    for prefix in ["{1'b1}[0 +:", "{1'b1}[0 -:"] {
+        let input = prefix.repeat(n) + "1" + &"]".repeat(n);
+        assert_eq!(
+            session.eval(&input).expect("deep concat widths").output,
+            "1'b1"
+        );
+        session
+            .eval(&format!("r = {input}"))
+            .expect("deep assignment rhs");
+        session
+            .eval(&format!("r[0 +: {input}] = 1'b1"))
+            .expect("deep assignment lhs width");
+        assert_eq!(session.eval("r").expect("assigned").output, "1'b1");
+        assert_eq!(
+            session
+                .eval(&format!("{{{input}{{1'b1}}}}[0]"))
+                .expect("deep replication count")
+                .output,
+            "1'b1"
+        );
+    }
+}
+
+#[test]
+fn deeply_nested_concat_result_select_errors_recover_without_side_effects() {
+    let n = 20_000;
+    let mut session = Session::new();
+    session.eval("reg [0:0] r = 1'b1").expect("decl");
+    for malformed in [
+        "{".repeat(n) + "1'b1" + &"}[0]".repeat(n - 1) + "}[0",
+        "{1'b0}[".repeat(n) + "0" + &"]".repeat(n - 1),
+        "{1'b0}[0:".repeat(n) + "0" + &"]".repeat(n - 1),
+        "{1'b1}[0 +:".repeat(n) + "1" + &"]".repeat(n - 1),
+    ] {
+        let err = session
+            .eval(&format!("$display(\"not executed\"); r = 0; {malformed}"))
+            .expect_err("deep malformed select");
+        assert!(err.starts_with("Syntax error:"));
+        assert!(err.task_output.is_empty());
+        assert_eq!(session.eval("r").expect("session recovered").output, "1'b1");
+    }
+    let invalid = "{".repeat(n) + "100" + &"}[0]".repeat(n);
+    let err = session
+        .eval(&format!("r = {invalid}"))
+        .expect_err("deep invalid source");
+    assert!(err.contains("concatenation operand has indefinite width"));
+    assert_eq!(session.eval("r").expect("semantic recovery").output, "1'b1");
+    let unknown = "{".repeat(n) + "1'bx" + &"}[0]".repeat(n);
+    assert_eq!(
+        session
+            .eval(&unknown)
+            .expect("deep unknown propagation")
+            .output,
+        "1'bx"
+    );
+}
+
+#[test]
+fn direct_deep_concat_result_select_trees_evaluate_and_drop_iteratively() {
+    for mode in 0..6 {
+        let bit = if mode >= 4 { "1'b1" } else { "1'b0" };
+        let mut expr = Expr::Literal(parse_integer(bit).expect("seed"));
+        for _ in 0..20_000 {
+            let zero = || Box::new(Expr::Literal(parse_integer("0").expect("zero")));
+            let (source, kind) = if mode == 0 {
+                (
+                    Expr::Concatenation { items: vec![expr] },
+                    SelectKind::Bit { index: zero() },
+                )
+            } else {
+                let kind = match mode {
+                    1 => SelectKind::Bit {
+                        index: Box::new(expr),
+                    },
+                    2 => SelectKind::PartConst {
+                        msb: zero(),
+                        lsb: Box::new(expr),
+                    },
+                    3 => SelectKind::PartConst {
+                        msb: Box::new(expr),
+                        lsb: zero(),
+                    },
+                    4 => SelectKind::PartIndexedUp {
+                        base: zero(),
+                        width: Box::new(expr),
+                    },
+                    _ => SelectKind::PartIndexedDown {
+                        base: zero(),
+                        width: Box::new(expr),
+                    },
+                };
+                (
+                    Expr::Concatenation {
+                        items: vec![Expr::Literal(parse_integer(bit).expect("source"))],
+                    },
+                    kind,
+                )
+            };
+            expr = Expr::ConcatSelect {
+                source: Box::new(source),
+                kind,
+            };
+        }
+        let session = Session::new();
+        assert_eq!(
+            crate::eval::evaluate_expr(&expr, &session)
+                .expect("direct deep concat select")
+                .canonical(),
+            bit
+        );
+    }
+}
+
+#[test]
+fn drop_of_deep_concat_result_select_sources_and_indices_does_not_overflow() {
+    for source_spine in [true, false] {
+        let mut expr = Expr::Literal(parse_integer("1'b0").expect("seed"));
+        for _ in 0..100_000 {
+            let leaf = Expr::Literal(parse_integer("0").expect("leaf"));
+            let (source, index) = if source_spine {
+                (expr, leaf)
+            } else {
+                (leaf, expr)
+            };
+            expr = Expr::ConcatSelect {
+                source: Box::new(Expr::Concatenation {
+                    items: vec![source],
+                }),
+                kind: SelectKind::Bit {
+                    index: Box::new(index),
+                },
+            };
+        }
+        drop(expr);
+    }
+}

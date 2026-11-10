@@ -118,6 +118,10 @@ pub(crate) enum Expr {
         count: Box<Expr>,
         items: Vec<Expr>,
     },
+    ConcatSelect {
+        source: Box<Expr>,
+        kind: SelectKind,
+    },
     // Every `$name` / `$name()` / `$name(args)` parses to this one shape —
     // the parser is purely syntactic for system identifiers. The
     // validator (`classify_system_call` in system_call.rs) owns the name table
@@ -262,6 +266,10 @@ fn truncate_expr_inner(expr: &mut Expr, depth: usize, max_depth: usize) {
                     truncate_expr_inner(arg, depth + 1, max_depth);
                 }
             }
+        }
+        Expr::ConcatSelect { source, kind } => {
+            truncate_expr_inner(source.as_mut(), depth + 1, max_depth);
+            truncate_select_kind_inner(kind, depth + 1, max_depth);
         }
         Expr::Select { kind, inner, .. } => {
             truncate_select_kind_inner(kind, depth + 1, max_depth);
@@ -430,6 +438,10 @@ fn steal_expr_children(expr: &mut Expr, out: &mut Vec<Expr>) {
                     out.push(std::mem::replace(arg, placeholder()));
                 }
             }
+        }
+        Expr::ConcatSelect { source, kind } => {
+            out.push(std::mem::replace(source.as_mut(), placeholder()));
+            steal_select_kind_children(kind, out);
         }
         Expr::Select { kind, inner, .. } => {
             steal_select_kind_children(kind, out);
@@ -941,10 +953,10 @@ enum Pending {
         unary_wrap: Vec<UnaryOp>,
         saved_min_bp: u8,
     },
-    /// An identifier's `[` consumed. Both operands and an optional
-    /// chained array-element select are collected on the heap.
+    /// An identifier's or concatenation's `[` consumed. Both operands
+    /// and an optional named array-element select are collected on the heap.
     Select {
-        name: String,
+        target: SelectTarget,
         outer: Option<SelectKind>,
         first: Option<(Expr, SelectSeparator)>,
         unary_wrap: Vec<UnaryOp>,
@@ -961,6 +973,11 @@ enum Pending {
         unary_wrap: Vec<UnaryOp>,
         saved_min_bp: u8,
     },
+}
+
+enum SelectTarget {
+    Identifier(String),
+    Concatenation(Expr),
 }
 
 #[derive(Clone, Copy)]
@@ -1192,7 +1209,7 @@ impl<'a> Parser<'a> {
                     let name = name.clone();
                     self.index += 2;
                     stack.push(Pending::Select {
-                        name,
+                        target: SelectTarget::Identifier(name),
                         outer: None,
                         first: None,
                         unary_wrap: prefix_ops,
@@ -1348,10 +1365,22 @@ impl<'a> Parser<'a> {
                             unreachable!("matched Brace above");
                         };
                         items.push(v);
-                        value = Some(apply_prefix_unary_ops(
-                            Expr::Concatenation { items },
-                            unary_wrap,
-                        ));
+                        let source = Expr::Concatenation { items };
+                        // Selects bind before the brace's prefix unary operators.
+                        if matches!(self.peek(), Some(Token::LBracket)) {
+                            self.index += 1;
+                            stack.push(Pending::Select {
+                                target: SelectTarget::Concatenation(source),
+                                outer: None,
+                                first: None,
+                                unary_wrap,
+                                saved_min_bp,
+                            });
+                            min_bp = 0;
+                            value = None;
+                            continue;
+                        }
+                        value = Some(apply_prefix_unary_ops(source, unary_wrap));
                         min_bp = saved_min_bp;
                     } else if items_empty && matches!(self.peek(), Some(Token::LBrace)) {
                         // First inner expression was followed by `{`:
@@ -1412,13 +1441,24 @@ impl<'a> Parser<'a> {
                             unreachable!("matched Replication above");
                         };
                         items.push(v);
-                        value = Some(apply_prefix_unary_ops(
-                            Expr::Replication {
-                                count: Box::new(count),
-                                items,
-                            },
-                            unary_wrap,
-                        ));
+                        let source = Expr::Replication {
+                            count: Box::new(count),
+                            items,
+                        };
+                        if matches!(self.peek(), Some(Token::LBracket)) {
+                            self.index += 1;
+                            stack.push(Pending::Select {
+                                target: SelectTarget::Concatenation(source),
+                                outer: None,
+                                first: None,
+                                unary_wrap,
+                                saved_min_bp,
+                            });
+                            min_bp = 0;
+                            value = None;
+                            continue;
+                        }
+                        value = Some(apply_prefix_unary_ops(source, unary_wrap));
                         min_bp = saved_min_bp;
                     } else {
                         return Err("missing closing brace in concatenation".to_string());
@@ -1427,7 +1467,7 @@ impl<'a> Parser<'a> {
                 Some(Pending::Select { .. }) => {
                     let frame = stack.pop().expect("just inspected via last()");
                     let Pending::Select {
-                        name,
+                        target,
                         outer,
                         first,
                         unary_wrap,
@@ -1473,7 +1513,7 @@ impl<'a> Parser<'a> {
                         };
                         if let Some(separator) = separator {
                             stack.push(Pending::Select {
-                                name,
+                                target,
                                 outer,
                                 first: Some((operand, separator)),
                                 unary_wrap,
@@ -1487,6 +1527,12 @@ impl<'a> Parser<'a> {
                         }
                     };
                     if matches!(self.peek(), Some(Token::LBracket)) {
+                        if matches!(&target, SelectTarget::Concatenation(_)) {
+                            return Err(
+                                "chained selects on concatenation results are not supported"
+                                    .to_string(),
+                            );
+                        }
                         if outer.is_some() {
                             return Err(
                                 "chained selects beyond one inner bracket are not supported"
@@ -1495,7 +1541,7 @@ impl<'a> Parser<'a> {
                         }
                         self.index += 1;
                         stack.push(Pending::Select {
-                            name,
+                            target,
                             outer: Some(kind),
                             first: None,
                             unary_wrap,
@@ -1504,14 +1550,20 @@ impl<'a> Parser<'a> {
                         min_bp = 0;
                         continue;
                     }
-                    let (kind, inner) = match outer {
-                        Some(outer) => (outer, Some(Box::new(kind))),
-                        None => (kind, None),
+                    let selected = match target {
+                        SelectTarget::Identifier(name) => {
+                            let (kind, inner) = match outer {
+                                Some(outer) => (outer, Some(Box::new(kind))),
+                                None => (kind, None),
+                            };
+                            Expr::Select { name, kind, inner }
+                        }
+                        SelectTarget::Concatenation(source) => Expr::ConcatSelect {
+                            source: Box::new(source),
+                            kind,
+                        },
                     };
-                    value = Some(apply_prefix_unary_ops(
-                        Expr::Select { name, kind, inner },
-                        unary_wrap,
-                    ));
+                    value = Some(apply_prefix_unary_ops(selected, unary_wrap));
                     min_bp = saved_min_bp;
                 }
                 Some(Pending::SystemCallArgs { name, .. }) => {

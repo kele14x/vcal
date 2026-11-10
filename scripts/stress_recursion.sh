@@ -155,6 +155,13 @@ run_case "select-index-deep         a[1+1+..+1]"        "n=$DEPTH; print('a[1' +
 run_case "select-range-deep         a[1+1+..:0]"        "n=$DEPTH; print('a[1' + '+1'*n + ':0]')" --parse-only
 # Selects use Pending frames too, including at the full parser depth.
 run_case "select-nested             a[a[..0..]]"        "n=$DEPTH; print('a['*n + '0' + ']'*n)" --parse-only
+run_case "concat-select-source-nested"                  "n=$DEPTH; print('{'*n + \"1'b1\" + '}[0]'*n)" --parse-only
+run_case "replication-select-source-nested"             "n=$DEPTH; print('{1{'*n + \"1'b1\" + '}}[0]'*n)" --parse-only
+run_case "concat-select-index-nested"                   "n=$DEPTH; print(\"{1'b0}[\"*n + '0' + ']'*n)" --parse-only
+run_case "concat-select-lsb-nested"                     "n=$DEPTH; print(\"{1'b0}[0:\"*n + '0' + ']'*n)" --parse-only
+run_case "concat-select-msb-nested"                     "n=$DEPTH; print(\"{1'b0}[\"*n + '0' + ':0]'*n)" --parse-only
+run_case "concat-select-width-up-nested"                "n=$DEPTH; print(\"{1'b1}[0 +:\"*n + '1' + ']'*n)" --parse-only
+run_case "concat-select-width-down-nested"              "n=$DEPTH; print(\"{1'b1}[0 -:\"*n + '1' + ']'*n)" --parse-only
 run_case "mixed-paren-concat        ({{(((..))}})"      "n=$DEPTH; m=n//4; print('({' + '({'*m + '1' + '})'*m + '})')" --parse-only
 run_case "mixed-signed-concat       \$signed({\$signed({..})})"  "n=$DEPTH; m=n//2; print('\$signed({'*m + '1' + '})'*m)" --parse-only
 run_case "mixed-unary-paren         ~(((..)))~"         "n=$DEPTH; print('~(' * n + '1' + ')'*n)" --parse-only
@@ -231,6 +238,18 @@ run_case "eval select-nested-width-up"             "n=$EVAL_DEPTH; print('reg [0
 run_case "eval select-nested-width-down"           "n=$EVAL_DEPTH; print('reg [0:0] a = 1;'); print('a[0 -:'*n + '1' + ']'*n + ';')"
 run_case "eval select-nested-array-inner"          "n=$EVAL_DEPTH; print('reg [0:0] a [0:0]; a[0]=0;'); print('a[0][0:'*n + '0' + ']'*n + ';')"
 run_case "eval select-nested-real-index"           "n=$EVAL_DEPTH; print('real a [0:0];'); print('\$rtoi(a['*n + '0' + '])'*n + ';')"
+run_case "eval concat-select-source-nested"        "n=$EVAL_DEPTH; print('{'*n + \"1'b1\" + '}[0]'*n)"
+run_case "eval replication-select-source-nested"   "n=$EVAL_DEPTH; print('{1{'*n + \"1'b1\" + '}}[0]'*n)"
+run_case "eval concat-select-index-nested"         "n=$EVAL_DEPTH; print(\"{1'b0}[\"*n + '0' + ']'*n)"
+run_case "eval concat-select-lsb-nested"           "n=$EVAL_DEPTH; print(\"{1'b0}[0:\"*n + '0' + ']'*n)"
+run_case "eval concat-select-msb-nested"           "n=$EVAL_DEPTH; print(\"{1'b0}[\"*n + '0' + ':0]'*n)"
+run_case "eval concat-select-width-up-nested"      "n=$EVAL_DEPTH; print(\"{1'b1}[0 +:\"*n + '1' + ']'*n)"
+run_case "eval concat-select-width-down-nested"    "n=$EVAL_DEPTH; print(\"{1'b1}[0 -:\"*n + '1' + ']'*n)"
+run_case "eval concat-select-deep-lhs-index"       "n=$EVAL_DEPTH; e=\"{1'b0}[\"*n+'0'+']'*n; print('reg [0:0] r=0; r['+e+\"]=1'b1;\")"
+run_case "eval concat-select-deep-decl-bound"      "n=$EVAL_DEPTH; e=\"{1'b0}[0:\"*n+'0'+']'*n; print('reg ['+e+\":0] r=1'b1;\")"
+run_case "eval concat-select-deep-rep-count"       "n=$EVAL_DEPTH; e=\"{1'b1}[0 +:\"*n+'1'+']'*n; print('{'+e+\"{1'b1}}[0]\")"
+run_case "eval concat-select-deep-source-error"    "n=$EVAL_DEPTH; print('{'*n + '100' + '}[0]'*n)"
+run_case "eval concat-select-deep-unclosed"        "n=$EVAL_DEPTH; print(\"{1'b0}[\"*n + '0' + ']'*(n-1))"
 
 # ============================================================
 # LValue concat: `{{{..a}}} = 1` exercises `expression_to_lvalue`

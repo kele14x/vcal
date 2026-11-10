@@ -20,6 +20,7 @@ import struct
 import subprocess
 import termios
 import time
+from unittest.mock import patch
 
 
 ENTER = b"\r"
@@ -31,6 +32,7 @@ LEFT = b"\x1b[D"
 RIGHT = b"\x1b[C"
 DELETE = b"\x1b[3~"
 ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+INCOMPLETE_ANSI = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*)?\Z")
 
 
 class Terminal:
@@ -38,6 +40,10 @@ class Terminal:
         self.binary = binary
         self.color = color
         self.raw = bytearray()
+        self._output = bytearray()
+        self._output_offset = 0
+        self._ansi_tail = b""
+        self._cursor_tail = b""
         self.cursor_queries = 0
         self.status = None
         self.pid, self.fd = pty.fork()
@@ -53,7 +59,14 @@ class Terminal:
 
     @property
     def output(self):
-        return ANSI.sub(b"", self.raw).replace(b"\r", b"")
+        chunk = self._ansi_tail + self.raw[self._output_offset:]
+        self._output_offset = len(self.raw)
+        pending = INCOMPLETE_ANSI.search(chunk)
+        self._ansi_tail = chunk[pending.start():] if pending else b""
+        if pending:
+            chunk = chunk[:pending.start()]
+        self._output.extend(ANSI.sub(b"", chunk).replace(b"\r", b""))
+        return bytes(self._output)
 
     def send(self, data):
         while data:
@@ -72,8 +85,9 @@ class Terminal:
                 raise
             chunk = b""
         self.raw.extend(chunk)
-        queries = self.raw.count(b"\x1b[6n")
-        while self.cursor_queries < queries:
+        queries = self._cursor_tail + chunk
+        self._cursor_tail = queries[-3:]
+        for _ in range(queries.count(b"\x1b[6n")):
             self.send(b"\x1b[1;1R")
             self.cursor_queries += 1
 
@@ -387,6 +401,50 @@ def parse_only_ctrl_j(terminal):
     assert b"Syntax error:" not in terminal.output
 
 
+def transcript_chunks():
+    stream = (b"\x1b[?2026h\x1b[32mIn [0]: \x1b[0m\r\n" + "π".encode()
+              + b"\x1b[6n\x1b[2;33m0\x1b[0m\x1b[6n\x1b[?2026l")
+    expected = ANSI.sub(b"", stream).replace(b"\r", b"")
+    chunks_to_check = [[stream[i:i + 1] for i in range(len(stream))]]
+    chunks_to_check.extend([stream[:i], stream[i:]] for i in range(len(stream) + 1))
+    for chunks in chunks_to_check:
+        terminal = Terminal.__new__(Terminal)
+        terminal.fd = -1
+        terminal.raw = bytearray()
+        terminal._output = bytearray()
+        terminal._output_offset = 0
+        terminal._ansi_tail = b""
+        terminal._cursor_tail = b""
+        terminal.cursor_queries = 0
+        replies = []
+        terminal.send = replies.append
+        with patch.object(select, "select", return_value=([-1], [], [])), \
+                patch.object(os, "read", side_effect=chunks):
+            for _ in chunks:
+                terminal.read(0)
+                output = terminal.output
+                assert terminal.output == output, "reading output twice changed the transcript"
+        assert terminal.output == expected, f"chunked ANSI stripping changed output: {chunks!r}"
+        assert bytes(terminal.raw) == stream, "raw transcript changed"
+        assert terminal.cursor_queries == 2 and replies == [b"\x1b[1;1R"] * 2
+
+
+def parse_only_large_paste(terminal):
+    depth = 100_000
+    terminal.paste(b"{" * depth + b"1'b1" + b"}[0]" * depth)
+    terminal.pending()
+    terminal.send(ENTER)
+    terminal.wait_for(b"In [1]: ", timeout=10)
+    output = terminal.output
+    assert b"ConcatSelect" in output and b"Truncated" in output
+    assert output.count(b"Out[0]: ") == 1
+    assert b"Syntax error:" not in output
+    terminal.paste(b"1+2")
+    terminal.send(ENTER)
+    terminal.wait_for(b"In [2]: ")
+    assert b"Binary {" in raw_result(terminal, 1), "small submission after large paste failed"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "target/debug/vcal")
@@ -394,6 +452,8 @@ def main():
     if not binary.is_file() or not os.access(binary, os.X_OK):
         parser.error(f"build vcal first; executable not found at {binary}")
 
+    transcript_chunks()
+    print("PASS incremental ANSI stripping and cursor queries across read boundaries")
     cases = [
         ("Alt-Enter and whole-buffer history", typed_and_history, {}),
         ("Alt-Enter at the cursor", newline_at_cursor, {}),
@@ -417,6 +477,8 @@ def main():
         ("parse-only Alt-Enter", parse_only_typed, {"parse_only": True}),
         ("parse-only multi-line paste", parse_only_paste, {"parse_only": True}),
         ("parse-only Ctrl-J", parse_only_ctrl_j, {"parse_only": True}),
+        ("parse-only 500 KB paste without color and recovery", parse_only_large_paste, {"parse_only": True}),
+        ("parse-only 500 KB colored paste and recovery", parse_only_large_paste, {"parse_only": True, "color": True}),
     ]
     for name, check, options in cases:
         terminal = Terminal(binary, **options)

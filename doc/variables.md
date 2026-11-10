@@ -119,13 +119,21 @@ A declared reg can be sliced four ways (LRM 4.2.1 / 5.2.1 / 5.2.2):
 | `r[b +: w]`   | indexed part-select up     | `w`           |
 | `r[b -: w]`   | indexed part-select down   | `w`           |
 
-The select grammar only attaches to a declared identifier — `4'b1111[0]`
-does not parse, matching the LRM production
-`identifier [ { [ expression ] } [ range_expression ] ]`. The unpacked
-`{ dimension }` array form remains out of scope.
+Verilog selects attach to a declared identifier — `4'b1111[0]` does not
+parse, matching the LRM production
+`identifier [ { [ expression ] } [ range_expression ] ]`. vcal also accepts
+read-only selects on concatenation and replication results as a
+[SystemVerilog extension](non-standard.md#systemverilog-extension-selects-on-concatenation-results):
+`{4'b1111}[0]`, `{a, b}[3:0]`, and `{2{4'hA}}[7 -: 4]`. The joined source
+is self-determined and numbered `[width - 1:0]`; every select is unsigned
+and renders numerically in the source's display base. Bare literals and
+parenthesized expressions remain unselectable, and each brace primary
+accepts only one select suffix. The existing concatenation operand-width
+and positive-size rules still apply.
 
-The same four select forms are also accepted on the left-hand side of a
-blocking assignment, per LRM A.8.5 `variable_lvalue`:
+On declared identifiers, the same four select forms are also accepted on
+the left-hand side of a blocking assignment, per LRM A.8.5
+`variable_lvalue`; concatenation-result selects are read-only:
 
 | LHS form                | Meaning                                |
 |-------------------------|----------------------------------------|

@@ -43,6 +43,19 @@ The Verilog LRM requires constant-expression operands for `r[m:l]` and for the `
 
 Select nesting has no fixed depth limit. Select brackets use heap frames in the parser, and their operands use the iterative annotation, validation, evaluation, and drop paths. Parse-only AST output still uses its separate display-depth truncation limit (see [repl.md](repl.md)).
 
+## SystemVerilog extension: selects on concatenation results
+
+vcal accepts read-only selects on concatenation and replication results, borrowing the `concatenation [ [ range_expression ] ]` and `multiple_concatenation [ [ range_expression ] ]` primary forms from SystemVerilog (IEEE 1800, Annex A.8.4). These are extensions to the Verilog IEEE 1364-2005 grammar, not vcal-only syntax.
+
+- `{32'd100}[0]` → `1'd0`; `{32'd100}[2]` → `1'd1`
+- `{8'hAB}[7:4]` → `4'ha`
+- `{4'hA, 4'hB}[0 +: 4]` → `4'hb`
+- `{2{4'hA}}[7 -: 4]` → `4'ha`
+
+The concatenation is evaluated at its self-determined width before selecting, with result bit numbering `[width - 1:0]` regardless of any operand's declared range. The selected value is unsigned, inherits the concatenation's numeric display base, and does not retain string display style. Outer expression or assignment width can widen the selected value, but cannot widen the source or its operands before selection. Index/base expressions are self-determined; out-of-range and x/z positions follow the existing select rules in [variables.md](variables.md). Part-selects must descend (`msb >= lsb`), and indexed widths must be definite positive integers. The runtime endpoint/width relaxation described above applies here too; SystemVerilog itself still requires constant part-select endpoints and indexed widths.
+
+All existing concatenation restrictions remain: `{100}[0]` and `{4'd1 + 1}[0]` are rejected for indefinite-width operands, real operands are rejected, and zero-size-only results are illegal. Bare literal selects (`100[0]`), parenthesized-expression selects (`(a + b)[3:0]`), and chained suffixes (`{8'hAB}[7:4][0]`) remain unsupported. To select again, wrap the selected value in a new concatenation (`{{8'hAB}[7:4]}[0]`). Concatenation-result selects are not assignment targets; existing concatenation lvalues such as `{a, b[3:0]} = rhs` are unchanged.
+
 ## Real numbers
 
 vcal stores real values as Rust `f64`, which is IEEE 754 binary64 — the same format LRM §3.5.2 references. A few corners the LRM leaves to the implementation are pinned down here:

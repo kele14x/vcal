@@ -155,6 +155,7 @@ The general evaluation model — width, signedness, leaf extension, base inherit
 - Syntax:
   - concatenation: `{ expr {, expr} }`
   - replication: `{ count_expr { expr {, expr} } }`
+  - read-only result select: `{ expr {, expr} }[select]` or `{ count_expr { expr {, expr} } }[select]` — a [SystemVerilog extension](non-standard.md#systemverilog-extension-selects-on-concatenation-results), where `select` is an index, `msb:lsb`, `base +: width`, or `base -: width`
 - Inner operands are self-determined, with no outer context propagated into them, and their bits are joined MSB-first.
 - The result is always unsigned, base inheritance is leftmost-wins, and any outer context only zero-extends the already joined result.
 - Indefinite-width rejection uses `is_indefinite_width`, following LRM §5.1.14. Any expression whose self-determined width depends on an unsized literal is rejected inside concatenation. That indefinite-width flag propagates through context-determined operators (arithmetic, bitwise, power, shift LHS, conditional branches, unary `+` / `-` / `~`) and stops at definite 1-bit-result operators (relational, equality, logical, reduction) and at concatenation and replication themselves.

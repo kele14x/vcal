@@ -425,3 +425,603 @@ fn replication_widens_through_outer_arithmetic_context() {
     let result = evaluate_input("{4{1'b1}} + 8'd0").expect("eval");
     assert_eq!(result.output, "8'b00001111");
 }
+
+#[test]
+fn concat_result_selects_parse_with_the_source_and_all_four_kinds() {
+    use crate::parser::{Expr, SelectKind, parse_expression};
+
+    for (input, mode) in [
+        ("{32'd100}[0]", 0),
+        ("{a,b}[3:0]", 1),
+        ("{4'b1010}[0 +: 2]", 2),
+        ("{4'b1010}[3 -: 2]", 3),
+    ] {
+        let expr = parse_expression(input).expect(input);
+        let Expr::ConcatSelect { source, kind } = &expr else {
+            panic!("expected concat-result select for {input}");
+        };
+        assert!(matches!(source.as_ref(), Expr::Concatenation { .. }));
+        assert!(matches!(
+            (mode, kind),
+            (0, SelectKind::Bit { .. })
+                | (1, SelectKind::PartConst { .. })
+                | (2, SelectKind::PartIndexedUp { .. })
+                | (3, SelectKind::PartIndexedDown { .. })
+        ));
+    }
+    let expr = parse_expression("{2{4'hA}}[7:4]").expect("replication select");
+    assert!(matches!(
+        &expr,
+        Expr::ConcatSelect { source, kind: SelectKind::PartConst { .. } }
+            if matches!(source.as_ref(), Expr::Replication { .. })
+    ));
+    let expr = parse_expression("~{4'b1010}[1:0]").expect("unary select");
+    assert!(matches!(
+        &expr,
+        Expr::Unary { expr, .. } if matches!(expr.as_ref(), Expr::ConcatSelect { .. })
+    ));
+}
+
+#[test]
+fn concat_result_selects_number_bits_from_zero_and_keep_numeric_base() {
+    for (input, expected) in [
+        ("{32'd100}[0]", "1'd0"),
+        ("{32'd100}[2]", "1'd1"),
+        ("{32'd100}[31]", "1'd0"),
+        ("{32'd100}[6:2]", "5'd25"),
+        ("{4'b1010}[0 +: 2]", "2'b10"),
+        ("{4'b1010}[3 -: 2]", "2'b10"),
+        ("{2{4'hA}}[7:4]", "4'ha"),
+        ("{2{4'hA}}[0]", "1'h0"),
+        ("{4'o5}[2:1]", "2'o2"),
+        ("{2'bxz, 2'b01}[3:1]", "3'bxz0"),
+        ("{2'bxz}[0]", "1'bz"),
+    ] {
+        assert_eq!(
+            evaluate_input(input).expect(input).output,
+            expected,
+            "{input}"
+        );
+    }
+    let mut session = Session::new();
+    session
+        .eval("reg [3:0] a = 4'hA, b = 4'b0011")
+        .expect("decls");
+    for (input, expected) in [
+        ("{a,b}[3:0]", "4'h3"),
+        ("{a,b}[7:4]", "4'ha"),
+        ("{b,a}[3:0]", "4'b1010"),
+    ] {
+        assert_eq!(
+            session.eval(input).expect(input).output,
+            expected,
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn concat_result_selects_compose_with_unary_binary_conditional_and_index_expressions() {
+    for (input, expected) in [
+        ("~{4'b0101}[1:0]", "2'b10"),
+        ("~{4'b0101}[1:0] + 4'b0", "4'b1110"),
+        ("-{4'd1}[1:0]", "2'd3"),
+        ("!{4'b1010}[0]", "1'b1"),
+        ("&{4'b1010}[3:2]", "1'b0"),
+        ("^{4'b1010}[3:2]", "1'b1"),
+        ("2'd1 + {4'd10}[3:2] * 2'd2", "2'd1"),
+        ("{4'b1010}[1] && {4'b1010}[0]", "1'b0"),
+        ("1'b1 ? {4'b1010}[3:2] : 4'b0", "4'b0010"),
+        ("{4'b1010}[0] ? 4'd3 : {4'd10}[3:2]", "4'd2"),
+        ("{4'b1010}[1 ? 1 : 0]", "1'b1"),
+        ("{4'b1010}[1 + 1 +: 1 ? 2 : 1]", "2'b10"),
+        ("{4'b1010}[1 ? 3 : 2 : 1 ? 2 : 0]", "2'b10"),
+        ("{{4'b1010}[1:0], 2'b01}[3:0]", "4'b1001"),
+        ("{2{{4'b1010}[1:0]}}", "4'b1010"),
+    ] {
+        assert_eq!(
+            evaluate_input(input).expect(input).output,
+            expected,
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn concat_result_selects_are_unsigned_and_barrier_source_and_index_widths() {
+    for (input, expected) in [
+        ("{-4'sd1}[3:0]", "4'd15"),
+        ("{-4'sd1}[3:0] + 8'sd0", "8'd15"),
+        ("{-4'sd1}[3:0] < 8'sd0", "1'b0"),
+        ("{4'd15 + 4'd1}[3:0] + 8'd1", "8'd1"),
+        ("{4'd15 + 4'd1}[4] + 8'd0", "8'dx"),
+        ("{2'd3 + 2'd1, 2'b01}[3:0]", "4'd1"),
+        ("{4'b1010}[2'd3 + 2'd1] + 16'b0", "16'b0000000000000000"),
+        ("{4'b1010}[2'd3 + 2'd1 +: 2] + 8'b0", "8'b00000010"),
+        ("{4'd15 + 4'd1}[0 +: 8]", "8'dx"),
+        ("1'b1 ? {4'd15 + 4'd1}[3:0] : 16'd1", "16'd0"),
+    ] {
+        assert_eq!(
+            evaluate_input(input).expect(input).output,
+            expected,
+            "{input}"
+        );
+    }
+    for (rhs, expected) in [
+        ("{-4'sd1}[3:0]", "16'd15"),
+        ("{4'd15 + 4'd1}[3:0] + 8'd1", "16'd1"),
+        ("{4'b1010}[2'd3 + 2'd1]", "16'b0000000000000000"),
+        ("{4'b1010}[0 +: {4'd5}[2:0]]", "16'b00000000000x1010"),
+    ] {
+        let mut session = Session::new();
+        session.eval("reg [15:0] dst").expect("decl");
+        session.eval(&format!("dst = {rhs}")).expect(rhs);
+        assert_eq!(
+            session.eval("dst").expect("assigned value").output,
+            expected,
+            "{rhs}"
+        );
+    }
+}
+
+#[test]
+fn concat_result_selects_rebase_reversed_ranges_and_accept_scalar_operands() {
+    let mut session = Session::new();
+    session
+        .eval("reg [0:3] a = 4'b1010; reg [-1:2] b = 4'b1010; reg scalar = 1'b1")
+        .expect("decls");
+    assert_eq!(session.eval("a[0]").expect("declared msb").output, "1'b1");
+    for (input, expected) in [
+        ("{a}[0]", "1'b0"),
+        ("{a}[3]", "1'b1"),
+        ("{a}[3:0]", "4'b1010"),
+        ("{a}[0 +: 2]", "2'b10"),
+        ("{a}[3 -: 2]", "2'b10"),
+        ("{b}[3:0]", "4'b1010"),
+        ("{scalar}[0]", "1'b1"),
+        ("{scalar}[0:0]", "1'b1"),
+        ("{scalar}[0 +: 1]", "1'b1"),
+        ("{scalar}[0 -: 1]", "1'b1"),
+        ("{scalar, 1'b0}[1:0]", "2'b10"),
+    ] {
+        assert_eq!(
+            session.eval(input).expect(input).output,
+            expected,
+            "{input}"
+        );
+    }
+    for input in ["{a}[0:3]", "{scalar}[0:1]", "{1'b1}[0:1]"] {
+        assert!(
+            session
+                .eval(input)
+                .expect_err(input)
+                .contains("direction does not match")
+        );
+    }
+    assert!(
+        session
+            .eval("scalar[0]")
+            .expect_err("scalar select")
+            .contains("scalar reg")
+    );
+}
+
+#[test]
+fn concat_result_select_unknown_and_outside_indices_produce_x_per_position() {
+    for index in [
+        "4",
+        "-1",
+        "1'bx",
+        "1'bz",
+        "128'd18446744073709551616",
+        "-128'sd18446744073709551616",
+    ] {
+        let input = format!("{{4'b1010}}[{index}]");
+        assert_eq!(
+            evaluate_input(&input).expect(&input).output,
+            "1'bx",
+            "{input}"
+        );
+    }
+    for (input, expected) in [
+        ("{4'b1010}[5:2]", "4'bxx10"),
+        ("{4'b1010}[1:-2]", "4'b10xx"),
+        ("{4'b1010}[4:3]", "2'bx1"),
+        ("{4'b1010}[-1:-3]", "3'bxxx"),
+        ("{4'b1010}[2 +: 4]", "4'bxx10"),
+        ("{4'b1010}[-1 +: 4]", "4'b010x"),
+        ("{4'b1010}[1 -: 4]", "4'b10xx"),
+        ("{4'b1010}[-1 -: 3]", "3'bxxx"),
+        ("{4'b1010}[1'bx +: 3]", "3'bxxx"),
+        ("{4'b1010}[1'bz -: 3]", "3'bxxx"),
+        ("{4'b1010}[128'd18446744073709551616 +: 2]", "2'bxx"),
+        ("{4'b1010}[128'd18446744073709551616 -: 2]", "2'bxx"),
+        ("{1'b1}[1:0]", "2'bx1"),
+    ] {
+        assert_eq!(
+            evaluate_input(input).expect(input).output,
+            expected,
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn concat_result_select_bounds_and_widths_keep_existing_diagnostics() {
+    for (suffix, diagnostic) in [
+        ("[1.0]", "bit-select index cannot be real"),
+        ("[1.0:0]", "part-select msb cannot be real"),
+        ("[3:1.0]", "part-select lsb cannot be real"),
+        ("[1'bx:0]", "part-select msb contains unknown bits"),
+        ("[3:1'bz]", "part-select lsb contains unknown bits"),
+        ("[0:3]", "part-select direction does not match"),
+        ("[1.0 +: 2]", "indexed part-select base cannot be real"),
+        ("[1.0 -: 2]", "indexed part-select base cannot be real"),
+        ("[0 +: 1.0]", "indexed part-select width cannot be real"),
+        ("[0 -: 1.0]", "indexed part-select width cannot be real"),
+        (
+            "[0 +: 1'bx]",
+            "indexed part-select width contains unknown bits",
+        ),
+        (
+            "[0 -: 1'bz]",
+            "indexed part-select width contains unknown bits",
+        ),
+        ("[0 +: 0]", "indexed part-select width must be positive"),
+        ("[0 -: -1]", "indexed part-select width must be positive"),
+        (
+            "[0 +: 128'd18446744073709551616]",
+            "indexed part-select width too large",
+        ),
+        (
+            "[128'd18446744073709551616:0]",
+            "part-select width too large",
+        ),
+    ] {
+        let input = format!("{{4'b1010}}{suffix}");
+        let err = evaluate_input(&input).expect_err(&input);
+        assert!(
+            err.starts_with("Semantic error:") && err.contains(diagnostic),
+            "{input}: {err}"
+        );
+    }
+}
+
+#[test]
+fn concat_result_select_does_not_hide_invalid_or_oversized_sources() {
+    for (input, diagnostic) in [
+        ("{100}[0]", "concatenation operand has indefinite width"),
+        (
+            "{4'd1 + 1}[0]",
+            "concatenation operand has indefinite width",
+        ),
+        (
+            "{1 << 4'd1}[0]",
+            "concatenation operand has indefinite width",
+        ),
+        ("{1.0}[0]", "concatenation operand cannot be real"),
+        ("{2{1.0}}[0]", "replication operand cannot be real"),
+        ("{$finish}[0]", "is a system task"),
+        ("{$display(\"not printed\")}[0]", "is a system task"),
+        (
+            "{0{1'b1}}[0]",
+            "replication count must be positive in this context",
+        ),
+        (
+            "{{0{1'b1}}}[0]",
+            "concatenation must have at least one operand with positive size",
+        ),
+        (
+            "{{0{1'b1}}, {0{1'b0}}}[0]",
+            "concatenation must have at least one operand with positive size",
+        ),
+        (
+            "{{0{1'b1}}[0], 1'b1}",
+            "replication count must be positive in this context",
+        ),
+        (
+            "{16777217'b0}[0]",
+            "concatenation width 16777217 exceeds limit 16777216",
+        ),
+        (
+            "{16777217{1'b0}}[0]",
+            "replication width 16777217 exceeds limit 16777216",
+        ),
+        (
+            "{9000000'b0, 9000000'b0}[0]",
+            "concatenation width 18000000 exceeds limit 16777216",
+        ),
+        (
+            "{1'b1}[16777216:0]",
+            "part-select width 16777217 exceeds limit 16777216",
+        ),
+        (
+            "{1'b1}[0 +: 16777217]",
+            "part-select width 16777217 exceeds limit 16777216",
+        ),
+        (
+            "{1'b1}[0 -: 16777217]",
+            "part-select width 16777217 exceeds limit 16777216",
+        ),
+        (
+            "1'b0 ? {100}[0] : 1'b1",
+            "concatenation operand has indefinite width",
+        ),
+        (
+            "{1'b1, {0{{1.0}[0]}}}",
+            "concatenation operand cannot be real",
+        ),
+    ] {
+        let err = evaluate_input(input).expect_err(input);
+        assert!(
+            err.starts_with("Semantic error:") && err.contains(diagnostic),
+            "{input}: {err}"
+        );
+        assert!(err.task_output.is_empty(), "{input}");
+    }
+    assert_eq!(
+        evaluate_input("{{0{1'b0}}, 1'b1}[0]")
+            .expect("zero sibling")
+            .output,
+        "1'b1"
+    );
+}
+
+#[test]
+fn concat_result_selects_work_as_nested_bounds_widths_counts_and_lvalue_indices() {
+    for (input, expected) in [
+        ("{4'b1010}[{2'b01}[0]]", "1'b1"),
+        ("{4'b1010}[{2'b11}[1:0]:{1'b0}[0]]", "4'b1010"),
+        ("{4'b1010}[{2'b01}[1:0] +: {2'b10}[1:0]]", "2'b01"),
+        ("{4'b1010}[{2'b11}[1:0] -: {2'b10}[1:0]]", "2'b10"),
+        ("{{2'b10}[1:0]{1'b1}}[1:0]", "2'b11"),
+    ] {
+        assert_eq!(
+            evaluate_input(input).expect(input).output,
+            expected,
+            "{input}"
+        );
+    }
+    let mut session = Session::new();
+    session
+        .eval("reg [7:0] r = 8'b0; reg [3:0] a [0:1]")
+        .expect("decls");
+    session.eval("r[{2'b01}[0]] = 1'b1").expect("bit lhs index");
+    assert_eq!(session.eval("r").expect("bit write").output, "8'b00000010");
+    session
+        .eval("r[{3'b101}[2:0]:{2'b10}[1:0]] = 4'b1010")
+        .expect("part lhs bounds");
+    assert_eq!(session.eval("r").expect("part write").output, "8'b00101010");
+    session
+        .eval("r[{3'b100}[2:0] +: {2'b10}[1:0]] = 2'b01")
+        .expect("indexed lhs");
+    assert_eq!(
+        session.eval("r").expect("indexed write").output,
+        "8'b00011010"
+    );
+    session
+        .eval("a[{2'b01}[0]][{2'b10}[1:0] -: {2'b10}[1:0]] = 2'b11")
+        .expect("array lhs");
+    assert_eq!(
+        session.eval("a[1][2:1]").expect("array read").output,
+        "2'b11"
+    );
+    session
+        .eval("reg [{2'b11}[1:0]:{1'b0}[0]] dst = 4'hA")
+        .expect("packed bounds");
+    session
+        .eval("reg [0:0] arr [{1'b0}[0]:{1'b1}[0]]; arr[1] = 1'b1")
+        .expect("unpacked bounds");
+    assert_eq!(session.eval("dst").expect("decl value").output, "4'ha");
+    assert_eq!(session.eval("arr[1]").expect("array value").output, "1'b1");
+}
+
+#[test]
+fn concat_result_select_bound_caches_refresh_and_do_not_widen() {
+    let mut session = Session::new();
+    session
+        .eval("reg [7:0] r = 8'h55; reg [3:0] width = 4'd5; reg [15:0] dst")
+        .expect("decls");
+    let input = "{r}[0 +: {width}[3:0]]";
+    assert_eq!(
+        session
+            .eval(&format!("{input} + 16'h0"))
+            .expect("wide arithmetic")
+            .output,
+        "16'h0015"
+    );
+    session
+        .eval(&format!("dst = {input}"))
+        .expect("wide assignment");
+    assert_eq!(session.eval("dst").expect("assigned").output, "16'h0015");
+    assert_eq!(
+        session
+            .eval(&format!("width = 4'd1; {input}"))
+            .expect("refreshed width")
+            .output,
+        "1'h1"
+    );
+    assert_eq!(
+        session
+            .eval(&format!("width = 4'd0; {input}"))
+            .expect_err("zero width"),
+        "Semantic error: indexed part-select width must be positive"
+    );
+    assert_eq!(
+        session
+            .eval(&format!("width = 4'd5; {input}"))
+            .expect("restored width")
+            .output,
+        "5'h15"
+    );
+}
+
+#[test]
+fn concat_result_select_clears_string_style_but_keeps_packed_string_bits() {
+    for (input, expected) in [
+        ("{\"AB\"}[7:0]", "8'h42"),
+        ("{\"A\", \"B\"}[15:8]", "8'h41"),
+        ("{\"AB\"}[0]", "1'h0"),
+        ("{\"AB\"}[1]", "1'h1"),
+        ("{2{\"A\"}}[15:0]", "16'h4141"),
+        ("{\"AB\"}[0 +: 8]", "8'h42"),
+        ("{\"AB\"}[15 -: 8]", "8'h41"),
+        ("{\"\"}[7:0]", "8'h00"),
+        ("{\"\\377\"}[7:0]", "8'hff"),
+        ("{{\"AB\"}[7:0], \"C\"}", "16'h4243"),
+    ] {
+        assert_eq!(
+            evaluate_input(input).expect(input).output,
+            expected,
+            "{input}"
+        );
+    }
+    let mut session = Session::new();
+    session
+        .eval("reg [15:0] dst = {\"AB\"}[7:0]")
+        .expect("string bits assignment");
+    assert_eq!(
+        session.eval("dst").expect("numeric read").output,
+        "16'h0042"
+    );
+}
+
+#[test]
+fn concat_result_selects_reject_other_expression_suffixes_chaining_and_lvalues() {
+    let mut session = Session::new();
+    session
+        .eval("reg [3:0] a = 4'b1010, b = 4'b0101")
+        .expect("decls");
+    for input in [
+        "4'b1010[0]",
+        "(4'b1010)[0]",
+        "(a + b)[0]",
+        "(a)[0]",
+        "\"A\"[0]",
+        "({a,b})[0]",
+        "({2{a}})[0]",
+        "{a,b}[0][0]",
+        "{a,b}[3:0][1]",
+        "{2{a}}[3:0][0]",
+        "{a,b}[0] = 1'b0",
+        "{a,b}[3:0] = 4'b0",
+        "{a,b}[0 +: 2] = 2'b0",
+        "{a,b}[3 -: 2] = 2'b0",
+        "{2{a}}[0] = 1'b0",
+        "{{a,b}[0], a} = 5'b0",
+    ] {
+        let err = session.eval(input).expect_err(input);
+        assert!(err.starts_with("Syntax error:"), "{input}: {err}");
+        assert_eq!(session.eval("a").expect("a unchanged").output, "4'b1010");
+        assert_eq!(session.eval("b").expect("b unchanged").output, "4'b0101");
+    }
+}
+
+#[test]
+fn malformed_concat_result_selects_recover_without_executing_earlier_statements() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a = 4'b1010").expect("decl");
+    for malformed in [
+        "{a}[",
+        "{a}[]",
+        "{a}[0",
+        "{a}[1:]",
+        "{a}[:0]",
+        "{a}[3:0",
+        "{a}[0 +:]",
+        "{a}[0 -:]",
+        "{a}[0 +: 1",
+        "{a}[0 + : 1]",
+        "{a}[0 - : 1]",
+        "{a}[0,1]",
+        "{a}[0][0]",
+        "{2{a}}[0",
+        "{{a}[0]}[",
+    ] {
+        let input = format!("$display(\"not executed\"); a = 4'b0; reg fresh; {malformed}");
+        let err = session.eval(&input).expect_err(malformed);
+        assert!(err.starts_with("Syntax error:"), "{malformed}: {err}");
+        assert!(err.task_output.is_empty(), "{malformed}");
+        assert!(session.lookup("fresh").is_none(), "{malformed}");
+        assert_eq!(session.eval("a").expect("a unchanged").output, "4'b1010");
+        assert_eq!(
+            session.eval("{a}[0]").expect("session recovered").output,
+            "1'b0"
+        );
+    }
+}
+
+#[test]
+fn invalid_concat_result_select_subexpressions_report_errors_without_panics_or_tasks() {
+    let mut session = Session::new();
+    session.eval("reg [3:0] a = 4'b1010").expect("decl");
+    for (bad, diagnostic) in [
+        ("{1.0}[0]", "concatenation operand cannot be real"),
+        ("{$finish}[0]", "is a system task"),
+    ] {
+        for template in [
+            "a[BAD]",
+            "{a}[BAD]",
+            "{a}[BAD:0]",
+            "{a}[3:BAD]",
+            "{a}[BAD +: 1]",
+            "{a}[0 -: BAD]",
+            "{(BAD){1'b1}}",
+            "a = BAD",
+            "a[BAD] = 1'b0",
+            "reg [BAD:0] fresh",
+            "reg [3:0] fresh = BAD",
+            "1'b0 ? BAD : 1'b1",
+            "{1'b1, {0{BAD}}}",
+        ] {
+            let input = template.replace("BAD", bad);
+            let err = session.eval(&input).expect_err(&input);
+            assert!(
+                err.starts_with("Semantic error:") && err.contains(diagnostic),
+                "{input}: {err}"
+            );
+            assert!(err.task_output.is_empty(), "{input}");
+            assert!(session.lookup("fresh").is_none(), "{input}");
+            assert_eq!(
+                session.eval("a").expect("session unchanged").output,
+                "4'b1010"
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_concat_result_selects_leave_assignment_and_declaration_state_unchanged() {
+    let mut session = Session::new();
+    session
+        .eval("reg [3:0] a = 4'b1010, b = 4'b0101")
+        .expect("decls");
+    for rhs in [
+        "{100}[0]",
+        "{1.0}[0]",
+        "{$finish}[0]",
+        "{a}[0 +: 0]",
+        "{a}[0:3]",
+        "{a}[1.0]",
+    ] {
+        let err = session.eval(&format!("a = {rhs}")).expect_err(rhs);
+        assert!(err.starts_with("Semantic error:"), "{rhs}: {err}");
+        assert!(err.task_output.is_empty(), "{rhs}");
+        assert_eq!(session.eval("a").expect("a unchanged").output, "4'b1010");
+    }
+    let err = session
+        .eval("reg [3:0] a = 4'b0, fresh = {100}[0]")
+        .expect_err("failed initializer");
+    assert!(err.contains("concatenation operand has indefinite width"));
+    assert!(session.lookup("fresh").is_none());
+    assert_eq!(
+        session.eval("a").expect("prior binding preserved").output,
+        "4'b1010"
+    );
+    let err = session
+        .eval("{a, b[{1.0}[0]]} = 5'b0")
+        .expect_err("failed lhs index");
+    assert!(err.contains("concatenation operand cannot be real"));
+    assert_eq!(session.eval("a").expect("a unchanged").output, "4'b1010");
+    assert_eq!(session.eval("b").expect("b unchanged").output, "4'b0101");
+}

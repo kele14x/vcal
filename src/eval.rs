@@ -110,6 +110,8 @@ enum AnnotatedKind<'a> {
 #[derive(Debug)]
 struct AnnotatedSelect<'a> {
     operands: Vec<Annotated<'a>>,
+    // Concatenation sources occupy operands[0], rebased to [width - 1:0].
+    source_range: Option<RegRange>,
     kind: ResolvedSelectKind,
     inner: Option<ResolvedSelectKind>,
     value: OnceCell<Value>,
@@ -432,6 +434,17 @@ pub(crate) fn annotate<'a>(root: &'a Expr, session: &Session) -> Result<Annotate
                     if let Some(inner) = inner {
                         operands.extend(select_operand_exprs(inner));
                     }
+                    work.push(AnnotateTask::Combine(AnnotateCombiner::Select {
+                        expr,
+                        operand_count: operands.len(),
+                    }));
+                    for operand in operands.into_iter().rev() {
+                        work.push(AnnotateTask::Visit(operand));
+                    }
+                }
+                Expr::ConcatSelect { source, kind } => {
+                    let mut operands = vec![source.as_ref()];
+                    operands.extend(select_operand_exprs(kind));
                     work.push(AnnotateTask::Combine(AnnotateCombiner::Select {
                         expr,
                         operand_count: operands.len(),
@@ -1005,7 +1018,7 @@ pub(crate) fn expression_is_real(expr: &Expr, session: &Session) -> bool {
                 work.push(then_expr);
                 work.push(else_expr);
             }
-            Expr::Concatenation { .. } | Expr::Replication { .. } => {}
+            Expr::Concatenation { .. } | Expr::Replication { .. } | Expr::ConcatSelect { .. } => {}
             // `$name(args)`: classify by name to decide result-type.
             //   - SignCast / BaseCast / unknown name → integer-typed
             //     (unknowns surface their diagnostic at validate time).
@@ -1705,6 +1718,7 @@ fn evaluate_leaf_expr_in_context(
             })
         }
         Expr::Select { .. }
+        | Expr::ConcatSelect { .. }
         | Expr::Grouped(_)
         | Expr::Unary { .. }
         | Expr::Binary { .. }
@@ -2982,7 +2996,8 @@ fn combine_eval<'b, 'a: 'b>(
                         .as_ref()
                         .and_then(ResolvedSelectKind::dynamic_operand)
                         .is_some(),
-                );
+                )
+                + usize::from(select.source_range.is_some());
             let operands = vals.split_off(vals.len() - count);
             let value = evaluate_resolved_select(node.expr, select, &operands, session)?;
             let _ = select.value.set(value.clone());
@@ -3695,14 +3710,37 @@ fn annotate_select<'a>(
     operands: Vec<Annotated<'a>>,
     session: &Session,
 ) -> Result<Annotated<'a>, String> {
-    let Expr::Select { name, kind, inner } = expr else {
-        unreachable!("select combiner requires a select expression");
-    };
     // Nested selects have already validated their own operands during
     // this bottom-up walk; their validator arm does not visit them again.
     for operand in &operands {
         validate_annotated(operand, session)?;
     }
+    if let Expr::ConcatSelect { kind, .. } = expr {
+        let source_meta = operands[0].meta();
+        let range = RegRange {
+            msb: BigInt::from(source_meta.width - 1),
+            lsb: BigInt::zero(),
+        };
+        let kind = resolve_annotated_select_kind(kind, 1, &operands, &range, session)?;
+        return Ok(Annotated {
+            expr,
+            meta: Some(ExprMeta {
+                width: kind.width(),
+                signed: false,
+                base: source_meta.base,
+            }),
+            kind: AnnotatedKind::Select(Box::new(AnnotatedSelect {
+                operands,
+                source_range: Some(range),
+                kind,
+                inner: None,
+                value: OnceCell::new(),
+            })),
+        });
+    }
+    let Expr::Select { name, kind, inner } = expr else {
+        unreachable!("select combiner requires a select expression");
+    };
     let reg = session.lookup(name).expect("select name checked at Visit");
     let (resolved, resolved_inner, meta) = if reg.is_real_array() || reg.is_array() {
         if !matches!(kind, SelectKind::Bit { .. }) {
@@ -3772,6 +3810,7 @@ fn annotate_select<'a>(
         meta,
         kind: AnnotatedKind::Select(Box::new(AnnotatedSelect {
             operands,
+            source_range: None,
             kind: resolved,
             inner: resolved_inner,
             value: OnceCell::new(),
@@ -3857,6 +3896,12 @@ fn push_select_eval<'b, 'a: 'b>(
             ctx: None,
         });
     }
+    if select.source_range.is_some() {
+        work.push(EvalTask::Visit {
+            node: &select.operands[0],
+            ctx: None,
+        });
+    }
 }
 
 fn evaluate_resolved_select(
@@ -3865,6 +3910,10 @@ fn evaluate_resolved_select(
     operands: &[IntegerValue],
     session: &Session,
 ) -> Result<Value, String> {
+    if let Some(range) = &select.source_range {
+        return apply_resolved_select(&operands[0], range, &select.kind, operands.get(1))
+            .map(Value::Integer);
+    }
     let Expr::Select { name, .. } = expr else {
         unreachable!("select expression")
     };
@@ -4154,7 +4203,8 @@ fn is_indefinite_width(expr: &Expr) -> bool {
             | Expr::Replication { .. }
             | Expr::SystemCall { .. }
             | Expr::Identifier(_)
-            | Expr::Select { .. } => {}
+            | Expr::Select { .. }
+            | Expr::ConcatSelect { .. } => {}
             Expr::Truncated => unreachable!(
                 "Expr::Truncated is a display-only sentinel; never reaches has_indefinite_width"
             ),
@@ -4512,8 +4562,8 @@ fn check_part_select_direction(
         Ok(())
     } else {
         Err(format!(
-            "part-select direction does not match reg declaration: \
-             reg is [{}:{}], select is [{}:{}]",
+            "part-select direction does not match source range: \
+             source is [{}:{}], select is [{}:{}]",
             range.msb, range.lsb, msb_sel, lsb_sel
         ))
     }

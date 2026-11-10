@@ -18,6 +18,7 @@ Priority key: **P0** critical or blocking; **P1** important; **P2** non-blocking
 - Integer `**` evaluates its exponent as a self-determined expression and uses width-bounded modular exponentiation, so nested or very large exponents wrap correctly without unbounded intermediates
 - Real arithmetic and mixed integer/real promotion (LRM 5.1.5 / 5.1.7 / Tables 5-2, 5-3)
 - Select parsing and operand traversal use heap work stacks; annotations retain resolved bounds and cache self-determined select results within each evaluation, eliminating nested-bound / indexed-width pipeline re-entry without a fixed select nesting limit (see [architecture.md](architecture.md))
+- SystemVerilog-style read-only bit-/part-/indexed-part-selects on concatenation and replication results (`{32'd100}[0]`, `{a, b}[3:0]`, `{2{4'hA}}[7 -: 4]`), with self-determined sources and unchanged concatenation operand-width restrictions (see [non-standard.md](non-standard.md#systemverilog-extension-selects-on-concatenation-results))
 - Two-pass context (width, signedness) propagation; leftmost-base propagation; `reg` display base starts as a weak binary fallback and resolves from the first whole-reg integer init/assignment
 - `reg` / `integer` / `real` declarations and blocking assignment with the full LRM A.8.5 `variable_lvalue` — bare name, bit/part/indexed-part selects, and arbitrarily nested concatenations on the LHS (see [variables.md](variables.md))
 - 1-D unpacked arrays on `reg` / `integer` / `real` (LRM 4.9 / A.2.2.1); arrays are capped at 65,536 elements, and vector-array payload is additionally capped at the same 16,777,216-bit limit as scalar vectors
@@ -32,11 +33,13 @@ Priority key: **P0** critical or blocking; **P1** important; **P2** non-blocking
 
 ## Active scope
 
-No implementation task is currently active; canonical result highlighting is complete using formatter-provided spans and the shared input palette.
+No implementation task is currently active; SystemVerilog-style concatenation-result selects and the Unix PTY large-paste harness fix are complete.
 
 Deferred follow-up: automatic continuation and Cmd-Enter. Ctrl-M retains its existing submit behavior; backslash-Enter continuation is excluded.
 
 ## Known issues
+
+Concatenation-result select validation 2026-11-10: formatting, Clippy, all 795 Rust tests, and all 120 release recursion stress cases passed on macOS, including 100,000 parser levels and 50,000 evaluation levels. All 24 Unix PTY checks plus stdout redirection passed against debug and release builds, including roughly 500 KB / 100,000-level parse-only pastes with and without color, truncated AST rendering, and subsequent-input recovery. The previous paste timeout was caused by repeated whole-transcript scans in the test harness; incremental ANSI stripping and cursor-query detection reduced the colored release case from a 25-second timeout to about 0.74 seconds, with split-sequence regressions passing. No editor or parser change was needed; native Windows remains unverified.
 
 Output highlighting validation 2026-11-10: formatting, Clippy, all 773 Rust tests, all 22 Unix PTY checks plus stdout redirection in `scripts/test_multiline.py`, and all 101 release recursion stress cases passed on macOS. Coverage includes canonical values and leftovers, plain formatting/task output, raw non-UTF-8 bytes, `NO_COLOR`, and unchanged parse-only AST content; native Windows terminal rendering remains unverified.
 
