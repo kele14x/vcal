@@ -1,4 +1,5 @@
-// Lenient, span-aware tokenizer used only by the rustyline highlighter.
+// Lenient, span-aware tokenizer used by the rustyline highlighter and by
+// the output formatter for known canonical value text (never arbitrary bytes).
 // Mirrors the boundary rules in `lexer::tokenize` but never errors: a `5.`,
 // `1e`, or bare `$` is still emitted as a single span (Number or Error)
 // instead of aborting, so the REPL can re-paint on every keystroke without

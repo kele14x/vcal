@@ -9,8 +9,8 @@ Priority key: **P0** critical or blocking; **P1** important; **P2** non-blocking
 ## What works
 
 - REPL shell with history and explicit multi-line editing in both interactive modes: Enter submits; Ctrl-J and Option/Alt-Enter insert newlines, with Shift-Enter also bound on Windows; arrows and bracketed paste support editing (see [repl.md](repl.md) for terminal requirements)
-- Token syntax highlighting (a based literal's `'[s]<base>` marker is coloured apart from its size and value digits)
-- Output byte policy: `$display` / `$write` and formatted `display_expression` output is a raw byte stream everywhere (pipes, files, Unix terminals stay byte-exact); a Windows console degrades non-UTF-8 bytes to lossy UTF-8 instead of erroring (see [repl.md](repl.md))
+- Shared input and canonical-result syntax highlighting: digits yellow, base markers faint yellow, quoted strings cyan; formatted text/substitutions and task output stay plain, while canonical leftovers are highlighted only on an interactive terminal with `NO_COLOR` unset
+- Output byte policy: `$display` / `$write` and formatted `display_expression` payload bytes are preserved (pipes and files stay byte-exact; terminal highlighting only wraps canonical value segments); a Windows console degrades non-UTF-8 bytes to lossy UTF-8 instead of erroring (see [repl.md](repl.md))
 - Unified non-empty `display_expression` echo lists (see [non-standard.md](non-standard.md)): every top-level expression input is a display-expression argument list, so `a` retains canonical calculator output, `a, b` echoes both values canonically, null comma slots emit one space each like `$display`, and a leading string-style expression such as `"a=%d", a` uses the `$display` format-control engine while rendering arguments left unconsumed by format controls canonically; trailing `;` suppresses the whole echo
 - Integer and real literals, all LRM forms (LRM 3.5.2)
 - String literals as packed unsigned 8-bit vectors (LRM 3.6 / A.8.8), with friendly escaped display for bare strings and string-only concatenation / replication; the formatter shared by `$display` / `$write` and formatted `display_expression` supports basic format strings, null arguments, and raw-byte output; internal zero-width numeric display renders with one `0` digit
@@ -32,11 +32,13 @@ Priority key: **P0** critical or blocking; **P1** important; **P2** non-blocking
 
 ## Active scope
 
-No implementation task is currently active; multi-line editing is complete with Ctrl-J and Option/Alt-Enter on Linux/macOS, plus Shift-Enter on Windows.
+No implementation task is currently active; canonical result highlighting is complete using formatter-provided spans and the shared input palette.
 
 Deferred follow-up: automatic continuation and Cmd-Enter. Ctrl-M retains its existing submit behavior; backslash-Enter continuation is excluded.
 
 ## Known issues
+
+Output highlighting validation 2026-11-10: formatting, Clippy, all 773 Rust tests, all 22 Unix PTY checks plus stdout redirection in `scripts/test_multiline.py`, and all 101 release recursion stress cases passed on macOS. Coverage includes canonical values and leftovers, plain formatting/task output, raw non-UTF-8 bytes, `NO_COLOR`, and unchanged parse-only AST content; native Windows terminal rendering remains unverified.
 
 Validation 2026-10-04: all 760 tests and 101 recursion stress cases passed on macOS after removing the select nesting limit. End-to-end tests cover 20,000-level select indices, bounds, indexed widths, array accesses, assignment and declaration paths, malformed-input recovery, and default parse-only rendering; release stress cases cover 100,000 parser levels and 50,000 evaluation levels. The six observable issues below remain open; the stage-prefix item remains a latent structural concern. This is bounded evidence, not a guarantee that no P0 exists; interactive and Windows paths were not exercised, and raising the parse-only AST display depth retains the documented recursive-rendering risk.
 

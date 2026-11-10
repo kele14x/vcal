@@ -23,8 +23,9 @@ mod tests;
 use value::DisplayStyle;
 pub use value::{Base, IntegerValue, LogicBit, Value};
 
+use highlight::Span;
 use parser::{DeclKind, DeclName, Expr, LValue, SelectKind, Stmt};
-use system_call::SystemCallKind;
+use system_call::{FormattedOutput, SystemCallKind};
 
 // Arrays store one independently addressable value per element, so their
 // allocation cost includes per-element metadata (and, for vector arrays, a
@@ -304,7 +305,7 @@ impl Session {
     }
 
     pub fn eval(&mut self, input: &str) -> Result<Evaluation, EvalError> {
-        evaluate_input_with_session(self, input)
+        evaluate_input_with_session(self, input).map(|(evaluation, _)| evaluation)
     }
 }
 
@@ -357,18 +358,23 @@ pub fn parse_input_with_depth(input: &str, max_depth: usize) -> Result<String, S
     Ok(format!("{statements:#?}"))
 }
 
+// Keep terminal styling private: public Evaluation bytes/text stay ANSI-free,
+// and existing callers can still construct or destructure Evaluation unchanged.
 fn evaluate_input_with_session(
     session: &mut Session,
     input: &str,
-) -> Result<Evaluation, EvalError> {
+) -> Result<(Evaluation, Vec<Span>), EvalError> {
     let input = input.trim();
     if input.is_empty() {
-        return Ok(Evaluation {
-            task_output: Vec::new(),
-            value_output: Vec::new(),
-            output: String::new(),
-            should_exit: false,
-        });
+        return Ok((
+            Evaluation {
+                task_output: Vec::new(),
+                value_output: Vec::new(),
+                output: String::new(),
+                should_exit: false,
+            },
+            Vec::new(),
+        ));
     }
 
     let (statements, trailing_semicolon) = parser::parse_statements(input)
@@ -378,7 +384,7 @@ fn evaluate_input_with_session(
     // echo-list value is visible only if the input did not end with a `;`.
     // System-task output is a side effect and accumulates independently.
     let mut task_output = Vec::new();
-    let mut last_value_output = Vec::new();
+    let mut last_value_output = FormattedOutput::default();
     let mut last_was_echo = false;
     for stmt in &statements {
         let (stmt_task_output, value_output, should_exit) =
@@ -391,30 +397,36 @@ fn evaluate_input_with_session(
             })?;
         task_output.extend(stmt_task_output);
         if should_exit {
-            return Ok(Evaluation {
-                task_output,
-                value_output: Vec::new(),
-                output: String::new(),
-                should_exit: true,
-            });
+            return Ok((
+                Evaluation {
+                    task_output,
+                    value_output: Vec::new(),
+                    output: String::new(),
+                    should_exit: true,
+                },
+                Vec::new(),
+            ));
         }
         last_value_output = value_output;
         last_was_echo = matches!(stmt, Stmt::ReplEcho(_));
     }
 
     let value_output = if trailing_semicolon || !last_was_echo {
-        Vec::new()
+        FormattedOutput::default()
     } else {
         last_value_output
     };
-    let output = String::from_utf8_lossy(&value_output).into_owned();
+    let output = String::from_utf8_lossy(&value_output.bytes).into_owned();
 
-    Ok(Evaluation {
-        task_output,
-        value_output,
-        output,
-        should_exit: false,
-    })
+    Ok((
+        Evaluation {
+            task_output,
+            value_output: value_output.bytes,
+            output,
+            should_exit: false,
+        },
+        value_output.spans,
+    ))
 }
 
 // Drives a single top-level Stmt. Decls mutate the session and emit no value
@@ -424,7 +436,10 @@ fn evaluate_input_with_session(
 // hoisted here, since tasks have no expression value. The hoist walks through
 // `Grouped` layers via the iterative `unwrap_grouped` so
 // `((($display("x"))))` still runs as a top-level task.
-fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(Vec<u8>, Vec<u8>, bool), String> {
+fn apply_stmt(
+    session: &mut Session,
+    stmt: &Stmt,
+) -> Result<(Vec<u8>, FormattedOutput, bool), String> {
     match stmt {
         Stmt::ReplEcho(args) => {
             if let [parser::SystemArg::Expr(expr)] = args.as_slice()
@@ -435,7 +450,11 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(Vec<u8>, Vec<u8>, b
                 && let Ok(SystemCallKind::Task(task)) = system_call::classify_system_call(name)
             {
                 let result = system_call::execute_task(task, task_args, session)?;
-                return Ok((result.output, Vec::new(), result.should_exit));
+                return Ok((
+                    result.output,
+                    FormattedOutput::default(),
+                    result.should_exit,
+                ));
             }
             let output = system_call::format_repl_echo_args(args, session)?;
             Ok((Vec::new(), output, false))
@@ -447,11 +466,11 @@ fn apply_stmt(session: &mut Session, stmt: &Stmt) -> Result<(Vec<u8>, Vec<u8>, b
             names,
         } => {
             let (output, should_exit) = apply_decl(session, *kind, *signed, range.as_ref(), names)?;
-            Ok((Vec::new(), output.into_bytes(), should_exit))
+            Ok((Vec::new(), output.into_bytes().into(), should_exit))
         }
         Stmt::Assign { lvalue, rhs } => {
             let (output, should_exit) = apply_assign(session, lvalue, rhs)?;
-            Ok((Vec::new(), output.into_bytes(), should_exit))
+            Ok((Vec::new(), output.into_bytes().into(), should_exit))
         }
     }
 }
@@ -969,8 +988,8 @@ pub fn run_interactive() -> io::Result<()> {
             let _ = editor.add_history_entry(line.as_str());
         }
 
-        match session.eval(&line) {
-            Ok(result) => {
+        match evaluate_input_with_session(&mut session, &line) {
+            Ok((result, spans)) => {
                 let mut stdout = ConsoleSafeWriter::new(io::stdout());
                 stdout.write_all(&result.task_output)?;
                 if result.value_output.is_empty() {
@@ -983,7 +1002,11 @@ pub fn run_interactive() -> io::Result<()> {
                         prefix
                     };
                     stdout.write_all(prefix.as_bytes())?;
-                    stdout.write_all(&result.value_output)?;
+                    stdout.write_all(&color::highlight_bytes(
+                        &result.value_output,
+                        &spans,
+                        use_color,
+                    ))?;
                     writeln!(stdout)?;
                     writeln!(stdout)?;
                 }

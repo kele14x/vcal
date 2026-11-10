@@ -7,7 +7,7 @@ use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 
-use crate::highlight::{TokenClass, highlight_spans};
+use crate::highlight::{Span, TokenClass, highlight_spans};
 
 // True when stdout is a real terminal and the user hasn't opted out via
 // the NO_COLOR convention (https://no-color.org). Independent of the
@@ -25,26 +25,41 @@ pub(crate) fn red(s: &str) -> String {
     format!("\x1b[31m{s}\x1b[0m")
 }
 
-pub(crate) fn yellow(s: &str) -> String {
-    format!("\x1b[33m{s}\x1b[0m")
+fn token_color(class: TokenClass) -> Option<&'static [u8]> {
+    match class {
+        TokenClass::Number => Some(b"\x1b[33m"),
+        // Same numeric hue, but faint so the base reads apart from the digits.
+        TokenClass::BaseMarker => Some(b"\x1b[2;33m"),
+        TokenClass::SystemIdent => Some(b"\x1b[35m"),
+        TokenClass::String => Some(b"\x1b[36m"),
+        TokenClass::Comment => Some(b"\x1b[2m"),
+        TokenClass::Error => Some(b"\x1b[31m"),
+        TokenClass::Identifier | TokenClass::Operator | TokenClass::Punct => None,
+    }
 }
 
-pub(crate) fn magenta(s: &str) -> String {
-    format!("\x1b[35m{s}\x1b[0m")
-}
-
-pub(crate) fn cyan(s: &str) -> String {
-    format!("\x1b[36m{s}\x1b[0m")
-}
-
-pub(crate) fn dim(s: &str) -> String {
-    format!("\x1b[2m{s}\x1b[0m")
-}
-
-// Faint yellow: same hue as numeric digits so a based literal's `'h` marker
-// still reads as part of the number, but visibly set apart from the value.
-pub(crate) fn dim_yellow(s: &str) -> String {
-    format!("\x1b[2;33m{s}\x1b[0m")
+// Shared palette renderer. Spans refer to the original byte buffer, not to
+// previously inserted ANSI. Copy all other bytes verbatim: formatted text may
+// contain arbitrary non-UTF-8 bytes before or between canonical value spans.
+pub(crate) fn highlight_bytes<'a>(bytes: &'a [u8], spans: &[Span], enabled: bool) -> Cow<'a, [u8]> {
+    if !enabled || spans.is_empty() {
+        return Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len() + spans.len() * 12);
+    let mut cursor = 0;
+    for span in spans {
+        out.extend_from_slice(&bytes[cursor..span.start]);
+        if let Some(color) = token_color(span.class) {
+            out.extend_from_slice(color);
+            out.extend_from_slice(&bytes[span.start..span.end]);
+            out.extend_from_slice(b"\x1b[0m");
+        } else {
+            out.extend_from_slice(&bytes[span.start..span.end]);
+        }
+        cursor = span.end;
+    }
+    out.extend_from_slice(&bytes[cursor..]);
+    Cow::Owned(out)
 }
 
 // Minimal rustyline `Helper` whose only job is to wrap the main prompt
@@ -87,35 +102,12 @@ impl Highlighter for PromptHelper {
         if !self.enabled {
             return Cow::Borrowed(line);
         }
-        let spans = highlight_spans(line);
-        // Minimal palette: identifiers / operators / punct stay default so
-        // the prompt remains quiet on busy terminals; only the high-signal
-        // classes get a colour.
-        let mut out = String::with_capacity(line.len() + spans.len() * 8);
-        let mut cursor = 0usize;
-        for span in spans {
-            // Whitespace between spans is preserved verbatim.
-            if span.start > cursor {
-                out.push_str(&line[cursor..span.start]);
+        match highlight_bytes(line.as_bytes(), &highlight_spans(line), true) {
+            Cow::Borrowed(_) => Cow::Borrowed(line),
+            Cow::Owned(bytes) => {
+                Cow::Owned(String::from_utf8(bytes).expect("ANSI insertion preserves input UTF-8"))
             }
-            let s = &line[span.start..span.end];
-            match span.class {
-                TokenClass::Number => out.push_str(&yellow(s)),
-                TokenClass::BaseMarker => out.push_str(&dim_yellow(s)),
-                TokenClass::SystemIdent => out.push_str(&magenta(s)),
-                TokenClass::String => out.push_str(&cyan(s)),
-                TokenClass::Comment => out.push_str(&dim(s)),
-                TokenClass::Error => out.push_str(&red(s)),
-                TokenClass::Identifier | TokenClass::Operator | TokenClass::Punct => {
-                    out.push_str(s)
-                }
-            }
-            cursor = span.end;
         }
-        if cursor < line.len() {
-            out.push_str(&line[cursor..]);
-        }
-        Cow::Owned(out)
     }
 
     // Edits must force a full repaint: inserting a char can recolour text

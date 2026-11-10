@@ -23,9 +23,17 @@ The normal and `--parse-only` interactive modes share the same editor:
 
 Line breaks are whitespace, not statement separators: separate declarations and assignments with `;` as usual. A final `;` suppresses the echo for the entire submitted buffer. String literals retain their existing rule that a literal cannot contain a raw line break.
 
+## Output highlighting
+
+In normal interactive mode, canonical calculator values use the input palette: numeric size and value digits are yellow, based-literal markers such as `'h` and `'sd` are faint yellow, and quoted strings (including their escapes) are cyan. Real values, including `NaN` and infinities, are yellow. The `Out[n]:` prefix retains its red color.
+
+Format-string text and values substituted by controls such as `%d`, `%h`, `%s`, and `%c` stay plain: they are display text, not Verilog source. Arguments left unconsumed by format controls still render canonically and receive highlighting. For example, `"value=%d", 42, 8'hff` leaves `value=42` plain and highlights only `8'hff`. Explicit `$display` / `$write` output, diagnostics, and parse-only AST content remain unhighlighted.
+
+Color requires stdout to be a terminal and `NO_COLOR` to be unset. Piped input through `run_repl`, redirected stdout, and public evaluation API output receive no added ANSI codes. The shared formatter records spans only for known canonical values; the interactive frontend inserts ANSI codes using those byte offsets, never tokenizing arbitrary formatted text.
+
 ## Output encoding
 
-`$display` / `$write` output and formatted `display_expression` echoes are a raw byte stream: `%s` / `%c` may emit arbitrary bytes, and piping or redirecting the REPL preserves them exactly. The one exception is a Windows console, whose stdio rejects non-UTF-8 writes; there, non-UTF-8 bytes are degraded to lossy UTF-8 (replacement characters) so the REPL keeps working. Valid UTF-8 output — which is everything except deliberate `%s` / `%c` raw bytes — is never altered.
+`$display` / `$write` output and formatted `display_expression` echoes are a raw byte stream: `%s` / `%c` may emit arbitrary bytes, and piping or redirecting the REPL preserves them exactly. The one exception is a Windows console, whose stdio rejects non-UTF-8 writes; there, non-UTF-8 bytes are degraded to lossy UTF-8 (replacement characters) so the REPL keeps working. Highlighting inserts ANSI codes around canonical segments only; formatted bytes are preserved even when adjacent to highlighted values. No UTF-8 conversion is introduced by highlighting.
 
 ## Session
 

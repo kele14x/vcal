@@ -2,6 +2,7 @@ use num_traits::ToPrimitive;
 
 use crate::Session;
 use crate::eval;
+use crate::highlight::{Span, TokenClass, highlight_spans};
 use crate::parser::{MathFunctionKind, RealConversionKind, SystemArg, SystemTask};
 use crate::value::{self, Base, DisplayStyle, IntegerValue, LogicBit, Value};
 
@@ -17,6 +18,48 @@ pub(crate) enum SystemFunction {
     RealConversion(RealConversionKind),
     SignCast { signed: bool },
     BaseCast(Base),
+}
+
+// Formatting stays byte-exact and ANSI-free. Only canonical value segments
+// carry styling; format literals, control substitutions, and task output do not.
+#[derive(Debug, Default)]
+pub(crate) struct FormattedOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) spans: Vec<Span>,
+}
+
+impl FormattedOutput {
+    fn push_canonical(&mut self, value: &Value) {
+        let text = value.canonical();
+        let offset = self.bytes.len();
+        // Tokenize only known canonical text, never the surrounding formatted
+        // bytes. Real output includes NaN/inf, which aren't input number tokens.
+        match value {
+            Value::Integer(_) => {
+                self.spans
+                    .extend(highlight_spans(&text).into_iter().map(|mut span| {
+                        span.start += offset;
+                        span.end += offset;
+                        span
+                    }))
+            }
+            Value::Real(_) => self.spans.push(Span {
+                start: offset,
+                end: offset + text.len(),
+                class: TokenClass::Number,
+            }),
+        }
+        self.bytes.extend_from_slice(text.as_bytes());
+    }
+}
+
+impl From<Vec<u8>> for FormattedOutput {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            spans: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -97,11 +140,14 @@ fn format_display_args(
     let prepared = prepare_display_args(args, session, false)?;
 
     let mut output = match &prepared.format_bytes {
-        Some(format_bytes) => format_with_controls(
-            format_bytes,
-            prepared.consumable_args(),
-            UnformattedStyle::Base(default_base),
-        )?,
+        Some(format_bytes) => {
+            format_with_controls(
+                format_bytes,
+                prepared.consumable_args(),
+                UnformattedStyle::Base(default_base),
+            )?
+            .bytes
+        }
         None => join_default_values(&prepared.values, default_base),
     };
 
@@ -123,7 +169,7 @@ fn format_display_args(
 pub(crate) fn format_repl_echo_args(
     args: &[SystemArg],
     session: &Session,
-) -> Result<Vec<u8>, String> {
+) -> Result<FormattedOutput, String> {
     let prepared = prepare_display_args(args, session, true)?;
 
     Ok(match &prepared.format_bytes {
@@ -308,7 +354,7 @@ fn format_with_controls(
     format_bytes: &[u8],
     args: &[DisplayArg],
     unformatted_style: UnformattedStyle,
-) -> Result<Vec<u8>, String> {
+) -> Result<FormattedOutput, String> {
     let mut output = Vec::new();
     let mut arg_index = 0usize;
     let mut index = 0usize;
@@ -376,31 +422,35 @@ fn format_with_controls(
         }
     }
 
+    // All literal text and substitutions above are plain. Leftover arguments
+    // can be canonical values, so record their spans while appending them.
+    let mut output = FormattedOutput::from(output);
     for value in &args[arg_index..] {
         match value {
             DisplayArg::Value(_) => {
-                if !output.is_empty()
-                    && !output.last().is_some_and(|byte| byte.is_ascii_whitespace())
+                if !output.bytes.is_empty()
+                    && !output
+                        .bytes
+                        .last()
+                        .is_some_and(|byte| byte.is_ascii_whitespace())
                 {
-                    output.push(b' ');
+                    output.bytes.push(b' ');
                 }
             }
             DisplayArg::Null => {}
         }
-        output.extend(format_unformatted_arg(value, unformatted_style));
+        match (value, unformatted_style) {
+            (DisplayArg::Value(value), UnformattedStyle::Canonical) => {
+                output.push_canonical(value);
+            }
+            (_, UnformattedStyle::Base(base)) => {
+                output.bytes.extend(format_default_arg(value, base));
+            }
+            (DisplayArg::Null, UnformattedStyle::Canonical) => output.bytes.push(b' '),
+        }
     }
 
     Ok(output)
-}
-
-fn format_unformatted_arg(value: &DisplayArg, style: UnformattedStyle) -> Vec<u8> {
-    match style {
-        UnformattedStyle::Base(base) => format_default_arg(value, base),
-        UnformattedStyle::Canonical => match value {
-            DisplayArg::Value(value) => value.canonical().into_bytes(),
-            DisplayArg::Null => vec![b' '],
-        },
-    }
 }
 
 fn join_default_values(values: &[DisplayArg], default_base: Base) -> Vec<u8> {
@@ -417,17 +467,17 @@ fn join_default_values(values: &[DisplayArg], default_base: Base) -> Vec<u8> {
     output
 }
 
-fn join_canonical_values(values: &[DisplayArg]) -> Vec<u8> {
-    let mut output = Vec::new();
+fn join_canonical_values(values: &[DisplayArg]) -> FormattedOutput {
+    let mut output = FormattedOutput::default();
     let mut previous_was_value = false;
     for (index, value) in values.iter().enumerate() {
         let current_is_value = matches!(value, DisplayArg::Value(_));
         if index > 0 && previous_was_value && current_is_value {
-            output.push(b' ');
+            output.bytes.push(b' ');
         }
         match value {
-            DisplayArg::Value(value) => output.extend(value.canonical().bytes()),
-            DisplayArg::Null => output.push(b' '),
+            DisplayArg::Value(value) => output.push_canonical(value),
+            DisplayArg::Null => output.bytes.push(b' '),
         }
         previous_was_value = current_is_value;
     }
