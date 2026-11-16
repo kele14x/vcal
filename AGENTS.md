@@ -50,6 +50,8 @@ Commit, tag, and push are separate actions: perform each only when the user expl
 
 Quick test for where a fact belongs: if it will still hold after the next feature ships, put it in one of the stable docs; otherwise it belongs in `doc/scope.md`.
 
+Do not put specific dates in documents — no "confirmed on &lt;date&gt;" markers on known issues, no dated validation logs, no "as of" timestamps. State whether something is current, open, or deferred, and let git history carry the timeline (`git log`, `git blame`). Likewise prefer capability descriptions over counts that go stale on the next commit, such as exact test totals.
+
 ## Meta-rules
 
 - Do not commit, amend, tag, or push unless the user **explicitly** says so — "commit", "tag", "push", or equivalent. Staging files for review (`git add` without a following `git commit`) is fine; the commit/push step waits for the explicit word. This avoids accidental history changes.
