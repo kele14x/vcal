@@ -1026,6 +1026,13 @@ pub(crate) fn parse_expression(input: &str) -> Result<Expr, String> {
     Ok(expression)
 }
 
+// Names the declaration grammar consumes as keywords, so no binding can
+// ever carry them. Shared by the decl parser and implicit declaration so
+// an inferred binding stays redeclarable and its notice pasteable.
+pub(crate) fn is_reserved_variable_name(name: &str) -> bool {
+    matches!(name, "reg" | "integer" | "real" | "signed")
+}
+
 // Returns the parsed statements and a flag indicating whether the input
 // ended with a `;` (after the final non-semicolon token). The REPL uses
 // the flag as an IPython-style output-suppression marker — see
@@ -1749,7 +1756,7 @@ impl<'a> Parser<'a> {
                     ));
                 }
             };
-            if matches!(name.as_str(), "reg" | "integer" | "real" | "signed") {
+            if is_reserved_variable_name(&name) {
                 return Err(format!(
                     "`{name}` cannot be used as a {} name",
                     kind.keyword()

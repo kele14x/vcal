@@ -11,6 +11,8 @@ mod concat;
 mod conditional;
 mod deep_nesting;
 mod display;
+mod hints;
+mod inference;
 mod integer_real_decls;
 mod limits;
 mod literals;

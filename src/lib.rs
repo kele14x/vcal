@@ -23,7 +23,7 @@ mod tests;
 use value::DisplayStyle;
 pub use value::{Base, IntegerValue, LogicBit, Value};
 
-use highlight::Span;
+use highlight::{Span, TokenClass};
 use parser::{DeclKind, DeclName, Expr, LValue, SelectKind, Stmt};
 use system_call::{FormattedOutput, SystemCallKind};
 
@@ -226,6 +226,16 @@ impl EvalError {
     }
 }
 
+// Crate-private error carrier for the internal driver: the public
+// `EvalError` keeps its original two-field shape (external callers can
+// construct it and destructure it exhaustively), while the task spans of
+// preserved output travel alongside for the interactive frontend only.
+#[derive(Debug)]
+pub(crate) struct EvalErrorWithSpans {
+    pub(crate) error: EvalError,
+    pub(crate) task_spans: Vec<Span>,
+}
+
 impl Deref for EvalError {
     type Target = str;
 
@@ -305,7 +315,9 @@ impl Session {
     }
 
     pub fn eval(&mut self, input: &str) -> Result<Evaluation, EvalError> {
-        evaluate_input_with_session(self, input).map(|(evaluation, _)| evaluation)
+        evaluate_input_with_session(self, input)
+            .map(|(evaluation, _)| evaluation)
+            .map_err(|failure| failure.error)
     }
 }
 
@@ -360,10 +372,19 @@ pub fn parse_input_with_depth(input: &str, max_depth: usize) -> Result<String, S
 
 // Keep terminal styling private: public Evaluation bytes/text stay ANSI-free,
 // and existing callers can still construct or destructure Evaluation unchanged.
+// Spans travel alongside, split by channel: `value` indexes value_output,
+// `task` indexes task_output (declaration hints). Only the interactive
+// frontend applies them.
+#[derive(Debug, Default)]
+pub(crate) struct OutputSpans {
+    pub(crate) value: Vec<Span>,
+    pub(crate) task: Vec<Span>,
+}
+
 fn evaluate_input_with_session(
     session: &mut Session,
     input: &str,
-) -> Result<(Evaluation, Vec<Span>), EvalError> {
+) -> Result<(Evaluation, OutputSpans), EvalErrorWithSpans> {
     let input = input.trim();
     if input.is_empty() {
         return Ok((
@@ -373,29 +394,42 @@ fn evaluate_input_with_session(
                 output: String::new(),
                 should_exit: false,
             },
-            Vec::new(),
+            OutputSpans::default(),
         ));
     }
 
-    let (statements, trailing_semicolon) = parser::parse_statements(input)
-        .map_err(|e| EvalError::new(format!("Syntax error: {e}")))?;
+    let (statements, trailing_semicolon) =
+        parser::parse_statements(input).map_err(|e| EvalErrorWithSpans {
+            error: EvalError::new(format!("Syntax error: {e}")),
+            task_spans: Vec::new(),
+        })?;
 
     // IPython-style suppression applies only to value output: the last
     // echo-list value is visible only if the input did not end with a `;`.
     // System-task output is a side effect and accumulates independently.
     let mut task_output = Vec::new();
+    let mut task_spans: Vec<Span> = Vec::new();
     let mut last_value_output = FormattedOutput::default();
     let mut last_was_echo = false;
     for stmt in &statements {
-        let (stmt_task_output, value_output, should_exit) =
-            apply_stmt(session, stmt).map_err(|message| EvalError {
-                message,
-                // Output from statements that already completed is a side
-                // effect that happened, so it travels with the diagnostic
-                // rather than being dropped by `?`.
-                task_output: mem::take(&mut task_output),
+        let (stmt_task_output, stmt_task_spans, value_output, should_exit) =
+            apply_stmt(session, stmt).map_err(|message| EvalErrorWithSpans {
+                error: EvalError {
+                    message,
+                    // Output from statements that already completed is a side
+                    // effect that happened, so it travels with the diagnostic
+                    // rather than being dropped by `?`.
+                    task_output: mem::take(&mut task_output),
+                },
+                task_spans: mem::take(&mut task_spans),
             })?;
+        let span_offset = task_output.len();
         task_output.extend(stmt_task_output);
+        task_spans.extend(stmt_task_spans.into_iter().map(|span| Span {
+            start: span.start + span_offset,
+            end: span.end + span_offset,
+            class: span.class,
+        }));
         if should_exit {
             return Ok((
                 Evaluation {
@@ -404,7 +438,10 @@ fn evaluate_input_with_session(
                     output: String::new(),
                     should_exit: true,
                 },
-                Vec::new(),
+                OutputSpans {
+                    value: Vec::new(),
+                    task: task_spans,
+                },
             ));
         }
         last_value_output = value_output;
@@ -425,21 +462,44 @@ fn evaluate_input_with_session(
             output,
             should_exit: false,
         },
-        value_output.spans,
+        OutputSpans {
+            value: value_output.spans,
+            task: task_spans,
+        },
     ))
 }
 
-// Drives a single top-level Stmt. Decls mutate the session and emit no value
-// output. Assignments mutate the session and emit no REPL value. Echo lists
-// evaluate through the unified canonical / format-string renderer — except
-// that a singleton `Expr::SystemCall` whose name classifies as a task is
-// hoisted here, since tasks have no expression value. The hoist walks through
-// `Grouped` layers via the iterative `unwrap_grouped` so
+// Assembles hint lines into task output, one Comment span per hint so the
+// interactive frontend can render them dim. The newline stays outside the
+// span; piped / API consumers see only the raw bytes.
+fn hint_task_output(hints: &[String]) -> (Vec<u8>, Vec<Span>) {
+    let mut bytes = Vec::new();
+    let mut spans = Vec::new();
+    for hint in hints {
+        let start = bytes.len();
+        bytes.extend_from_slice(hint.as_bytes());
+        spans.push(Span {
+            start,
+            end: bytes.len(),
+            class: TokenClass::Comment,
+        });
+        bytes.push(b'\n');
+    }
+    (bytes, spans)
+}
+
+// Drives a single top-level Stmt. Decls and assignments mutate the session
+// and emit no REPL value; successfully declared variables emit comment-form
+// hints as task output (see doc/non-standard.md → Declaration hints). Echo
+// lists evaluate through the unified canonical / format-string renderer —
+// except that a singleton `Expr::SystemCall` whose name classifies as a task
+// is hoisted here, since tasks have no expression value. The hoist walks
+// through `Grouped` layers via the iterative `unwrap_grouped` so
 // `((($display("x"))))` still runs as a top-level task.
 fn apply_stmt(
     session: &mut Session,
     stmt: &Stmt,
-) -> Result<(Vec<u8>, FormattedOutput, bool), String> {
+) -> Result<(Vec<u8>, Vec<Span>, FormattedOutput, bool), String> {
     match stmt {
         Stmt::ReplEcho(args) => {
             if let [parser::SystemArg::Expr(expr)] = args.as_slice()
@@ -452,12 +512,13 @@ fn apply_stmt(
                 let result = system_call::execute_task(task, task_args, session)?;
                 return Ok((
                     result.output,
+                    Vec::new(),
                     FormattedOutput::default(),
                     result.should_exit,
                 ));
             }
             let output = system_call::format_repl_echo_args(args, session)?;
-            Ok((Vec::new(), output, false))
+            Ok((Vec::new(), Vec::new(), output, false))
         }
         Stmt::Decl {
             kind,
@@ -465,12 +526,24 @@ fn apply_stmt(
             range,
             names,
         } => {
-            let (output, should_exit) = apply_decl(session, *kind, *signed, range.as_ref(), names)?;
-            Ok((Vec::new(), output.into_bytes().into(), should_exit))
+            let (hints, should_exit) = apply_decl(session, *kind, *signed, range.as_ref(), names)?;
+            let (task_output, task_spans) = hint_task_output(&hints);
+            Ok((
+                task_output,
+                task_spans,
+                FormattedOutput::default(),
+                should_exit,
+            ))
         }
         Stmt::Assign { lvalue, rhs } => {
-            let (output, should_exit) = apply_assign(session, lvalue, rhs)?;
-            Ok((Vec::new(), output.into_bytes().into(), should_exit))
+            let (hints, should_exit) = apply_assign(session, lvalue, rhs)?;
+            let (task_output, task_spans) = hint_task_output(&hints);
+            Ok((
+                task_output,
+                task_spans,
+                FormattedOutput::default(),
+                should_exit,
+            ))
         }
     }
 }
@@ -484,14 +557,15 @@ fn apply_stmt(
 // base. Redeclaration replaces the previous binding outright (vcal is a
 // single-scope REPL), and the whole decl is committed all-or-nothing so
 // `integer i = 1, j = nope` leaves `i` untouched on failure (mirroring
-// `reg`'s prior behaviour).
+// `reg`'s prior behaviour). On success it returns one comment-form hint
+// per declared name; a failed decl returns no hints.
 fn apply_decl(
     session: &mut Session,
     kind: DeclKind,
     signed: bool,
     range: Option<&(Expr, Expr)>,
     names: &[DeclName],
-) -> Result<(String, bool), String> {
+) -> Result<(Vec<String>, bool), String> {
     // `reg` evaluates its packed range up front so a malformed range
     // aborts the whole decl before any name is committed. `integer`
     // bakes a constant `[31:0]` range so bit-selects against the
@@ -526,6 +600,24 @@ fn apply_decl(
             DeclKind::Real => (None, 0usize, false, Base::Binary, true),
         };
 
+    // Hint shape shared by every name in the decl; the unpacked dimension
+    // (if any) is appended per name once resolved.
+    let shape_prefix = match kind {
+        DeclKind::Reg => {
+            let mut shape = String::from("reg");
+            if signed {
+                shape.push_str(" signed");
+            }
+            if let Some(range) = &resolved_range {
+                shape.push_str(&format!(" [{}:{}]", range.msb, range.lsb));
+            }
+            shape
+        }
+        DeclKind::Integer => String::from("integer"),
+        DeclKind::Real => String::from("real"),
+    };
+    let mut hints = Vec::new();
+
     // Staging area mirrors the prior reg-only path: every init runs
     // against a `Session` view of `staged` so a self-reference reads
     // the prior binding (`reg [1:0] a = 2'b11; reg a = a` narrows to
@@ -559,6 +651,10 @@ fn apply_decl(
                 let count = dim_range.width()?;
                 ensure_array_element_count(count)?;
                 ensure_array_total_bits(element_width, count)?;
+                hints.push(format!(
+                    "// {name}: {shape_prefix} [{}:{}]",
+                    dim_range.msb, dim_range.lsb
+                ));
                 let element_template = IntegerValue {
                     width: element_width,
                     signed: element_signed,
@@ -586,6 +682,10 @@ fn apply_decl(
                 })?;
                 let count = dim_range.width()?;
                 ensure_array_element_count(count)?;
+                hints.push(format!(
+                    "// {name}: {shape_prefix} [{}:{}]",
+                    dim_range.msb, dim_range.lsb
+                ));
                 RegStorage::RealArray {
                     dim: dim_range,
                     elements: vec![0.0; count],
@@ -602,6 +702,7 @@ fn apply_decl(
                     element_base_locked,
                     &mut staged,
                 )?;
+                hints.push(format!("// {name}: {shape_prefix}"));
                 RegStorage::Vector(value)
             }
             // Scalar real: LRM 4.8 zero-init, optional real-pipeline
@@ -614,6 +715,7 @@ fn apply_decl(
                     })?,
                     None => 0.0,
                 };
+                hints.push(format!("// {name}: {shape_prefix}"));
                 RegStorage::Real(value)
             }
         };
@@ -626,7 +728,7 @@ fn apply_decl(
         );
     }
     session.variables = staged;
-    Ok((String::new(), false))
+    Ok((hints, false))
 }
 
 fn ensure_array_element_count(count: usize) -> Result<(), String> {
@@ -727,12 +829,20 @@ fn eval_init_value(
 // that resolves to a `real` reg routes through `apply_real_assign`
 // instead: real has no width / base / bits, so the LHS context that
 // `evaluate_lvalue_assignment` would otherwise build doesn't apply
-// here.
+// here. A bare-name LHS with no binding at all is intercepted first
+// and auto-declared by `apply_inferred_assign` (non-standard). The
+// returned hints are comment-form task output — empty on every path
+// except implicit declaration.
 fn apply_assign(
     session: &mut Session,
     lvalue: &LValue,
     rhs: &Expr,
-) -> Result<(String, bool), String> {
+) -> Result<(Vec<String>, bool), String> {
+    if let LValue::Name(name) = lvalue
+        && session.lookup(name).is_none()
+    {
+        return apply_inferred_assign(session, name, rhs);
+    }
     if let LValue::Name(name) = lvalue
         && let Some(reg) = session.lookup(name)
         && reg.is_real()
@@ -749,9 +859,72 @@ fn apply_assign(
     {
         return apply_real_array_element_assign(session, name, index, rhs);
     }
-    let (staged, displayed) = eval::evaluate_lvalue_assignment(lvalue, rhs, session)?;
+    let (staged, _) = eval::evaluate_lvalue_assignment(lvalue, rhs, session)?;
     session.variables = staged;
-    Ok((displayed.canonical(), false))
+    Ok((Vec::new(), false))
+}
+
+// Non-standard implicit declaration: `name = expr` with no prior binding
+// creates the variable from the self-determined RHS. There is no LHS
+// context yet, so the RHS's natural width / signedness / base become the
+// binding's fixed shape — an integer result is a vector reg `[width-1:0]`,
+// a real result is a `real`. The binding commits only after the RHS
+// evaluates successfully, and the hint marks the shape `(inferred)`.
+fn apply_inferred_assign(
+    session: &mut Session,
+    name: &str,
+    rhs: &Expr,
+) -> Result<(Vec<String>, bool), String> {
+    // Same names the decl parser rejects: an inferred binding must stay
+    // redeclarable, and its hint must describe a pasteable decl shape.
+    if parser::is_reserved_variable_name(name) {
+        return Err(format!(
+            "Semantic error: `{name}` cannot be used as a variable name"
+        ));
+    }
+    let value = eval::evaluate_expr(rhs, session)?;
+    let (reg, hint) = match value {
+        Value::Real(f) => (
+            RegValue {
+                range: None,
+                storage: RegStorage::Real(f),
+            },
+            format!("// {name}: real (inferred)"),
+        ),
+        Value::Integer(value) => {
+            // The evaluator rejects every zero-width result, so the range
+            // halves below stay well-formed.
+            debug_assert!(value.width >= 1);
+            let width = value.width;
+            let stored = IntegerValue {
+                width,
+                signed: value.signed,
+                base: value.base,
+                base_locked: value.base_locked,
+                display_style: DisplayStyle::Base,
+                bits: value.bits,
+                unsized_literal: false,
+            };
+            let signed_qualifier = if value.signed { "signed " } else { "" };
+            (
+                RegValue {
+                    range: Some(RegRange {
+                        msb: BigInt::from(width - 1),
+                        lsb: BigInt::from(0),
+                    }),
+                    storage: RegStorage::Vector(stored),
+                },
+                format!(
+                    "// {name}: reg {signed_qualifier}[{}:0] (inferred)",
+                    width - 1
+                ),
+            )
+        }
+    };
+    let mut staged = session.variables.clone();
+    staged.insert(name.to_string(), reg);
+    session.variables = staged;
+    Ok((vec![hint], false))
 }
 
 // LRM 5.6 blocking assignment with a real LHS. Evaluates the RHS as a
@@ -764,7 +937,7 @@ fn apply_real_assign(
     session: &mut Session,
     name: &str,
     rhs: &Expr,
-) -> Result<(String, bool), String> {
+) -> Result<(Vec<String>, bool), String> {
     let value = evaluate_real_value(rhs, session)?;
     let mut staged = session.variables.clone();
     let reg = staged
@@ -775,25 +948,23 @@ fn apply_real_assign(
         .expect("caller verified the reg is a real reg");
     *slot = value;
     session.variables = staged;
-    Ok((Value::Real(value).canonical(), false))
+    Ok((Vec::new(), false))
 }
 
 // LRM 5.6 blocking assignment for a real-array element (`r[i] = expr`
 // where `r` is `real r [0:..]`). Sibling of `apply_real_assign`: the RHS
 // flows through the real pipeline (`evaluate_real_value` promotes
 // integer RHS via §3.5.3); the index is resolved against the unpacked
-// dimension. Per LRM 4.2.1, OOB index / x-z index drop the write — but
-// we still echo the RHS as if it had landed, mirroring how the bare
-// `apply_real_assign` always reports the RHS value. The index
-// expression is structurally validated up front (so e.g. `r[a + b]`
-// surfaces an undeclared-identifier error from `a`/`b` before RHS
-// evaluation).
+// dimension. Per LRM 4.2.1, OOB index / x-z index drop the write. The
+// index expression is structurally validated up front (so e.g.
+// `r[a + b]` surfaces an undeclared-identifier error from `a`/`b`
+// before RHS evaluation).
 fn apply_real_array_element_assign(
     session: &mut Session,
     name: &str,
     index: &Expr,
     rhs: &Expr,
-) -> Result<(String, bool), String> {
+) -> Result<(Vec<String>, bool), String> {
     eval::semantic_check(index, session)?;
     if eval::expression_is_real(index, session) {
         return Err("Semantic error: array element index cannot be real".to_string());
@@ -811,7 +982,7 @@ fn apply_real_array_element_assign(
         elements[internal] = value;
         session.variables = staged;
     }
-    Ok((Value::Real(value).canonical(), false))
+    Ok((Vec::new(), false))
 }
 
 // Evaluates an arbitrary expression as a real value, after the same
@@ -991,7 +1162,11 @@ pub fn run_interactive() -> io::Result<()> {
         match evaluate_input_with_session(&mut session, &line) {
             Ok((result, spans)) => {
                 let mut stdout = ConsoleSafeWriter::new(io::stdout());
-                stdout.write_all(&result.task_output)?;
+                stdout.write_all(&color::highlight_bytes(
+                    &result.task_output,
+                    &spans.task,
+                    use_color,
+                ))?;
                 if result.value_output.is_empty() {
                     writeln!(stdout)?;
                 } else {
@@ -1004,7 +1179,7 @@ pub fn run_interactive() -> io::Result<()> {
                     stdout.write_all(prefix.as_bytes())?;
                     stdout.write_all(&color::highlight_bytes(
                         &result.value_output,
-                        &spans,
+                        &spans.value,
                         use_color,
                     ))?;
                     writeln!(stdout)?;
@@ -1014,10 +1189,14 @@ pub fn run_interactive() -> io::Result<()> {
                     break;
                 }
             }
-            Err(err) => {
+            Err(failure) => {
                 let mut stdout = ConsoleSafeWriter::new(io::stdout());
-                stdout.write_all(&err.task_output)?;
-                writeln!(stdout, "{}", err.message)?;
+                stdout.write_all(&color::highlight_bytes(
+                    &failure.error.task_output,
+                    &failure.task_spans,
+                    use_color,
+                ))?;
+                writeln!(stdout, "{}", failure.error.message)?;
                 writeln!(stdout)?;
             }
         }

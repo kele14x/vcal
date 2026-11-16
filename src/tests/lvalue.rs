@@ -295,9 +295,12 @@ fn lhs_indexed_width_zero_rejected() {
 
 #[test]
 fn lhs_undeclared_identifier_rejected() {
+    // Bare-name assignment auto-declares (tests/inference.rs), but a
+    // select on an undeclared name has no width to infer and stays an
+    // error.
     let mut session = Session::new();
     let err = session
-        .eval("nope = 1'b1")
+        .eval("nope[0] = 1'b1")
         .expect_err("undeclared name rejected");
     assert_eq!(err, "Semantic error: undeclared identifier: nope");
 }

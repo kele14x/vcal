@@ -85,10 +85,10 @@ fn repl_preserves_write_output_without_adding_newline() {
     run_repl(&mut input, &mut output).expect("REPL should run");
 
     // `$write` emits no trailing newline, so the diagnostic follows the
-    // preserved bytes directly.
+    // preserved bytes directly. The earlier decl emits its hint first.
     assert_eq!(
         output,
-        b"In [0]: \nIn [1]: checkpointSemantic error: undeclared identifier: missing\n\
+        b"In [0]: // a: integer\n\nIn [1]: checkpointSemantic error: undeclared identifier: missing\n\
           \n\
           In [2]: \n"
     );

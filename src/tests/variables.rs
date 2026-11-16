@@ -442,12 +442,14 @@ fn reading_undeclared_identifier_is_an_error() {
 }
 
 #[test]
-fn assigning_to_undeclared_identifier_is_an_error() {
+fn assigning_to_undeclared_identifier_infers_a_binding() {
+    // Non-standard implicit declaration: the self-determined RHS shapes
+    // the new binding (unsized decimal → signed 32-bit), and the hint
+    // announces it as task output. See tests/inference.rs for the rest.
     let mut session = Session::new();
-    let err = session
-        .eval("b = 1")
-        .expect_err("assignment to undeclared should be rejected");
-    assert_eq!(err, "Semantic error: undeclared identifier: b");
+    let result = session.eval("b = 1").expect("implicit declaration");
+    assert_eq!(result.task_output, b"// b: reg signed [31:0] (inferred)\n");
+    assert_eq!(session.eval("b").expect("read").output, "32'sd1");
 }
 
 #[test]

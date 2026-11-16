@@ -25,6 +25,26 @@ The Verilog LRM requires a trailing semicolon for each statement. This is annoyi
 
 This convention has no LRM counterpart — it exists only at the REPL prompt. Multi-statement input like `1; 2; 3` is `;`-separated by definition, and only the *last* statement's result is eligible to print, so the trailing-`;` rule applies uniformly to the input as a whole rather than per statement.
 
+## Declaration hints
+
+Every successfully declared variable emits one comment-form hint line as task output — explicit `reg` / `integer` / `real` declarations (redeclarations and each name of a multi-name decl included) and implicit declarations from assignment alike:
+
+```text
+reg [7:0] a           →  // a: reg [7:0]
+reg signed [3:0] s    →  // s: reg signed [3:0]
+integer i             →  // i: integer
+real r                →  // r: real
+reg [3:0] arr [0:15]  →  // arr: reg [3:0] [0:15]
+b = 8'h1 + 8'h0       →  // b: reg [7:0] (inferred)
+s = 1.5               →  // s: real (inferred)
+```
+
+- The shape text describes the binding: `reg` with the resolved `[msb:lsb]` range and `signed` qualifier where present, the `integer` / `real` keyword for those kinds, and the resolved unpacked dimension appended for arrays. The `(inferred)` marker appears only for implicit declarations.
+- Hints are task output: no `Out[n]:` prefix, not suppressed by a trailing `;`, and preserved in chronological order ahead of a later statement's error. Ordinary assignments to existing variables emit nothing.
+- A failed declaration emits no hints at all — the all-or-nothing commit means even earlier names in a failing multi-name decl are not announced.
+- In color-enabled interactive sessions hints render dim (the comment color). The piped REPL and the public API (`Session::eval`, `evaluate_input`) stay ANSI-free; the styling metadata travels separately from the bytes.
+- Hints are comments: pasting them back is harmless and declares nothing. Changing a binding's shape still requires a real declaration.
+
 ## Integer constants
 
 Unsized number (simple decimal number or a number without size) shall be at least 32 bits. vcal uses a number of bits longer than 32 if the value needs more bits instead of strictly truncating to 32 bits as the LRM permits.
@@ -42,6 +62,20 @@ LRM 1364-2005 has an internal inconsistency about operand extension: §5.1.10 sa
 The Verilog LRM requires constant-expression operands for `r[m:l]` and for the `width` half of `r[b +: w]` / `r[b -: w]`, because simulators and synthesizers resolve those shapes during elaboration. vcal has no separate elaboration stage: the REPL evaluates each input directly against the current `Session`. So vcal deliberately relaxes those forms to ordinary integer expressions evaluated at runtime. The resulting values still must be usable as a select shape: part-select endpoints and indexed widths must resolve to definite integers, and indexed widths must be positive.
 
 Select nesting has no fixed depth limit. Select brackets use heap frames in the parser, and their operands use the iterative annotation, validation, evaluation, and drop paths. Parse-only AST output still uses its separate display-depth truncation limit (see [repl.md](repl.md)).
+
+## Implicit declaration on assignment
+
+Verilog requires every variable to be declared before use; its only implicit form is the 1-bit `wire` net created for undeclared identifiers in certain net contexts, a well-known way for typos to hide. vcal takes the opposite trade for REPL smoothness: a blocking assignment to a **bare undeclared name** creates the variable from the assignment line itself.
+
+```text
+a = 8'h1 + 8'h0      // creates reg [7:0] a; `a` reads back 8'h01
+```
+
+- The RHS is evaluated **self-determined** — no LHS context exists yet — and its natural width, signedness, and display base become the new binding's shape. An integer result creates a vector reg `[width-1:0]`; a real result creates a `real`. So `a = 1` is a signed 32-bit reg (unsized-decimal rules), `a = 4'shf` is signed 4-bit, `a = 1'b1` is a 1-bit *vector* (`[0:0]`, selectable), and `r = 1.5` is a real. The RHS's result type alone decides: `r = 1` creates a signed 32-bit reg, and a later `r = 1.5` converts into it per §3.5.3 rather than reshaping it. The stored reg displays numerically like any assigned reg, so a string RHS loses its string display style (`s = "AB"` reads back `16'h4142`).
+- The shape is **fixed at creation**. Later assignments truncate or extend under the normal blocking-assignment rules; the width never auto-grows. Changing width or type requires an explicit `reg` / `integer` / `real` redeclaration, which resets the binding as usual.
+- Only bare-name assignment triggers inference. A select on an undeclared name (`a[0] = 1'b1`), an undeclared concat-lvalue leaf, and any *read* of an undeclared name remain `Semantic error: undeclared identifier` — a select gives no width to infer, and inferring on reads would hide typos inside expressions. The names the declaration grammar reserves (`reg`, `integer`, `real`, `signed`) are rejected as well, so an inferred binding can always be redeclared.
+- The binding commits only after the RHS evaluates successfully: `a = nope` leaves no `a` behind.
+- Creation is never silent: the assignment emits a declaration hint — `// a: reg [7:0] (inferred)` — under the unified rules in [Declaration hints](#declaration-hints) above. There is no disable switch.
 
 ## SystemVerilog extension: selects on concatenation results
 

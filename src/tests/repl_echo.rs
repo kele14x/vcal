@@ -151,7 +151,8 @@ fn piped_repl_prefixes_formatted_raw_echo_with_out_slot() {
 fn highlighted_echo(input: &str, enabled: bool) -> (crate::Evaluation, Vec<u8>) {
     let (result, spans) =
         crate::evaluate_input_with_session(&mut Session::new(), input).expect("styled echo");
-    let bytes = crate::color::highlight_bytes(&result.value_output, &spans, enabled).into_owned();
+    let bytes =
+        crate::color::highlight_bytes(&result.value_output, &spans.value, enabled).into_owned();
     (result, bytes)
 }
 
@@ -227,9 +228,9 @@ fn format_text_and_substitutions_are_not_tokenized() {
     ] {
         let (result, spans) =
             crate::evaluate_input_with_session(&mut Session::new(), input).expect("formatted echo");
-        assert!(spans.is_empty(), "{input}");
+        assert!(spans.value.is_empty(), "{input}");
         assert_eq!(
-            crate::color::highlight_bytes(&result.value_output, &spans, true).as_ref(),
+            crate::color::highlight_bytes(&result.value_output, &spans.value, true).as_ref(),
             result.value_output,
         );
     }
@@ -286,7 +287,7 @@ fn suppressed_and_task_outputs_have_no_value_spans() {
         let (result, spans) =
             crate::evaluate_input_with_session(&mut Session::new(), input).expect("no echo");
         assert!(result.value_output.is_empty(), "{input}");
-        assert!(spans.is_empty(), "{input}");
+        assert!(spans.value.is_empty(), "{input}");
         assert!(!result.task_output.contains(&0x1b));
     }
 }

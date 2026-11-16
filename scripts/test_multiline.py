@@ -239,6 +239,7 @@ def colored_wrapped_buffer(terminal):
 RESET = b"\x1b[0m"
 YELLOW = b"\x1b[33m"
 DIM_YELLOW = b"\x1b[2;33m"
+DIM = b"\x1b[2m"
 CYAN = b"\x1b[36m"
 
 
@@ -373,6 +374,44 @@ def stdout_redirection(binary):
     assert b"\x1b" not in output, "redirected stdout was styled without NO_COLOR"
 
 
+def declaration_hints_dim(terminal):
+    terminal.send(b"reg [7:0] a" + ENTER)
+    terminal.wait_for(b"In [1]: ")
+    assert DIM + b"// a: reg [7:0]" + RESET in terminal.raw, "explicit decl hint not dim"
+    terminal.send(b"b = 8'h1" + ENTER)
+    terminal.wait_for(b"In [2]: ")
+    assert DIM + b"// b: reg [7:0] (inferred)" + RESET in terminal.raw, "inferred hint not dim"
+    # Ordinary assignment stays silent; redecl emits a fresh hint.
+    terminal.send(b"b = 8'h2" + ENTER)
+    terminal.wait_for(b"In [3]: ")
+    terminal.send(b"reg [3:0] a" + ENTER)
+    terminal.wait_for(b"In [4]: ")
+    assert terminal.raw.count(b"// b: reg [7:0] (inferred)") == 1, "assignment emitted a hint"
+    assert DIM + b"// a: reg [3:0]" + RESET in terminal.raw, "redecl hint not dim"
+    assert b"Out[" not in terminal.output, "hints must not open an output slot"
+
+
+def declaration_hints_plain_no_color(terminal):
+    terminal.send(b"reg [7:0] a" + ENTER)
+    terminal.wait_for(b"In [1]: ")
+    assert b"// a: reg [7:0]" in terminal.output
+    terminal.send(b"b = 8'h1" + ENTER)
+    terminal.wait_for(b"In [2]: ")
+    assert b"// b: reg [7:0] (inferred)" in terminal.output
+    assert b"\x1b[2m" not in terminal.raw, "NO_COLOR hint was styled"
+    assert b"Out[" not in terminal.output, "hints must not open an output slot"
+
+
+def redirected_hints_plain(binary):
+    source = b"reg [7:0] a\nb = 8'h1\na\n$finish\n"
+    output = redirected_run(binary, source)
+    expected = (b"In [0]: // a: reg [7:0]\n\n"
+                b"In [1]: // b: reg [7:0] (inferred)\n\n"
+                b"In [2]: Out[2]: 8'bxxxxxxxx\n\nIn [3]: \n")
+    assert output == expected, f"redirected hints changed: {output!r}"
+    assert b"\x1b" not in output, "redirected hints were styled"
+
+
 def parse_only_typed(terminal):
     terminal.send(b"1+" + ALT_ENTER + b"2")
     terminal.pending()
@@ -473,6 +512,8 @@ def main():
         ("plain formatted output and colored canonical leftovers", formatted_result_colors, {"color": True}),
         ("explicit display/write output remains plain", explicit_task_output_unchanged, {"color": True}),
         ("NO_COLOR leaves all output regions plain", no_color_results, {}),
+        ("declaration hints render dim with color", declaration_hints_dim, {"color": True}),
+        ("NO_COLOR declaration hints stay plain", declaration_hints_plain_no_color, {}),
         ("colored parse-only preserves the plain AST", colored_parse_only_unchanged, {"parse_only": True, "color": True}),
         ("parse-only Alt-Enter", parse_only_typed, {"parse_only": True}),
         ("parse-only multi-line paste", parse_only_paste, {"parse_only": True}),
@@ -495,6 +536,8 @@ def main():
         print(f"PASS {name}")
     stdout_redirection(binary)
     print("PASS redirected stdout remains plain without NO_COLOR")
+    redirected_hints_plain(binary)
+    print("PASS redirected declaration hints remain plain")
     print(f"All {len(cases)} interactive checks and stdout redirection passed.")
 
 

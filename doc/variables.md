@@ -27,9 +27,10 @@ real    name [= init] { , name [= init] }
   of resetting a reg's metadata, so the new decl wipes the old width,
   signedness, display base, and bit pattern. The freshly redeclared reg
   starts at all `x` like any other new reg.
-- A fresh reg is initialized to all `x`. The decl statement prints a
-  bare blank line — the same convention assignments, `$finish`, and
-  `$stop` use for non-value statements (see [repl.md](repl.md)).
+- A fresh reg is initialized to all `x`. The decl statement prints one
+  comment-form hint per declared name (`// a: reg [7:0]`) followed by the
+  bare blank line non-value statements use (see [repl.md](repl.md) and
+  [non-standard.md](non-standard.md) → "Declaration hints").
 
 ## `integer`
 
@@ -106,7 +107,10 @@ An identifier reference resolves to the reg's current bits and then
 participates in the surrounding expression like any other primary — its
 `(width, signed, base)` propagates per §5.5 (so e.g. an 8-bit reg whose
 base resolved to hex makes a leftmost `+` result render in hex).
-Referencing an undeclared name is an error.
+Referencing an undeclared name is an error. A blocking assignment to a
+bare undeclared name is the one exception: it auto-declares the variable
+from the self-determined RHS — see
+[non-standard.md](non-standard.md) → "Implicit declaration on assignment".
 
 ## Bit-select and part-select
 
