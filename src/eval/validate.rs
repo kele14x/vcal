@@ -177,8 +177,11 @@ fn visit_annotated<'b, 'a: 'b>(
 ) -> Result<(), String> {
     match &annot.kind {
         AnnotatedKind::Leaf => match annot.expr {
-            // Enforce the same MAX_BIT_WIDTH cap as the integer leaf
-            // evaluator before evaluating this annotation.
+            // Cap literal widths here because the integer leaf evaluator
+            // materializes bits trusting this check has run. Also covers
+            // paths that skip validation, e.g. evaluate_subexpr_as_integer
+            // annotates pre-validated operands but still hits literal
+            // leaves through this driver.
             Expr::Literal(spec) => value::ensure_bit_width(spec.width, "literal")?,
             Expr::StringLiteral(bytes) => {
                 value::ensure_bit_width(bytes.len().max(1).saturating_mul(8), "string literal")?
